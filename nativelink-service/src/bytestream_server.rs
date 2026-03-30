@@ -497,13 +497,15 @@ impl ByteStreamServer {
         let (uuid, bytes_received, is_collision) =
             match instance.active_uploads.lock().entry(uuid_key) {
                 Entry::Occupied(mut entry) => {
-                    let maybe_idle_stream = entry.get_mut();
-                    if let Some(idle_stream) = maybe_idle_stream.1.take() {
+                    let original_key = *entry.key();
+                    if entry.get().1.is_some() {
                         // Case 2: Stream exists but is idle, we can resume it
-                        let bytes_received = maybe_idle_stream.0.clone();
+                        let val = entry.get_mut();
+                        let idle_stream = val.1.take().unwrap();
+                        let bytes_received = val.0.clone();
                         info!(
                             msg = "Joining existing stream",
-                            uuid = format!("{:032x}", entry.key())
+                            uuid = format!("{:032x}", original_key)
                         );
                         // Track resumed upload
                         instance
@@ -512,22 +514,19 @@ impl ByteStreamServer {
                             .fetch_add(1, Ordering::Relaxed);
                         return idle_stream.into_active_stream(bytes_received, instance);
                     }
-                    // Case 3: Stream is active - generate a unique UUID to avoid collision
-                    // Using nanosecond timestamp makes collision probability essentially zero
-                    let original_key = *entry.key();
-                    let unique_key = Self::generate_unique_uuid_key(original_key);
+                    // Case 3: Stream is active - likely a resume after connection reset.
+                    // The original stream's connection died but hasn't been cleaned up yet.
+                    // Replace the entry so the new stream takes over the UUID slot.
+                    // The old stream's Arc becomes orphaned and is freed when its task exits.
+                    let current_bytes = entry.get().0.load(Ordering::Acquire);
+                    let bytes_received = Arc::new(AtomicU64::new(current_bytes));
+                    entry.insert((bytes_received.clone(), None));
                     warn!(
-                        msg = "UUID collision detected, generating unique UUID to prevent conflict",
+                        msg = "UUID collision detected, replacing existing stream",
                         original_uuid = format!("{:032x}", original_key),
-                        unique_uuid = format!("{:032x}", unique_key)
+                        bytes_received = current_bytes
                     );
-                    // Entry goes out of scope here, releasing the lock
-
-                    let bytes_received = Arc::new(AtomicU64::new(0));
-                    let mut active_uploads = instance.active_uploads.lock();
-                    // Insert with the unique UUID - this should never collide due to nanosecond precision
-                    active_uploads.insert(unique_key, (bytes_received.clone(), None));
-                    (unique_key, bytes_received, true)
+                    (original_key, bytes_received, true)
                 }
                 Entry::Vacant(entry) => {
                     // Case 1: UUID doesn't exist, create new stream
@@ -761,14 +760,26 @@ impl ByteStreamServer {
                             .unwrap_or(usize::MAX)..,
                     )
                 } else {
-                    if write_offset != tx.get_bytes_written() {
+                    if write_offset > tx.get_bytes_written() {
+                        // Client is ahead of server — either a resume after UUID
+                        // collision or chunks arrived out of order through NLB/h2.
+                        // Accept the data to avoid failing the upload; the blob
+                        // will fail hash verification if bytes are truly missing.
+                        warn!(
+                            msg = "Write offset ahead of bytes_written, accepting data",
+                            write_offset = write_offset,
+                            bytes_written = tx.get_bytes_written()
+                        );
+                        write_request.data
+                    } else if write_offset < tx.get_bytes_written() {
                         return Err(make_input_err!(
                             "Received out of order data. Got {}, expected {}",
                             write_offset,
                             tx.get_bytes_written()
                         ));
+                    } else {
+                        write_request.data
                     }
-                    write_request.data
                 };
 
                 // Do not process EOF or weird stuff will happen.
