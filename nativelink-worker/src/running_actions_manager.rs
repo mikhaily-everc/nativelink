@@ -298,6 +298,10 @@ pub async fn prepare_action_inputs(
                     ?e,
                     "Directory cache failed, falling back to traditional download"
                 );
+                // Ensure work directory exists for traditional path
+                fs::create_dir_all(Path::new(work_directory))
+                    .await
+                    .err_tip(|| format!("Error creating work directory {work_directory}"))?;
                 // Fall through to traditional path
             }
         }
@@ -825,9 +829,14 @@ impl RunningActionImpl {
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
             let (command, ()) = try_join(command_fut, async {
-                fs::create_dir(&self.work_directory)
-                    .await
-                    .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
+                // Only pre-create the work directory if directory cache is disabled.
+                // When directory cache is enabled, it creates the directory via hardlink
+                // from the cache, which fails if the directory already exists.
+                if self.running_actions_manager.directory_cache.is_none() {
+                    fs::create_dir(&self.work_directory)
+                        .await
+                        .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
+                }
                 // Now the work directory has been created, we have to clean up.
                 self.did_cleanup.store(false, Ordering::Release);
                 // Download the input files/folder and place them into the temp directory.
