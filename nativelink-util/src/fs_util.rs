@@ -188,8 +188,13 @@ fn set_readonly_recursive_impl<'a>(
             let mut perms = metadata.permissions();
 
             // If it's a directory, set to r-xr-xr-x (555)
-            // If it's a file, set to r--r--r-- (444)
-            let mode = if metadata.is_dir() { 0o555 } else { 0o444 };
+            // If it's a file, set to read-only but preserve execute bits
+            let current_mode = perms.mode();
+            let mode = if metadata.is_dir() {
+                0o555
+            } else {
+                0o444 | (current_mode & 0o111)
+            };
             perms.set_mode(mode);
 
             fs::set_permissions(path, perms)
