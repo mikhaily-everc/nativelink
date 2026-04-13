@@ -75,9 +75,23 @@ nativelink:
     tag: "latest"
 ```
 
-## Worker Image
+## Worker Init Image
 
-Separate image at `tools/rbe/worker-image/Dockerfile`. AL2023-based with system libs for Bazel toolchains. Does NOT contain the NativeLink binary — that comes from the worker-init container (`ghcr.io/tracemachina/nativelink-worker-init`).
+Init container that copies the NativeLink binary into the worker pod's shared volume. Built from the fork (same binary as the CAS image) so the worker runs the patched NativeLink version.
+
+```bash
+# From the repo root or tools/rbe/nativelink — script locates itself
+./tools/rbe/nativelink/build-worker-init.sh [TAG]
+# TAG defaults to "v3"
+```
+
+See `build-worker-init.sh` for full details. After pushing, update `DEFAULT_WORKER_INIT_IMAGE` in `tools/rbe/k8s/manifests/worker-provisioner-deployment.yaml`.
+
+**Note**: The script mounts the full repo root (not just the submodule dir) so Nix can resolve the git submodule's parent `.git` directory.
+
+## Worker OS Image
+
+Separate image at `tools/rbe/worker-image/Dockerfile`. AL2023-based with system libs for Bazel toolchains. Does NOT contain the NativeLink binary — that comes from the worker-init container above.
 
 ```bash
 cd tools/rbe/worker-image
@@ -87,13 +101,14 @@ docker push \
   692503192357.dkr.ecr.us-east-1.amazonaws.com/mlrc-gradle-cache/worker:latest
 ```
 
-Update `values.yaml` `podImage` with the push digest (`@sha256:...`).
+Update `worker-specs.json` `podImage` with the push digest (`@sha256:...`).
 
 ## ECR Repositories
 
 | Repo | Content |
 |------|---------|
 | `mlrc-gradle-cache/cas` | NativeLink CAS/scheduler binary (Nix-built) |
+| `mlrc-gradle-cache/worker-init` | Worker init container — copies NativeLink binary into shared volume |
 | `mlrc-gradle-cache/worker` | Worker OS image (AL2023 + dev headers) |
 
 ## Updating from Upstream

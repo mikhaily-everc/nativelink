@@ -25,3 +25,5 @@ nativelink.bazelrc
 *.log
 buck-out/
 nativelink_config.schema.json
+nativelink-worker-init.tar
+nativelink-image.tar
