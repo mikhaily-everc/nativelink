@@ -11,105 +11,66 @@ Fork of [TraceMachina/nativelink](https://github.com/TraceMachina/nativelink) wi
 
 `fix/bytestream-write-resume-v3` — based on upstream `main`, rebased periodically.
 
-## Building the CAS Image
+## Building and Pushing Images
 
-Uses Nix flake with a persistent Docker volume for caching. Builds target `linux/amd64`.
+All three images are built via Bazel for `linux_amd64`. Pushing uses `--config=oci-push` which sets exec platform to macOS so crane/jq resolve to darwin binaries. ECR credentials are handled automatically via the Docker credential helper.
 
-### Prerequisites
-
-- Docker with `linux/amd64` platform support
-- `nix-store` Docker volume (created on first run, persists deps across builds)
-
-### Build Command
+### Full E2E workflow (Bazel-native)
 
 ```bash
-cd tools/rbe/nativelink
+# 1. Build all images (heavy Rust compilation runs on RBE linux workers)
+bazel build \
+  //tools/rbe/cas-image:image \
+  //tools/rbe/worker-init-image:image \
+  //tools/rbe/worker-image:image \
+  --platforms=//tools/bazel/oci:linux_amd64
 
-docker run --rm --platform linux/amd64 \
-  --security-opt seccomp=unconfined \
-  -v nix-store:/nix \
-  -v $(pwd):/src \
-  -w /src \
-  nixos/nix:2.34.4 sh -c "
-    echo 'sandbox = false' >> /etc/nix/nix.conf &&
-    echo 'filter-syscalls = false' >> /etc/nix/nix.conf &&
-    nix build .#nativelink-image \
-      --extra-experimental-features 'nix-command flakes' --no-link &&
-    nix run .#nativelink-image.copyTo \
-      --extra-experimental-features 'nix-command flakes' \
-      -- docker-archive:/src/nativelink-image.tar"
+# 2. Push to ECR (--config=oci-push runs the push script locally with darwin crane)
+bazel run //tools/rbe/cas-image:push --config=oci-push
+bazel run //tools/rbe/worker-init-image:push --config=oci-push
+bazel run //tools/rbe/worker-image:push --config=oci-push
+
+# 3. Generate manifests stamped with the built image digests
+bazel build //tools/rbe/k8s:cas_deployment_stamped \
+            //tools/rbe/k8s:worker_provisioner_deployment_stamped \
+            //tools/rbe/k8s:worker_specs_stamped
+
+# Outputs:
+#   bazel-bin/tools/rbe/k8s/cas-deployment-stamped.yaml
+#   bazel-bin/tools/rbe/k8s/worker-provisioner-deployment-stamped.yaml
+#   bazel-bin/tools/rbe/k8s/worker-specs-stamped.json
 ```
 
-First build: ~28 min (downloads all deps). Subsequent builds with only Rust changes: ~2-5 min (nix-store volume caches deps).
+> **Digest stamping**: OCI digests are content-addressable (sha256 of image content), so they're known before pushing. The stamped manifests are correct before step 2 completes — whatever digest appears in the manifest is exactly what ECR stores after push.
 
-**Important**: Nix uses the git commit hash in the image metadata. Always commit changes before building.
+### `--config=oci-push` explained
 
-### Load and Push
+The generated `oci_push` script bundles crane/jq via exec-platform toolchain resolution. With the default config (exec=linux, RBE), it bundles linux binaries that can't run on macOS.
+
+`--config=oci-push` sets `--host_platform=macos_arm64` → exec platform becomes macOS → crane/jq resolve to darwin arm64 binaries. The NativeLink binary (target config, linux/amd64) is reused from disk cache — its cache key excludes exec platform.
+
+Requires `oci.toolchains()` in MODULE.bazel (already added) which registers the darwin crane binary for lazy fetching.
+
+### Images
+
+| Repo | Content | Build target |
+|------|---------|--------------|
+| `mlrc-gradle-cache/cas` | NativeLink binary on `al2023_minimal` | `//tools/rbe/cas-image:image` |
+| `mlrc-gradle-cache/worker-init` | CAS image + `copy_nativelink` Go binary | `//tools/rbe/worker-init-image:image` |
+| `mlrc-gradle-cache/worker` | `al2023_minimal` + worker user (uid 1000) | `//tools/rbe/worker-image:image` |
+
+### Fallback: system crane
+
+If `--config=oci-push` has issues (first run fetching darwin crane), use system crane directly:
 
 ```bash
-# Load into Docker
-docker load < nativelink-image.tar
-
-# Tag for ECR
-docker tag nativelink:latest \
-  692503192357.dkr.ecr.us-east-1.amazonaws.com/mlrc-gradle-cache/cas:latest
-
-# Login to ECR
-aws ecr get-login-password --region us-east-1 --profile dev | \
-  docker login --username AWS --password-stdin \
-  692503192357.dkr.ecr.us-east-1.amazonaws.com
-
-# Push
-docker push \
-  692503192357.dkr.ecr.us-east-1.amazonaws.com/mlrc-gradle-cache/cas:latest
+IMAGE_DIR=bazel-bin/tools/rbe/cas-image/image
+REPO=692503192357.dkr.ecr.us-east-1.amazonaws.com/mlrc-gradle-cache/cas
+DIGEST=$(jq -r '.manifests[0].digest' "$IMAGE_DIR/index.json")
+crane push "$IMAGE_DIR" "$REPO@$DIGEST" --image-refs /tmp/cas-refs.txt
+crane tag $(cat /tmp/cas-refs.txt) latest
+# Repeat for worker-init and worker images
 ```
-
-### Update Helm Values
-
-Update `values.yaml` with the new image tag/SHA:
-
-```yaml
-nativelink:
-  image:
-    repository: 692503192357.dkr.ecr.us-east-1.amazonaws.com/mlrc-gradle-cache/cas
-    tag: "latest"
-```
-
-## Worker Init Image
-
-Init container that copies the NativeLink binary into the worker pod's shared volume. Built from the fork (same binary as the CAS image) so the worker runs the patched NativeLink version.
-
-```bash
-# From the repo root or tools/rbe/nativelink — script locates itself
-./tools/rbe/nativelink/build-worker-init.sh [TAG]
-# TAG defaults to "v3"
-```
-
-See `build-worker-init.sh` for full details. After pushing, update `DEFAULT_WORKER_INIT_IMAGE` in `tools/rbe/k8s/manifests/worker-provisioner-deployment.yaml`.
-
-**Note**: The script mounts the full repo root (not just the submodule dir) so Nix can resolve the git submodule's parent `.git` directory.
-
-## Worker OS Image
-
-Separate image at `tools/rbe/worker-image/Dockerfile`. AL2023-based with system libs for Bazel toolchains. Does NOT contain the NativeLink binary — that comes from the worker-init container above.
-
-```bash
-cd tools/rbe/worker-image
-docker build --platform linux/amd64 -t \
-  692503192357.dkr.ecr.us-east-1.amazonaws.com/mlrc-gradle-cache/worker:latest .
-docker push \
-  692503192357.dkr.ecr.us-east-1.amazonaws.com/mlrc-gradle-cache/worker:latest
-```
-
-Update `worker-specs.json` `podImage` with the push digest (`@sha256:...`).
-
-## ECR Repositories
-
-| Repo | Content |
-|------|---------|
-| `mlrc-gradle-cache/cas` | NativeLink CAS/scheduler binary (Nix-built) |
-| `mlrc-gradle-cache/worker-init` | Worker init container — copies NativeLink binary into shared volume |
-| `mlrc-gradle-cache/worker` | Worker OS image (AL2023 + dev headers) |
 
 ## Updating from Upstream
 
