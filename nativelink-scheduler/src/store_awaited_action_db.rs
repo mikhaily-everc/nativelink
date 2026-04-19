@@ -852,10 +852,11 @@ where
                     )
                 });
 
-            debug_assert!(
-                ActionStage::Queued == awaited_action.state().stage,
-                "Expected action to be queued"
-            );
+            // NOTE: try_subscribe can legitimately return an action in Executing
+            // stage (action coalescing — see "Subscribing to existing action"
+            // branch in try_subscribe). The original upstream debug_assert that
+            // this was ActionStage::Queued was incorrect and panicked under
+            // coalescing workloads; removed here.
 
             let operation_id = awaited_action.operation_id().clone();
             if awaited_action.state().client_operation_id != operation_id {
