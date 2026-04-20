@@ -107,6 +107,7 @@ async fn make_mock_store_with_prefix(
         DEFAULT_SCAN_COUNT,
         DEFAULT_MAX_PERMITS,
         DEFAULT_MAX_COUNT_PER_CURSOR,
+        0,
         rx,
         manager,
     )

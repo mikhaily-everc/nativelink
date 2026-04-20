@@ -1380,6 +1380,19 @@ pub struct RedisSpec {
     /// Default: 1500
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_count_per_cursor: u64,
+
+    /// TTL (seconds) passed to `FT.CREATE TEMPORARY` for scheduler RediSearch
+    /// indexes created by this store. The idle timer resets on every
+    /// `FT.SEARCH`, `FT.AGGREGATE`, or write to a matching-prefix hash; when
+    /// it elapses without activity, RediSearch auto-drops the index (which
+    /// clears the DocTable high-water mark and is re-created idempotently on
+    /// next use). Only applies to stores that create search indexes
+    /// (scheduler backend); no effect on pure K/V AC/CAS stores.
+    /// 0 uses the default.
+    ///
+    /// Default: 86400 (24 hours).
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub experimental_index_ttl_s: u64,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]

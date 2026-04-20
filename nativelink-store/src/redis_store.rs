@@ -334,6 +334,12 @@ where
     #[metric(help = "The maximum number of results to return per cursor")]
     max_count_per_cursor: u64,
 
+    /// TTL (seconds) passed to `FT.CREATE TEMPORARY` for scheduler RediSearch
+    /// indexes created by this store. See
+    /// [`RedisSpec::experimental_index_ttl_s`].
+    #[metric(help = "TTL (seconds) applied to scheduler RediSearch indexes via FT.CREATE TEMPORARY")]
+    index_ttl_s: u64,
+
     /// A manager for subscriptions to keys in Redis.
     subscription_manager: tokio::sync::OnceCell<Arc<RedisSubscriptionManager>>,
 
@@ -409,6 +415,7 @@ where
         scan_count: usize,
         max_client_permits: usize,
         max_count_per_cursor: u64,
+        index_ttl_s: u64,
         subscriber_channel: UnboundedReceiver<PushInfo>,
         connection_manager: M,
     ) -> Result<Self, Error> {
@@ -427,6 +434,7 @@ where
             subscriber_channel: Mutex::new(Some(subscriber_channel)),
             client_permits: Arc::new(Semaphore::new(max_client_permits)),
             max_count_per_cursor,
+            index_ttl_s,
         })
     }
 
@@ -522,6 +530,9 @@ where
         if spec.retry.max_retries == 0 {
             spec.retry.max_retries = 1;
         }
+        if spec.experimental_index_ttl_s == 0 {
+            spec.experimental_index_ttl_s = DEFAULT_INDEX_TTL_S;
+        }
         trace!(?spec, "redis spec is after setting defaults");
         Ok(())
     }
@@ -579,6 +590,7 @@ impl RedisStore<ClusterConnection, ClusterRedisManager<ClusterConnection>> {
             spec.scan_count,
             spec.max_client_permits,
             spec.max_count_per_cursor,
+            spec.experimental_index_ttl_s,
             subscriber_channel,
             ClusterRedisManager::new(client.get_async_connection().await?).await?,
         )
@@ -705,6 +717,7 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
             spec.scan_count,
             spec.max_client_permits,
             spec.max_count_per_cursor,
+            spec.experimental_index_ttl_s,
             subscriber_channel,
             StandardRedisManager::new(Box::new(move || {
                 Box::pin(Self::connect(spec.clone(), tx.clone()))
@@ -1115,8 +1128,11 @@ const CURSOR_IDLE_MS: u64 = 30_000;
 const DATA_FIELD_NAME: &str = "data";
 /// The name of the field in the Redis hash that stores the version.
 const VERSION_FIELD_NAME: &str = "version";
-/// The time to live of indexes in seconds. After this time redis may delete the index.
-const INDEX_TTL_S: u64 = 60 * 60 * 24; // 24 hours.
+/// Default TTL (seconds) passed to `FT.CREATE TEMPORARY` for scheduler
+/// RediSearch indexes. The idle timer resets on every `FT.SEARCH` /
+/// `FT.AGGREGATE` / matching-prefix write. Overridable per store via
+/// `RedisSpec::experimental_index_ttl_s`.
+const DEFAULT_INDEX_TTL_S: u64 = 60 * 60 * 24; // 24 hours.
 
 #[allow(rustdoc::broken_intra_doc_links)]
 /// Lua script to set a key if the version matches.
@@ -1684,7 +1700,7 @@ where
                 nofields: true,
                 nofreqs: true,
                 nooffsets: true,
-                temporary: Some(INDEX_TTL_S),
+                temporary: Some(self.index_ttl_s),
             };
             let index = format!(
                 "{}",
