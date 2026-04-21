@@ -15,7 +15,7 @@
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Instant, UNIX_EPOCH};
 
 use async_lock::Mutex;
@@ -28,9 +28,10 @@ use nativelink_metric::{
 };
 use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
-use nativelink_util::platform_properties::PlatformProperties;
+use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
 use nativelink_util::shutdown_guard::ShutdownGuard;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc::error::TrySendError;
 use tonic::async_trait;
 use tracing::{error, info, trace, warn};
 
@@ -51,19 +52,125 @@ pub struct SchedulerMetrics {
     pub find_worker_time_ns: AtomicU64,
     /// Total number of workers iterated during find operations.
     pub workers_iterated: AtomicU64,
-    /// Total number of action dispatches.
+    /// Total number of successful action dispatches (post `commit_reservation`).
     pub actions_dispatched: AtomicU64,
     /// Total number of keep-alive updates.
     pub keep_alive_updates: AtomicU64,
     /// Total number of worker timeouts.
     pub worker_timeouts: AtomicU64,
+    /// Total number of worker reservations successfully created.
+    pub reservations_created: AtomicU64,
+    /// Total number of reservations that committed to a running action.
+    pub reservations_committed: AtomicU64,
+    /// Total number of reservations released (explicit release + Drop-enqueued
+    /// cleanup processed by the releaser task).
+    pub reservations_released: AtomicU64,
+    /// Total number of `commit_reservation` calls that failed (generation
+    /// mismatch, worker eviction, or send failure during finalize).
+    pub reservation_commit_failures: AtomicU64,
+    /// Subset of `reservation_commit_failures` caused by a worker being
+    /// replaced (reconnected) between reserve and commit.
+    pub reservation_generation_mismatches: AtomicU64,
+    /// Drop-time enqueue attempts that failed because the bounded release
+    /// channel was saturated. Each one represents worker budget that will
+    /// only be reclaimed when the affected worker is evicted.
+    pub reservation_leak_on_drop_enqueue_failed: AtomicU64,
+    /// Double-disarm detections (logic bug, soft-warned and counted rather
+    /// than panicking in release builds).
+    pub reservation_disarm_bugs: AtomicU64,
 }
 
+/// Capacity of the bounded release channel. Sized for the worst-case burst
+/// of simultaneously-dropped reservations (much larger than any realistic
+/// `N × pod-shutdown` scenario); overflow is a loud error.
+const RELEASE_CHANNEL_CAPACITY: usize = 256;
+
 use crate::platform_property_manager::PlatformPropertyManager;
-use crate::worker::{ActionInfoWithProps, Worker, WorkerTimestamp, WorkerUpdate};
+use crate::worker::{
+    ActionInfoWithProps, Worker, WorkerGeneration, WorkerTimestamp, WorkerUpdate,
+};
 use crate::worker_capability_index::WorkerCapabilityIndex;
 use crate::worker_registry::SharedWorkerRegistry;
 use crate::worker_scheduler::WorkerScheduler;
+
+/// Payload owned by an active `WorkerReservation`. Moved out of the outer
+/// handle on disarm (commit / release / Drop) so exactly one of those three
+/// code paths ever processes a given reservation.
+#[derive(Debug)]
+struct WorkerReservationInner {
+    worker_id: WorkerId,
+    generation: WorkerGeneration,
+    debits: Vec<(String, PlatformPropertyValue)>,
+    release_tx: mpsc::Sender<WorkerReservationInner>,
+}
+
+/// Handle representing an exclusive claim on a worker's budget slot for a
+/// pending match. The inner payload is consumed by one of three terminal
+/// paths — `commit_reservation`, `release_reservation`, or Drop — whichever
+/// fires first. After disarm, Drop is a no-op; before disarm, Drop enqueues
+/// the payload on the release channel so the releaser task can restore the
+/// budget under the pool lock.
+#[derive(Debug)]
+pub struct WorkerReservation {
+    inner: Option<WorkerReservationInner>,
+    metrics: Arc<SchedulerMetrics>,
+}
+
+impl WorkerReservation {
+    /// Consume the payload for explicit commit / release paths. Drop becomes
+    /// a no-op afterwards. Returns `None` if already disarmed — a logic bug;
+    /// debug-asserts in debug builds, logs + counts `reservation_disarm_bugs`
+    /// in all builds and returns `None` so callers can short-circuit rather
+    /// than taking the process down.
+    fn disarm(mut self) -> Option<WorkerReservationInner> {
+        let inner = self.inner.take();
+        if inner.is_none() {
+            debug_assert!(false, "WorkerReservation already disarmed");
+            error!("WorkerReservation disarm called twice — logic bug");
+            self.metrics
+                .reservation_disarm_bugs
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        inner
+    }
+
+    /// Target worker's id while the reservation is armed.
+    pub fn worker_id(&self) -> Option<&WorkerId> {
+        self.inner.as_ref().map(|i| &i.worker_id)
+    }
+
+    /// Worker generation captured at reservation time.
+    pub fn generation(&self) -> Option<WorkerGeneration> {
+        self.inner.as_ref().map(|i| i.generation)
+    }
+}
+
+impl Drop for WorkerReservation {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let tx = inner.release_tx.clone();
+        match tx.try_send(inner) {
+            Ok(()) => {
+                // Releaser task will process under the mutex and increment
+                // `reservations_released` there.
+            }
+            Err(TrySendError::Full(dropped)) => {
+                error!(
+                    worker_id = %dropped.worker_id,
+                    "release channel saturated; worker budget will leak until worker eviction"
+                );
+                self.metrics
+                    .reservation_leak_on_drop_enqueue_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Closed(_)) => {
+                // Scheduler shutting down; worker pool is being torn down too.
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Workers(LruCache<WorkerId, Worker>);
@@ -123,6 +230,12 @@ struct ApiWorkerSchedulerImpl {
     /// Used to accelerate `find_worker_for_action` by filtering candidates
     /// based on properties before doing linear scan.
     capability_index: WorkerCapabilityIndex,
+
+    /// Monotonically-increasing counter that mints a `WorkerGeneration` each
+    /// time a worker enters the pool. Reservations capture the worker's
+    /// generation at issue time; commit checks the pool generation still
+    /// matches, refusing stale reservations across reconnects.
+    next_generation: AtomicU64,
 }
 
 impl core::fmt::Debug for ApiWorkerSchedulerImpl {
@@ -179,9 +292,15 @@ impl ApiWorkerSchedulerImpl {
 
     /// Adds a worker to the pool.
     /// Note: This function will not do any task matching.
-    fn add_worker(&mut self, worker: Worker) -> Result<(), Error> {
+    fn add_worker(&mut self, mut worker: Worker) -> Result<(), Error> {
         let worker_id = worker.id.clone();
         let platform_properties = worker.platform_properties.clone();
+        // Mint a fresh generation for this worker instance. A reconnect lands
+        // a new `Worker` under the same `WorkerId` via `LruCache::put` (which
+        // replaces), so any reservation still holding the previous generation
+        // will fail the fence check at commit time.
+        let generation = WorkerGeneration(self.next_generation.fetch_add(1, Ordering::Relaxed));
+        worker.set_generation(generation);
         self.workers.put(worker_id.clone(), worker);
 
         // Add to capability index for fast matching
@@ -267,11 +386,13 @@ impl ApiWorkerSchedulerImpl {
             if !w.can_accept_work() {
                 if full_worker_logging {
                     info!(
-                        "Worker {worker_id} cannot accept work: is_paused={}, is_draining={}, inflight={}/{}",
+                        "Worker {worker_id} cannot accept work: is_paused={}, is_draining={}, inflight={}/{} (running={}, pending={})",
                         w.is_paused,
                         w.is_draining,
+                        w.running_action_infos.len() + w.pending_action_count(),
+                        w.max_inflight_tasks,
                         w.running_action_infos.len(),
-                        w.max_inflight_tasks
+                        w.pending_action_count(),
                     );
                 }
                 return false;
@@ -488,6 +609,11 @@ pub struct ApiWorkerScheduler {
 
     /// Performance metrics for observability.
     metrics: Arc<SchedulerMetrics>,
+
+    /// Bounded sender used by `WorkerReservation::Drop` to enqueue
+    /// cancellation cleanup on the releaser task. Cloned into every
+    /// reservation handle. Capacity is `RELEASE_CHANNEL_CAPACITY`.
+    release_tx: mpsc::Sender<WorkerReservationInner>,
 }
 
 impl ApiWorkerScheduler {
@@ -499,7 +625,10 @@ impl ApiWorkerScheduler {
         worker_timeout_s: u64,
         worker_registry: SharedWorkerRegistry,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let (release_tx, release_rx) =
+            mpsc::channel::<WorkerReservationInner>(RELEASE_CHANNEL_CAPACITY);
+        let metrics = Arc::new(SchedulerMetrics::default());
+        let arc_self = Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
                 worker_state_manager,
@@ -508,12 +637,241 @@ impl ApiWorkerScheduler {
                 worker_registry: worker_registry.clone(),
                 shutting_down: false,
                 capability_index: WorkerCapabilityIndex::new(),
+                // Start at 1 so `WorkerGeneration(0)` (the `Worker::new`
+                // default) is always distinguishable from a live generation.
+                next_generation: AtomicU64::new(1),
             }),
             platform_property_manager,
             worker_timeout_s,
             worker_registry,
-            metrics: Arc::new(SchedulerMetrics::default()),
+            metrics: Arc::clone(&metrics),
+            release_tx,
+        });
+
+        // Releaser task: drains reservations that were Drop-enqueued by
+        // future cancellation (pod shutdown, stream drop, panic). Uses a
+        // Weak reference so its existence does not keep the scheduler alive;
+        // terminates naturally when all senders drop.
+        let weak_self = Arc::downgrade(&arc_self);
+        tokio::spawn(Self::run_releaser(weak_self, release_rx, metrics));
+
+        arc_self
+    }
+
+    async fn run_releaser(
+        weak_self: Weak<Self>,
+        mut release_rx: mpsc::Receiver<WorkerReservationInner>,
+        metrics: Arc<SchedulerMetrics>,
+    ) {
+        while let Some(payload) = release_rx.recv().await {
+            let Some(scheduler) = weak_self.upgrade() else {
+                return;
+            };
+            {
+                let mut inner = scheduler.inner.lock().await;
+                if let Some(worker) = inner.workers.get_mut(&payload.worker_id) {
+                    // If the generation changed the worker has been replaced
+                    // and the new instance has its own (untouched) budget —
+                    // nothing to restore.
+                    if worker.generation() == payload.generation {
+                        worker.restore_budget(&payload.debits);
+                    }
+                }
+            }
+            metrics
+                .reservations_released
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Attempts to find a worker capable of running an action and reserves
+    /// its budget slot. The returned reservation must be consumed by
+    /// `commit_reservation` or `release_reservation`; if neither is called
+    /// the Drop impl enqueues cleanup on the releaser task.
+    pub async fn reserve_worker_for_action(
+        &self,
+        platform_properties: &PlatformProperties,
+        full_worker_logging: bool,
+    ) -> Option<WorkerReservation> {
+        let start = Instant::now();
+        self.metrics
+            .find_worker_calls
+            .fetch_add(1, Ordering::Relaxed);
+
+        let mut inner = self.inner.lock().await;
+        let worker_count = inner.workers.len() as u64;
+        let maybe_worker_id =
+            inner.inner_find_worker_for_action(platform_properties, full_worker_logging);
+
+        self.metrics
+            .workers_iterated
+            .fetch_add(worker_count, Ordering::Relaxed);
+
+        #[allow(clippy::cast_possible_truncation)]
+        self.metrics
+            .find_worker_time_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        let Some(worker_id) = maybe_worker_id else {
+            self.metrics
+                .find_worker_misses
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+
+        // Found a candidate — debit its budget under the lock so no other
+        // concurrent match can reserve the same slot.
+        let worker = inner
+            .workers
+            .get_mut(&worker_id)
+            .expect("inner_find_worker_for_action returned a worker in the pool");
+        let generation = worker.generation();
+        let debits = worker.reserve_budget(platform_properties);
+
+        self.metrics
+            .find_worker_hits
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .reservations_created
+            .fetch_add(1, Ordering::Relaxed);
+
+        Some(WorkerReservation {
+            inner: Some(WorkerReservationInner {
+                worker_id,
+                generation,
+                debits,
+                release_tx: self.release_tx.clone(),
+            }),
+            metrics: Arc::clone(&self.metrics),
         })
+    }
+
+    /// Commits a reservation to a running action: verifies the worker's
+    /// generation still matches, inserts the op into `running_action_infos`,
+    /// and sends `StartAction` to the worker.
+    ///
+    /// On generation mismatch or worker-gone, returns `Err((Some(res), err))`
+    /// with the reservation still armed — caller must release it so the
+    /// budget is refunded.
+    ///
+    /// On send failure (worker disconnected mid-finalize) the worker is
+    /// evicted (which requeues the just-inserted op via `UpdateWithDisconnect`)
+    /// and `Err((None, err))` is returned.
+    pub async fn commit_reservation(
+        &self,
+        res: WorkerReservation,
+        operation_id: OperationId,
+        action_info: ActionInfoWithProps,
+    ) -> Result<(), (Option<WorkerReservation>, Error)> {
+        let worker_id = res
+            .worker_id()
+            .expect("commit_reservation called on disarmed reservation")
+            .clone();
+        let expected_generation = res
+            .generation()
+            .expect("commit_reservation called on disarmed reservation");
+
+        let mut inner = self.inner.lock().await;
+
+        // Phase 1: generation fence (read-only on `inner.workers`).
+        let pool_generation = inner.workers.peek(&worker_id).map(Worker::generation);
+        match pool_generation {
+            Some(found) if found == expected_generation => { /* pass */ }
+            Some(found) => {
+                self.metrics
+                    .reservation_generation_mismatches
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .reservation_commit_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err((
+                    Some(res),
+                    make_err!(
+                        Code::Aborted,
+                        "worker {worker_id} generation mismatch: reservation was for {:?}, pool now has {:?}",
+                        expected_generation,
+                        found
+                    ),
+                ));
+            }
+            None => {
+                self.metrics
+                    .reservation_generation_mismatches
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .reservation_commit_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err((
+                    Some(res),
+                    make_err!(Code::Aborted, "worker {worker_id} no longer in pool"),
+                ));
+            }
+        }
+
+        // Phase 2: disarm and finalize. Scoping `worker` inside a block
+        // releases the mutable borrow of `inner.workers` before we may need
+        // to call `inner.immediate_evict_worker` on the error path.
+        let _payload = res.disarm();
+        let finalize_res = {
+            let worker = inner
+                .workers
+                .get_mut(&worker_id)
+                .expect("generation check held; worker still present under lock");
+            worker.finalize_run(operation_id, action_info).await
+        };
+
+        match finalize_res {
+            Ok(()) => {
+                self.metrics
+                    .reservations_committed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .actions_dispatched
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(notify_err) => {
+                let is_disconnect = notify_err.code == Code::Internal
+                    && notify_err.messages.len() == 1
+                    && notify_err.messages[0] == "Worker Disconnected";
+                let err = make_err!(
+                    Code::Internal,
+                    "Worker command failed during commit, removing worker {worker_id} -- {notify_err:?}",
+                );
+                let evict_res = inner
+                    .immediate_evict_worker(&worker_id, err.clone(), is_disconnect)
+                    .await;
+                self.metrics
+                    .reservation_commit_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                Err((
+                    None,
+                    Result::<(), _>::Err(err).merge(evict_res).unwrap_err(),
+                ))
+            }
+        }
+    }
+
+    /// Explicitly releases a reservation: restores the worker's debited
+    /// budget and increments `reservations_released`. On double-disarm the
+    /// call is a no-op (logged + counted via `reservation_disarm_bugs`).
+    pub async fn release_reservation(&self, res: WorkerReservation) {
+        let Some(payload) = res.disarm() else {
+            return;
+        };
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(worker) = inner.workers.get_mut(&payload.worker_id) {
+                if worker.generation() == payload.generation {
+                    worker.restore_budget(&payload.debits);
+                }
+                // Worker-replaced case: new instance has its own untouched
+                // budget; nothing to do.
+            }
+        }
+        self.metrics
+            .reservations_released
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns a reference to the worker registry.
@@ -521,19 +879,26 @@ impl ApiWorkerScheduler {
         &self.worker_registry
     }
 
+    /// Legacy one-shot dispatch: reserve + commit in a single locked step.
+    /// Retained for callers outside the matcher (tests, health paths) that
+    /// do not use the reserve/commit/release split. The matcher now goes
+    /// through `reserve_worker_for_action` + `commit_reservation`.
     pub async fn worker_notify_run_action(
         &self,
         worker_id: WorkerId,
         operation_id: OperationId,
         action_info: ActionInfoWithProps,
     ) -> Result<(), Error> {
-        self.metrics
-            .actions_dispatched
-            .fetch_add(1, Ordering::Relaxed);
         let mut inner = self.inner.lock().await;
-        inner
+        let result = inner
             .worker_notify_run_action(worker_id, operation_id, action_info)
-            .await
+            .await;
+        if result.is_ok() {
+            self.metrics
+                .actions_dispatched
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Returns the scheduler metrics for observability.

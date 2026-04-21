@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
+use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt, future};
 use nativelink_config::schedulers::SimpleSpec;
-use nativelink_error::{Code, Error, ResultExt};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::{MetricsComponent, RootMetricsComponent};
 use nativelink_proto::com::github::trace_machina::nativelink::events::OriginEvent;
 use nativelink_util::action_messages::{ActionInfo, ActionState, OperationId, WorkerId};
@@ -61,6 +62,14 @@ const DEFAULT_CLIENT_ACTION_TIMEOUT_S: u64 = 60;
 /// Default times a job can retry before failing.
 /// If this changes, remember to change the documentation in the config.
 const DEFAULT_MAX_JOB_RETRIES: usize = 3;
+
+/// Maximum number of reserve→commit matches driven concurrently by
+/// `do_try_match`. Chosen so the matcher's peak Redis connection usage
+/// (roughly one `assign_operation` round-trip per in-flight match) leaves
+/// headroom in the pool for subscriber polls and other command flows
+/// (`cas.json` `connection_pool_size: 20`). See the plan's "Resolved
+/// decisions" section for the rationale.
+const MAX_CONCURRENT_MATCHES: usize = 8;
 
 struct SimpleSchedulerActionStateResult {
     client_operation_id: OperationId,
@@ -212,105 +221,39 @@ impl SimpleScheduler {
         self.do_try_match(true).await
     }
 
-    // TODO(palfrey) This is an O(n*m) (aka n^2) algorithm. In theory we
-    // can create a map of capabilities of each worker and then try and match
-    // the actions to the worker using the map lookup (ie. map reduce).
+    /// Returns the inner `ApiWorkerScheduler` so callers can observe
+    /// scheduler metrics or (in tests) exercise the reserve/commit/release
+    /// API directly.
+    pub fn worker_scheduler(&self) -> &Arc<ApiWorkerScheduler> {
+        &self.worker_scheduler
+    }
+
+    /// Returns the matching-engine state manager so tests can drive
+    /// `assign_operation(...)` directly — used to verify the five-point
+    /// rollback contract (`Err(Code::ResourceExhausted)` returns an op to
+    /// `Queued` without bumping `attempts`).
+    pub fn matching_engine_state_manager(&self) -> &Arc<dyn MatchingEngineStateManager> {
+        &self.matching_engine_state_manager
+    }
+
     async fn do_try_match(&self, full_worker_logging: bool) -> Result<(), Error> {
-        async fn match_action_to_worker(
-            action_state_result: &dyn ActionStateResult,
-            workers: &ApiWorkerScheduler,
-            matching_engine_state_manager: &dyn MatchingEngineStateManager,
-            platform_property_manager: &PlatformPropertyManager,
-            full_worker_logging: bool,
-        ) -> Result<(), Error> {
-            let (action_info, maybe_origin_metadata) =
-                action_state_result
-                    .as_action_info()
-                    .await
-                    .err_tip(|| "Failed to get action_info from as_action_info_result stream")?;
-
-            // TODO(palfrey) We should not compute this every time and instead store
-            // it with the ActionInfo when we receive it.
-            let platform_properties = platform_property_manager
-                .make_platform_properties(action_info.platform_properties.clone())
-                .err_tip(
-                    || "Failed to make platform properties in SimpleScheduler::do_try_match",
-                )?;
-
-            let action_info = ActionInfoWithProps {
-                inner: action_info,
-                platform_properties,
-            };
-
-            // Try to find a worker for the action.
-            let worker_id = {
-                match workers
-                    .find_worker_for_action(&action_info.platform_properties, full_worker_logging)
-                    .await
-                {
-                    Some(worker_id) => worker_id,
-                    // If we could not find a worker for the action,
-                    // we have nothing to do.
-                    None => return Ok(()),
-                }
-            };
-
-            let attach_operation_fut = async move {
-                // Extract the operation_id from the action_state.
-                let operation_id = {
-                    let (action_state, _origin_metadata) = action_state_result
-                        .as_state()
-                        .await
-                        .err_tip(|| "Failed to get action_info from as_state_result stream")?;
-                    action_state.client_operation_id.clone()
-                };
-
-                // Tell the matching engine that the operation is being assigned to a worker.
-                let assign_result = matching_engine_state_manager
-                    .assign_operation(&operation_id, Ok(&worker_id))
-                    .await
-                    .err_tip(|| "Failed to assign operation in do_try_match");
-                if let Err(err) = assign_result {
-                    if err.code == Code::Aborted {
-                        // If the operation was aborted, it means that the operation was
-                        // cancelled due to another operation being assigned to the worker.
-                        return Ok(());
-                    }
-                    // Any other error is a real error.
-                    return Err(err);
-                }
-
-                debug!(%worker_id, %operation_id, ?action_info, "Notifying worker of operation");
-                workers
-                    .worker_notify_run_action(worker_id, operation_id, action_info)
-                    .await
-                    .err_tip(|| {
-                        "Failed to run worker_notify_run_action in SimpleScheduler::do_try_match"
-                    })
-            };
-            tokio::pin!(attach_operation_fut);
-
-            let origin_metadata = maybe_origin_metadata.unwrap_or_default();
-
-            let ctx = Context::current_with_baggage(vec![KeyValue::new(
-                ENDUSER_ID,
-                origin_metadata.identity,
-            )]);
-
-            info_span!("do_try_match")
-                .in_scope(|| attach_operation_fut)
-                .with_context(ctx)
-                .await
-        }
-
-        let mut result = Ok(());
-
         let start = Instant::now();
 
-        let mut stream = self
+        // Drain the queued-operations stream into an owned Vec before
+        // running the concurrent pipeline. The stream itself borrows the
+        // matching-engine state manager (its `'a` lifetime parameter), and
+        // `StreamExt::map(...).buffer_unordered(N)` compositions tripped
+        // a higher-ranked trait-bound inference that clashed with the
+        // outer `spawn!` `'static` requirement. A `Vec` + manual
+        // `FuturesUnordered` pump loop sidesteps that and makes the
+        // concurrency and priority-order semantics explicit.
+        let mut actions: std::collections::VecDeque<Box<dyn ActionStateResult>> = self
             .get_queued_operations()
             .await
-            .err_tip(|| "Failed to get queued operations in do_try_match")?;
+            .err_tip(|| "Failed to get queued operations in do_try_match")?
+            .collect::<Vec<_>>()
+            .await
+            .into();
 
         let query_elapsed = start.elapsed();
         if query_elapsed > Duration::from_secs(1) {
@@ -320,17 +263,42 @@ impl SimpleScheduler {
             );
         }
 
-        while let Some(action_state_result) = stream.next().await {
-            result = result.merge(
-                match_action_to_worker(
-                    action_state_result.as_ref(),
-                    self.worker_scheduler.as_ref(),
-                    self.matching_engine_state_manager.as_ref(),
-                    self.platform_property_manager.as_ref(),
+        // Drive up to `MAX_CONCURRENT_MATCHES` matches concurrently across
+        // their `.await` chains. Reservations are issued in
+        // priority/`state_sort_key` order (stream was ordered; the VecDeque
+        // preserves order; we pop from the front). Redis `assign_operation`
+        // and commit phases then run in parallel. `reserve_worker_for_action`
+        // fences over-subscription under the pool mutex, so concurrency
+        // here is safe wrt. worker capacity and budget.
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut result: Result<(), Error> = Ok(());
+
+        // Initial fill.
+        while in_flight.len() < MAX_CONCURRENT_MATCHES {
+            let Some(action) = actions.pop_front() else {
+                break;
+            };
+            in_flight.push(match_one(
+                action,
+                Arc::clone(&self.worker_scheduler),
+                Arc::clone(&self.matching_engine_state_manager),
+                Arc::clone(&self.platform_property_manager),
+                full_worker_logging,
+            ));
+        }
+
+        // Drain + refill loop.
+        while let Some(r) = in_flight.next().await {
+            result = result.merge(r);
+            if let Some(action) = actions.pop_front() {
+                in_flight.push(match_one(
+                    action,
+                    Arc::clone(&self.worker_scheduler),
+                    Arc::clone(&self.matching_engine_state_manager),
+                    Arc::clone(&self.platform_property_manager),
                     full_worker_logging,
-                )
-                .await,
-            );
+                ));
+            }
         }
 
         let total_elapsed = start.elapsed();
@@ -344,6 +312,137 @@ impl SimpleScheduler {
 
         result
     }
+}
+
+/// Per-action reserve → assign → commit pipeline. Owns the action through
+/// the full match lifecycle; returns `Ok(())` both on successful commit and
+/// on benign abort paths (no worker found, op already assigned elsewhere).
+///
+/// Rollback contract: on any failure after `assign_operation` has already
+/// committed state, we rewrite the op back to `Queued` by re-issuing
+/// `assign_operation(Err(Code::ResourceExhausted))` — which the state
+/// manager classifies as backpressure (see `simple_scheduler_state_manager.rs`
+/// `UpdateWithError` handling) and therefore does NOT bump
+/// `awaited_action.attempts`. The worker's debited budget is refunded via
+/// `release_reservation`. See the plan's five-point rollback contract.
+async fn match_one(
+    action_state_result: Box<dyn ActionStateResult>,
+    workers: Arc<ApiWorkerScheduler>,
+    state_manager: Arc<dyn MatchingEngineStateManager>,
+    ppm: Arc<PlatformPropertyManager>,
+    full_worker_logging: bool,
+) -> Result<(), Error> {
+    let (action_info, maybe_origin_metadata) = action_state_result
+        .as_action_info()
+        .await
+        .err_tip(|| "Failed to get action_info from as_action_info_result stream")?;
+
+    // TODO(palfrey) We should not compute this every time and instead store
+    // it with the ActionInfo when we receive it.
+    let platform_properties = ppm
+        .make_platform_properties(action_info.platform_properties.clone())
+        .err_tip(|| "Failed to make platform properties in SimpleScheduler::do_try_match")?;
+
+    let action_info = ActionInfoWithProps {
+        inner: action_info,
+        platform_properties,
+    };
+
+    let Some(reservation) = workers
+        .reserve_worker_for_action(&action_info.platform_properties, full_worker_logging)
+        .await
+    else {
+        return Ok(());
+    };
+
+    let worker_id = reservation
+        .worker_id()
+        .expect("reservation just issued is armed")
+        .clone();
+
+    let origin_metadata = maybe_origin_metadata.unwrap_or_default();
+    let ctx = Context::current_with_baggage(vec![KeyValue::new(
+        ENDUSER_ID,
+        origin_metadata.identity,
+    )]);
+
+    let attach_fut = async move {
+        let operation_id = {
+            let (action_state, _origin_metadata) = action_state_result
+                .as_state()
+                .await
+                .err_tip(|| "Failed to get action_info from as_state_result stream")?;
+            action_state.client_operation_id.clone()
+        };
+
+        let assign_result = state_manager
+            .assign_operation(&operation_id, Ok(&worker_id))
+            .await;
+
+        match assign_result {
+            Ok(()) => {
+                debug!(%worker_id, %operation_id, ?action_info, "Notifying worker of operation");
+                match workers
+                    .commit_reservation(reservation, operation_id.clone(), action_info)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err((Some(res), commit_err)) => {
+                        // Commit failed BEFORE finalize_run mutated any
+                        // worker state (generation fence or worker-gone).
+                        // The reservation is still armed — roll back the
+                        // assign we just committed using a backpressure
+                        // error code so `attempts` is not incremented, then
+                        // release the reservation to refund the budget.
+                        let rollback_err = make_err!(
+                            Code::ResourceExhausted,
+                            "commit_reservation failed after assign: {commit_err}",
+                        );
+                        if let Err(rollback_fail) = state_manager
+                            .assign_operation(&operation_id, Err(rollback_err))
+                            .await
+                        {
+                            error!(
+                                %operation_id,
+                                ?rollback_fail,
+                                "Failed to roll back assign_operation after commit failure"
+                            );
+                        }
+                        workers.release_reservation(res).await;
+                        Err(commit_err)
+                            .err_tip(|| "Failed to commit reservation in SimpleScheduler::do_try_match")
+                    }
+                    Err((None, commit_err)) => {
+                        // Commit failed DURING finalize_run (worker
+                        // disconnected). `immediate_evict_worker` has already
+                        // drained the worker's `running_action_infos` and
+                        // requeued this op via `UpdateWithDisconnect` (no
+                        // attempts bump). Nothing left to clean up here.
+                        Err(commit_err)
+                            .err_tip(|| "Failed to commit reservation in SimpleScheduler::do_try_match")
+                    }
+                }
+            }
+            Err(assign_err) if assign_err.code == Code::Aborted => {
+                // Op was cancelled or already assigned elsewhere; the state
+                // manager has already moved on. Release our reservation.
+                workers.release_reservation(reservation).await;
+                Ok(())
+            }
+            Err(assign_err) => {
+                // Assign itself failed. State is unchanged or already
+                // updated by the state manager; either way we have nothing
+                // to roll back. Just release the reservation.
+                workers.release_reservation(reservation).await;
+                Err(assign_err).err_tip(|| "Failed to assign operation in do_try_match")
+            }
+        }
+    };
+
+    info_span!("do_try_match")
+        .in_scope(|| attach_fut)
+        .with_context(ctx)
+        .await
 }
 
 impl SimpleScheduler {

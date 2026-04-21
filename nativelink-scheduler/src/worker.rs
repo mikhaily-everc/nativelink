@@ -29,6 +29,14 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub type WorkerTimestamp = u64;
 
+/// Monotonically-increasing identifier minted by the scheduler each time a
+/// `Worker` is added to the pool. Reservations capture the generation of the
+/// worker they were issued against so that a reservation held across a
+/// worker reconnect (which replaces the `Worker` in the pool under the same
+/// `WorkerId`) can detect staleness at commit time and refuse to apply.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WorkerGeneration(pub u64);
+
 /// Represents the action info and the platform properties of the action.
 /// These platform properties have the type of the properties as well as
 /// the value of the properties, unlike `ActionInfo`, which only has the
@@ -99,6 +107,18 @@ pub struct Worker {
     #[metric(help = "Maximum inflight tasks for this worker (or 0 for unlimited)")]
     pub max_inflight_tasks: u64,
 
+    /// Generation tag assigned by the scheduler at `add_worker` time. Used to
+    /// fence reservations against worker reconnects (see `WorkerGeneration`).
+    /// Defaults to `WorkerGeneration(0)` at construction; overwritten by the
+    /// scheduler before the worker enters the pool.
+    generation: WorkerGeneration,
+
+    /// Number of reservations issued against this worker that have not yet
+    /// been committed or released. Included in `can_accept_work` so two
+    /// concurrent matches against the same worker cannot both pass the
+    /// inflight-capacity check before either has entered `running_action_infos`.
+    pending_action_count: usize,
+
     /// Stats about the worker.
     #[metric]
     metrics: Arc<Metrics>,
@@ -110,26 +130,6 @@ fn send_msg_to_worker(
 ) -> Result<(), Error> {
     tx.send(UpdateForWorker { update: Some(msg) })
         .map_err(|err| Error::from_std_err(Code::Internal, &err).append("Worker disconnected"))
-}
-
-/// Reduces the platform properties available on the worker based on the platform properties provided.
-/// This is used because we allow more than 1 job to run on a worker at a time, and this is how the
-/// scheduler knows if more jobs can run on a given worker.
-fn reduce_platform_properties(
-    parent_props: &mut PlatformProperties,
-    reduction_props: &PlatformProperties,
-) {
-    debug_assert!(reduction_props.is_satisfied_by(parent_props, false));
-    for (property, prop_value) in &reduction_props.properties {
-        if let PlatformPropertyValue::Minimum(value) = prop_value {
-            let worker_props = &mut parent_props.properties;
-            if let &mut PlatformPropertyValue::Minimum(worker_value) =
-                &mut worker_props.get_mut(property).unwrap()
-            {
-                *worker_value -= value;
-            }
-        }
-    }
 }
 
 impl Worker {
@@ -150,6 +150,8 @@ impl Worker {
             is_paused: false,
             is_draining: false,
             max_inflight_tasks,
+            generation: WorkerGeneration(0),
+            pending_action_count: 0,
             metrics: Arc::new(Metrics {
                 connected_timestamp: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -202,9 +204,72 @@ impl Worker {
         operation_id: OperationId,
         action_info: ActionInfoWithProps,
     ) -> Result<(), Error> {
+        // Legacy one-shot path: reserve budget + finalize in a single step.
+        // Retained for callers outside the matcher (e.g. tests, health paths)
+        // that do not need the reserve/commit/release split.
+        let _debits = self.reserve_budget(&action_info.platform_properties);
+        self.finalize_run(operation_id, action_info).await
+    }
+
+    /// Debit the worker's `Minimum` budget for a pending match and bump the
+    /// pending counter. Returns the list of debits so they can be restored
+    /// via `restore_budget` if the match never commits.
+    ///
+    /// Must only be called by the scheduler holding the pool lock — the
+    /// returned debits are consumed asymmetrically by either `finalize_run`
+    /// (which leaves the budget debited because the action is now running)
+    /// or `restore_budget` (which refunds the budget on rollback).
+    pub(crate) fn reserve_budget(
+        &mut self,
+        action_props: &PlatformProperties,
+    ) -> Vec<(String, PlatformPropertyValue)> {
+        debug_assert!(action_props.is_satisfied_by(&self.platform_properties, false));
+        let mut debits: Vec<(String, PlatformPropertyValue)> = Vec::new();
+        for (property, prop_value) in &action_props.properties {
+            if let PlatformPropertyValue::Minimum(value) = prop_value {
+                let worker_props = &mut self.platform_properties.properties;
+                if let Some(PlatformPropertyValue::Minimum(worker_value)) =
+                    worker_props.get_mut(property)
+                {
+                    *worker_value -= value;
+                    debits.push((property.clone(), PlatformPropertyValue::Minimum(*value)));
+                }
+            }
+        }
+        self.pending_action_count += 1;
+        debits
+    }
+
+    /// Inverse of `reserve_budget`: add the debited values back to the worker
+    /// and decrement the pending counter. Invoked on reservation release
+    /// (explicit `release_reservation` from the matcher, or Drop-triggered
+    /// cleanup via the release channel).
+    pub(crate) fn restore_budget(&mut self, debits: &[(String, PlatformPropertyValue)]) {
+        for (property, prop_value) in debits {
+            if let PlatformPropertyValue::Minimum(value) = prop_value {
+                let worker_props = &mut self.platform_properties.properties;
+                if let Some(PlatformPropertyValue::Minimum(worker_value)) =
+                    worker_props.get_mut(property)
+                {
+                    *worker_value += value;
+                }
+            }
+        }
+        self.pending_action_count = self.pending_action_count.saturating_sub(1);
+    }
+
+    /// Commit a previously-reserved match onto the worker: insert into
+    /// `running_action_infos`, decrement the pending counter, and send
+    /// `StartAction` to the worker process. Does NOT re-debit platform
+    /// properties — `reserve_budget` already did that.
+    pub(crate) async fn finalize_run(
+        &mut self,
+        operation_id: OperationId,
+        action_info: ActionInfoWithProps,
+    ) -> Result<(), Error> {
         let tx = &mut self.tx;
-        let worker_platform_properties = &mut self.platform_properties;
         let running_action_infos = &mut self.running_action_infos;
+        let pending_action_count = &mut self.pending_action_count;
         let worker_id = self.id.clone().into();
         self.metrics
             .run_action
@@ -218,15 +283,29 @@ impl Worker {
                     platform: Some((&action_info.platform_properties).into()),
                     worker_id,
                 };
-                reduce_platform_properties(
-                    worker_platform_properties,
-                    &action_info.platform_properties,
-                );
                 running_action_infos.insert(operation_id, PendingActionInfoData { action_info });
+                *pending_action_count = pending_action_count.saturating_sub(1);
 
                 send_msg_to_worker(tx, update_for_worker::Update::StartAction(start_execute))
             })
             .await
+    }
+
+    pub(crate) fn generation(&self) -> WorkerGeneration {
+        self.generation
+    }
+
+    pub(crate) fn set_generation(&mut self, generation: WorkerGeneration) {
+        self.generation = generation;
+    }
+
+    pub(crate) fn pending_action_count(&self) -> usize {
+        self.pending_action_count
+    }
+
+    #[cfg(test)]
+    pub fn pending_action_count_for_test(&self) -> usize {
+        self.pending_action_count
     }
 
     pub(crate) fn execution_complete(&mut self, operation_id: &OperationId) {
@@ -280,7 +359,8 @@ impl Worker {
         !self.is_paused
             && !self.is_draining
             && (self.max_inflight_tasks == 0
-                || u64::try_from(self.running_action_infos.len()).unwrap_or(u64::MAX)
+                || u64::try_from(self.running_action_infos.len() + self.pending_action_count)
+                    .unwrap_or(u64::MAX)
                     < self.max_inflight_tasks)
     }
 }
