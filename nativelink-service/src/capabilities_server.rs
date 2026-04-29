@@ -24,7 +24,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::digest_function::Valu
 use nativelink_proto::build::bazel::remote::execution::v2::priority_capabilities::PriorityRange;
 use nativelink_proto::build::bazel::remote::execution::v2::symlink_absolute_path_strategy::Value as SymlinkAbsolutePathStrategy;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    ActionCacheUpdateCapabilities, CacheCapabilities, ExecutionCapabilities,
+    ActionCacheUpdateCapabilities, CacheCapabilities, ExecutionCapabilities, FastCdc2020Params,
     GetCapabilitiesRequest, PriorityCapabilities, ServerCapabilities,
 };
 use nativelink_proto::build::bazel::semver::SemVer;
@@ -38,12 +38,17 @@ const MAX_BATCH_TOTAL_SIZE: i64 = 64 * 1024;
 #[derive(Debug, Default)]
 pub struct CapabilitiesServer {
     supported_node_properties_for_instance: HashMap<InstanceName, Vec<String>>,
+    /// Whether the CAS service for this instance has a splice-manifest store
+    /// wired up — i.e. whether it will honor SplitBlob/SpliceBlob. Used to
+    /// advertise `CacheCapabilities.split_blob_support` / `splice_blob_support`.
+    chunking_enabled_for_instance: HashMap<InstanceName, bool>,
 }
 
 impl CapabilitiesServer {
     pub async fn new(
         configs: &[WithInstanceName<CapabilitiesConfig>],
         scheduler_map: &HashMap<String, Arc<dyn ClientStateManager>>,
+        chunking_enabled_for_instance: HashMap<InstanceName, bool>,
     ) -> Result<Self, Error> {
         let mut supported_node_properties_for_instance = HashMap::new();
         for config in configs {
@@ -82,6 +87,7 @@ impl CapabilitiesServer {
         }
         Ok(Self {
             supported_node_properties_for_instance,
+            chunking_enabled_for_instance,
         })
     }
 
@@ -109,6 +115,11 @@ impl Capabilities for CapabilitiesServer {
         let maybe_supported_node_properties = self
             .supported_node_properties_for_instance
             .get(&instance_name);
+        let chunking_enabled = self
+            .chunking_enabled_for_instance
+            .get(&instance_name)
+            .copied()
+            .unwrap_or(false);
         let execution_capabilities =
             maybe_supported_node_properties.map(|props_for_instance| ExecutionCapabilities {
                 digest_function: default_digest_hasher_func().proto_digest_func().into(),
@@ -140,6 +151,18 @@ impl Capabilities for CapabilitiesServer {
                 symlink_absolute_path_strategy: SymlinkAbsolutePathStrategy::Disallowed.into(),
                 supported_compressors: vec![],
                 supported_batch_update_compressors: vec![],
+                split_blob_support: chunking_enabled,
+                splice_blob_support: chunking_enabled,
+                // When chunking is enabled, advertise FastCDC 2020 so Bazel
+                // clients accept --experimental_remote_cache_chunking. The
+                // chunker runs client-side; the server only stores the chunk
+                // list and verifies concatenation in SpliceBlob, so no
+                // server-side algorithm implementation is required.
+                fast_cdc_2020_params: chunking_enabled.then(|| FastCdc2020Params {
+                    avg_chunk_size_bytes: 524_288, // 512 KiB (REAPI recommended)
+                    seed: 0,
+                }),
+                rep_max_cdc_params: None,
             }),
             execution_capabilities,
             deprecated_api_version: None,

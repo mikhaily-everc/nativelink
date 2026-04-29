@@ -54,6 +54,13 @@ const BASE_RETRY_DELAY_MS: u64 = 10;
 /// Maximum jitter to add to retry delay (in ms).
 const MAX_RETRY_JITTER_MS: u64 = 20;
 
+/// Concurrency for the per-item work inside `filter_operations`: each item
+/// triggers `subscriber.borrow()` (two Redis HGETs) and an
+/// `apply_filter_predicate` check. Running these serially made the matcher's
+/// `get_queued_operations` drain scale with queue depth × Redis RTT. Using
+/// `try_buffered(N)` runs them concurrently while preserving upstream order.
+const FILTER_OPERATIONS_CONCURRENCY: usize = 16;
+
 /// Simple struct that implements the `ActionStateResult` trait and always returns an error.
 struct ErrorActionStateResult(Error);
 
@@ -994,27 +1001,29 @@ where
         let Some(sorted_awaited_action_state) =
             sorted_awaited_action_state_for_flags(filter.stages)
         else {
+            let filter_for_stream = filter.clone();
             let mut all_items: Vec<_> = self
                 .action_db
                 .get_all_awaited_actions()
                 .await
                 .err_tip(|| "In SimpleSchedulerStateManager::filter_operations")?
-                .and_then(|awaited_action_subscriber| async move {
-                    let awaited_action = awaited_action_subscriber
-                        .borrow()
-                        .await
-                        .err_tip(|| "In SimpleSchedulerStateManager::filter_operations")?;
-                    Ok((awaited_action_subscriber, awaited_action))
-                })
-                .try_filter_map(|(subscriber, awaited_action)| {
-                    let filter = filter.clone();
+                .map_ok(move |subscriber| {
+                    let filter = filter_for_stream.clone();
                     async move {
-                        Ok(self
-                            .apply_filter_predicate(&awaited_action, &subscriber, &filter)
+                        let awaited_action = subscriber
+                            .borrow()
                             .await
-                            .then_some((subscriber, awaited_action.sort_key())))
+                            .err_tip(|| "In SimpleSchedulerStateManager::filter_operations")?;
+                        let pass = self
+                            .apply_filter_predicate(&awaited_action, &subscriber, &filter)
+                            .await;
+                        Ok::<_, Error>(
+                            pass.then(|| (subscriber, awaited_action.sort_key())),
+                        )
                     }
                 })
+                .try_buffered(FILTER_OPERATIONS_CONCURRENCY)
+                .try_filter_map(|maybe_pair| futures::future::ready(Ok(maybe_pair)))
                 .try_collect()
                 .await
                 .err_tip(|| "In SimpleSchedulerStateManager::filter_operations")?;
@@ -1036,6 +1045,12 @@ where
             filter.order_by_priority_direction,
             Some(OrderDirection::Desc)
         );
+        // Each item triggers two serial Redis round-trips in `borrow()`
+        // (HGET for the awaited action, HGET for the keepalive key).
+        // Observed drain was 100-300 ms per item × queue depth.
+        // `try_buffered(N)` runs borrow + filter concurrently across N items
+        // while preserving the sort order established by the upstream
+        // FT.AGGREGATE SORTBY clause.
         let stream = self
             .action_db
             .get_range_of_actions(
@@ -1046,22 +1061,22 @@ where
             )
             .await
             .err_tip(|| "In SimpleSchedulerStateManager::filter_operations")?
-            .and_then(|awaited_action_subscriber| async move {
-                let awaited_action = awaited_action_subscriber
-                    .borrow()
-                    .await
-                    .err_tip(|| "In SimpleSchedulerStateManager::filter_operations")?;
-                Ok((awaited_action_subscriber, awaited_action))
-            })
-            .try_filter_map(move |(subscriber, awaited_action)| {
+            .map_ok(move |subscriber| {
                 let filter = filter.clone();
                 async move {
-                    Ok(self
-                        .apply_filter_predicate(&awaited_action, &subscriber, &filter)
+                    let awaited_action = subscriber
+                        .borrow()
                         .await
-                        .then_some(subscriber))
+                        .err_tip(|| "In SimpleSchedulerStateManager::filter_operations")?;
+                    Ok::<_, Error>(
+                        self.apply_filter_predicate(&awaited_action, &subscriber, &filter)
+                            .await
+                            .then_some(subscriber),
+                    )
                 }
             })
+            .try_buffered(FILTER_OPERATIONS_CONCURRENCY)
+            .try_filter_map(|maybe_subscriber| futures::future::ready(Ok(maybe_subscriber)))
             .map(move |result| -> Box<dyn ActionStateResult> {
                 result.map_or_else(
                     |e| -> Box<dyn ActionStateResult> { Box::new(ErrorActionStateResult(e)) },

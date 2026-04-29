@@ -3004,6 +3004,7 @@ dependencies = [
  "async-lock",
  "async-trait",
  "axum",
+ "bincode",
  "bytes",
  "futures",
  "hex",

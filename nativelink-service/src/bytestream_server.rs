@@ -518,13 +518,18 @@ impl ByteStreamServer {
                     // The original stream's connection died but hasn't been cleaned up yet.
                     // Replace the entry so the new stream takes over the UUID slot.
                     // The old stream's Arc becomes orphaned and is freed when its task exits.
+                    // The orphaned `store_update_fut` keeps writing to `digest`, so this
+                    // path can produce two concurrent CAS writes for the same key —
+                    // keep `digest` queryable in logs to correlate with downstream
+                    // SpliceBlob `Code::DataLoss` events on chunk content corruption.
                     let current_bytes = entry.get().0.load(Ordering::Acquire);
                     let bytes_received = Arc::new(AtomicU64::new(current_bytes));
                     entry.insert((bytes_received.clone(), None));
                     warn!(
                         msg = "UUID collision detected, replacing existing stream",
                         original_uuid = format!("{:032x}", original_key),
-                        bytes_received = current_bytes
+                        bytes_received = current_bytes,
+                        digest = %digest,
                     );
                     (original_key, bytes_received, true)
                 }

@@ -1438,6 +1438,93 @@ pub struct GetTreeResponse {
     pub next_page_token: ::prost::alloc::string::String,
 }
 /// A request message for
+/// [ContentAddressableStorage.SplitBlob][build.bazel.remote.execution.v2.ContentAddressableStorage.SplitBlob].
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SplitBlobRequest {
+    /// The instance of the execution system to operate against. A server may
+    /// support multiple instances of the execution system (with their own workers,
+    /// storage, caches, etc.). The server MAY require use of this field to select
+    /// between them in an implementation-defined fashion, otherwise it can be
+    /// omitted.
+    #[prost(string, tag = "1")]
+    pub instance_name: ::prost::alloc::string::String,
+    /// The digest of the blob to be split.
+    #[prost(message, optional, tag = "2")]
+    pub blob_digest: ::core::option::Option<Digest>,
+    /// The digest function of the blob to be split.
+    ///
+    /// If the digest function used is one of MD5, MURMUR3, SHA1, SHA256,
+    /// SHA384, SHA512, or VSO, the client MAY leave this field unset. In
+    /// that case the server SHOULD infer the digest function using the
+    /// length of the blob digest hashes and the digest functions announced
+    /// in the server's capabilities.
+    #[prost(enumeration = "digest_function::Value", tag = "3")]
+    pub digest_function: i32,
+    /// The chunking function that the client prefers to use.
+    ///
+    /// The server MAY use a different chunking function.
+    #[prost(enumeration = "chunking_function::Value", tag = "4")]
+    pub chunking_function: i32,
+}
+/// A response message for
+/// [ContentAddressableStorage.SplitBlob][build.bazel.remote.execution.v2.ContentAddressableStorage.SplitBlob].
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SplitBlobResponse {
+    /// The ordered list of digests of the chunks into which the blob was split.
+    /// The original blob is assembled by concatenating the chunk data according to
+    /// the order of the digests given by this list.
+    ///
+    /// The server MUST use the same digest function as the one explicitly or
+    /// implicitly (through hash length) specified in the split request.
+    #[prost(message, repeated, tag = "1")]
+    pub chunk_digests: ::prost::alloc::vec::Vec<Digest>,
+    /// The chunking function used to split the blob.
+    #[prost(enumeration = "chunking_function::Value", tag = "2")]
+    pub chunking_function: i32,
+}
+/// A request message for
+/// [ContentAddressableStorage.SpliceBlob][build.bazel.remote.execution.v2.ContentAddressableStorage.SpliceBlob].
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpliceBlobRequest {
+    /// The instance of the execution system to operate against. A server may
+    /// support multiple instances of the execution system (with their own workers,
+    /// storage, caches, etc.). The server MAY require use of this field to select
+    /// between them in an implementation-defined fashion, otherwise it can be
+    /// omitted.
+    #[prost(string, tag = "1")]
+    pub instance_name: ::prost::alloc::string::String,
+    /// Expected digest of the spliced blob.
+    #[prost(message, optional, tag = "2")]
+    pub blob_digest: ::core::option::Option<Digest>,
+    /// The ordered list of digests of the chunks which need to be concatenated to
+    /// assemble the original blob.
+    #[prost(message, repeated, tag = "3")]
+    pub chunk_digests: ::prost::alloc::vec::Vec<Digest>,
+    /// The digest function of all chunks to be concatenated and of the blob to be
+    /// spliced. The server MUST use the same digest function for both cases.
+    ///
+    /// If the digest function used is one of MD5, MURMUR3, SHA1, SHA256, SHA384,
+    /// SHA512, or VSO, the client MAY leave this field unset. In that case the
+    /// server SHOULD infer the digest function using the length of the blob digest
+    /// hashes and the digest functions announced in the server's capabilities.
+    #[prost(enumeration = "digest_function::Value", tag = "4")]
+    pub digest_function: i32,
+    /// The chunking function that the client used to split the blob.
+    #[prost(enumeration = "chunking_function::Value", tag = "5")]
+    pub chunking_function: i32,
+}
+/// A response message for
+/// [ContentAddressableStorage.SpliceBlob][build.bazel.remote.execution.v2.ContentAddressableStorage.SpliceBlob].
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpliceBlobResponse {
+    /// Computed digest of the spliced blob.
+    ///
+    /// The server MUST use the same digest function as the one explicitly or
+    /// implicitly (through hash length) specified in the splice request.
+    #[prost(message, optional, tag = "1")]
+    pub blob_digest: ::core::option::Option<Digest>,
+}
+/// A request message for
 /// [Capabilities.GetCapabilities][build.bazel.remote.execution.v2.Capabilities.GetCapabilities].
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetCapabilitiesRequest {
@@ -1691,6 +1778,67 @@ pub mod symlink_absolute_path_strategy {
         }
     }
 }
+/// The chunking function is used to split a blob into chunks.
+///
+/// The server advertises support for a chunking function by setting the
+/// corresponding params field in
+/// [CacheCapabilities][build.bazel.remote.execution.v2.CacheCapabilities].
+///
+/// For optimal deduplication, clients SHOULD use an advertised chunking function.
+/// When clients use UNKNOWN, the server chooses an algorithm for SplitBlob and
+/// simply verifies chunk concatenation for SpliceBlob.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ChunkingFunction {}
+/// Nested message and enum types in `ChunkingFunction`.
+pub mod chunking_function {
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration
+    )]
+    #[repr(i32)]
+    pub enum Value {
+        /// No specific algorithm. Servers MUST always accept this value.
+        /// For SplitBlob, the server chooses the algorithm. For SpliceBlob, the
+        /// server only verifies that chunks concatenate to form the expected blob.
+        Unknown = 0,
+        /// The FastCDC chunking algorithm as described in the 2020 paper by
+        /// Wen Xia, et al. See <https://ieeexplore.ieee.org/document/9055082>
+        /// for details.
+        FastCdc2020 = 1,
+        /// The RepMaxCDC chunking algorithm as implemented by buildbarn/go-cdc.
+        /// See <https://github.com/buildbarn/go-cdc> for details.
+        RepMaxCdc = 2,
+    }
+    impl Value {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unknown => "UNKNOWN",
+                Self::FastCdc2020 => "FAST_CDC_2020",
+                Self::RepMaxCdc => "REP_MAX_CDC",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "UNKNOWN" => Some(Self::Unknown),
+                "FAST_CDC_2020" => Some(Self::FastCdc2020),
+                "REP_MAX_CDC" => Some(Self::RepMaxCdc),
+                _ => None,
+            }
+        }
+    }
+}
 /// Compression formats which may be supported.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct Compressor {}
@@ -1786,6 +1934,61 @@ pub struct CacheCapabilities {
     /// requests.
     #[prost(enumeration = "compressor::Value", repeated, tag = "7")]
     pub supported_batch_update_compressors: ::prost::alloc::vec::Vec<i32>,
+    /// Whether blob splitting is supported for the particular server/instance. If
+    /// yes, the server/instance implements the specified behavior for blob
+    /// splitting and a meaningful result can be expected from the
+    /// [ContentAddressableStorage.SplitBlob][build.bazel.remote.execution.v2.ContentAddressableStorage.SplitBlob]
+    /// operation.
+    #[prost(bool, tag = "9")]
+    pub split_blob_support: bool,
+    /// Whether blob splicing is supported for the particular server/instance. If
+    /// yes, the server/instance implements the specified behavior for blob
+    /// splicing and a meaningful result can be expected from the
+    /// [ContentAddressableStorage.SpliceBlob][build.bazel.remote.execution.v2.ContentAddressableStorage.SpliceBlob]
+    /// operation.
+    #[prost(bool, tag = "10")]
+    pub splice_blob_support: bool,
+    /// The parameters for the FastCDC 2020 chunking algorithm.
+    /// If set, the server supports the FastCDC chunking algorithm.
+    #[prost(message, optional, tag = "11")]
+    pub fast_cdc_2020_params: ::core::option::Option<FastCdc2020Params>,
+    /// The parameters for the RepMaxCDC chunking algorithm.
+    /// If set, the server supports the RepMaxCDC chunking algorithm.
+    #[prost(message, optional, tag = "12")]
+    pub rep_max_cdc_params: ::core::option::Option<RepMaxCdcParams>,
+}
+/// Parameters for the FastCDC content-defined chunking algorithm.
+/// See Bazel PR bazelbuild/bazel#28903 and the 2020 paper by Wen Xia et al.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct FastCdc2020Params {
+    /// The average (expected) chunk size for the FastCDC chunking algorithm.
+    /// The value MUST be between 1 KiB and 1 MiB. The recommended value is
+    /// 524288 (512 KiB).
+    #[prost(uint64, tag = "1")]
+    pub avg_chunk_size_bytes: u64,
+    /// The seed for the FastCDC mask generation.
+    /// The recommended value is 0.
+    ///
+    /// All clients sharing a cache SHOULD use the same seed to maximize
+    /// chunk reuse.
+    #[prost(uint32, tag = "2")]
+    pub seed: u32,
+}
+/// Parameters for the RepMaxCDC content-defined chunking algorithm.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RepMaxCdcParams {
+    /// The minimum chunk size for the RepMaxCDC chunking algorithm.
+    /// The value MUST be at least 64 bytes (the Gear hash window size).
+    /// All chunks will be in the range [min_chunk_size_bytes, 2*min_chunk_size_bytes).
+    /// The recommended value is 262144 (256 KiB).
+    #[prost(uint64, tag = "1")]
+    pub min_chunk_size_bytes: u64,
+    /// The lookahead window for finding optimal cutting points.
+    /// Larger values improve deduplication quality with diminishing returns.
+    /// Setting to 0 produces uniform chunks of min_chunk_size_bytes.
+    /// The recommended value is 8 * min_chunk_size_bytes.
+    #[prost(uint64, tag = "2")]
+    pub horizon_size_bytes: u64,
 }
 /// Capabilities of the remote execution system.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2718,6 +2921,125 @@ pub mod content_addressable_storage_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        /// SplitBlob retrieves information about how a blob is split into chunks.
+        ///
+        /// This call returns information about how a blob is split into chunks, and
+        /// returns a list of the chunk digests. Using the returned list of chunk digests,
+        /// a client can check which chunks are locally available and only fetch the
+        /// missing ones. The desired blob can be assembled by concatenating the fetched
+        /// chunks in the order of the digests in the list. The chunks SHOULD all be
+        /// available in the CAS.
+        ///
+        /// This API can be used to reduce the required data to download a large blob
+        /// from CAS if some chunks from similar blobs are locally available. For this
+        /// procedure to work properly, blobs SHOULD be split in a content-defined way,
+        /// rather than with fixed-sized chunking.
+        ///
+        /// Servers which implement this functionality MUST declare that they support
+        /// it by setting the
+        /// [CacheCapabilities.split_blob_support][build.bazel.remote.execution.v2.CacheCapabilities.split_blob_support]
+        /// field accordingly.
+        ///
+        /// Clients MUST check that the server supports this capability, before using
+        /// it.
+        ///
+        /// Errors:
+        ///
+        /// * `NOT_FOUND`: The requested blob is not present in the CAS, OR there is no
+        ///   split information available for the blob, OR at least one chunk needed to
+        ///   reconstruct the blob is missing from the CAS.
+        pub async fn split_blob(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SplitBlobRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SplitBlobResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "build.bazel.remote.execution.v2.ContentAddressableStorage",
+                        "SplitBlob",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// SpliceBlob tells the CAS how chunks can compose a blob.
+        ///
+        /// This is the complementary operation to the
+        /// [ContentAddressableStorage.SplitBlob][build.bazel.remote.execution.v2.ContentAddressableStorage.SplitBlob]
+        /// function to handle the chunked upload of large blobs to save upload
+        /// traffic.
+        ///
+        /// When uploading a large blob using chunked upload, clients MUST first upload
+        /// all chunks to the CAS, then call this RPC to tell the server how those chunks
+        /// compose the original blob.
+        ///
+        /// Servers which implement this functionality MUST declare that they support
+        /// it by setting the
+        /// [CacheCapabilities.splice_blob_support][build.bazel.remote.execution.v2.CacheCapabilities.splice_blob_support]
+        /// field accordingly.
+        ///
+        /// Clients MUST check that the server supports this capability, before using
+        /// it.
+        ///
+        /// In order to ensure data consistency of the CAS, the server MUST only add
+        /// blobs to the CAS after verifying their digests. In particular, servers MUST NOT
+        /// trust digests provided by the client. The server MAY accept a request as no-op
+        /// if the client-specified blob is already in CAS or if information on how to
+        /// construct the blob from chunks is available. If the client-specified blob is
+        /// not already in the CAS, the server MUST verify that the digest of the newly
+        /// created blob assembled from chunks matches the digest specified by the
+        /// client, and reject the request if they differ.
+        ///
+        /// Errors:
+        ///
+        /// * `FAILED_PRECONDITION`: At least one of the referenced chunks is not
+        ///   present in the CAS.
+        /// * `INVALID_ARGUMENT`: The digest of the blob reassembled from chunks does
+        ///   not match the digest specified by the client.
+        pub async fn splice_blob(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SpliceBlobRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SpliceBlobResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/build.bazel.remote.execution.v2.ContentAddressableStorage/SpliceBlob",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "build.bazel.remote.execution.v2.ContentAddressableStorage",
+                        "SpliceBlob",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated client implementations.
@@ -3588,6 +3910,81 @@ pub mod content_addressable_storage_server {
             &self,
             request: tonic::Request<super::GetTreeRequest>,
         ) -> std::result::Result<tonic::Response<Self::GetTreeStream>, tonic::Status>;
+        /// SplitBlob retrieves information about how a blob is split into chunks.
+        ///
+        /// This call returns information about how a blob is split into chunks, and
+        /// returns a list of the chunk digests. Using the returned list of chunk digests,
+        /// a client can check which chunks are locally available and only fetch the
+        /// missing ones. The desired blob can be assembled by concatenating the fetched
+        /// chunks in the order of the digests in the list. The chunks SHOULD all be
+        /// available in the CAS.
+        ///
+        /// This API can be used to reduce the required data to download a large blob
+        /// from CAS if some chunks from similar blobs are locally available. For this
+        /// procedure to work properly, blobs SHOULD be split in a content-defined way,
+        /// rather than with fixed-sized chunking.
+        ///
+        /// Servers which implement this functionality MUST declare that they support
+        /// it by setting the
+        /// [CacheCapabilities.split_blob_support][build.bazel.remote.execution.v2.CacheCapabilities.split_blob_support]
+        /// field accordingly.
+        ///
+        /// Clients MUST check that the server supports this capability, before using
+        /// it.
+        ///
+        /// Errors:
+        ///
+        /// * `NOT_FOUND`: The requested blob is not present in the CAS, OR there is no
+        ///   split information available for the blob, OR at least one chunk needed to
+        ///   reconstruct the blob is missing from the CAS.
+        async fn split_blob(
+            &self,
+            request: tonic::Request<super::SplitBlobRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SplitBlobResponse>,
+            tonic::Status,
+        >;
+        /// SpliceBlob tells the CAS how chunks can compose a blob.
+        ///
+        /// This is the complementary operation to the
+        /// [ContentAddressableStorage.SplitBlob][build.bazel.remote.execution.v2.ContentAddressableStorage.SplitBlob]
+        /// function to handle the chunked upload of large blobs to save upload
+        /// traffic.
+        ///
+        /// When uploading a large blob using chunked upload, clients MUST first upload
+        /// all chunks to the CAS, then call this RPC to tell the server how those chunks
+        /// compose the original blob.
+        ///
+        /// Servers which implement this functionality MUST declare that they support
+        /// it by setting the
+        /// [CacheCapabilities.splice_blob_support][build.bazel.remote.execution.v2.CacheCapabilities.splice_blob_support]
+        /// field accordingly.
+        ///
+        /// Clients MUST check that the server supports this capability, before using
+        /// it.
+        ///
+        /// In order to ensure data consistency of the CAS, the server MUST only add
+        /// blobs to the CAS after verifying their digests. In particular, servers MUST NOT
+        /// trust digests provided by the client. The server MAY accept a request as no-op
+        /// if the client-specified blob is already in CAS or if information on how to
+        /// construct the blob from chunks is available. If the client-specified blob is
+        /// not already in the CAS, the server MUST verify that the digest of the newly
+        /// created blob assembled from chunks matches the digest specified by the
+        /// client, and reject the request if they differ.
+        ///
+        /// Errors:
+        ///
+        /// * `FAILED_PRECONDITION`: At least one of the referenced chunks is not
+        ///   present in the CAS.
+        /// * `INVALID_ARGUMENT`: The digest of the blob reassembled from chunks does
+        ///   not match the digest specified by the client.
+        async fn splice_blob(
+            &self,
+            request: tonic::Request<super::SpliceBlobRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SpliceBlobResponse>,
+            tonic::Status,
+        >;
     }
     /// The CAS (content-addressable storage) is used to store the inputs to and
     /// outputs from the execution service. Each piece of content is addressed by the
@@ -3999,6 +4396,104 @@ pub mod content_addressable_storage_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob" => {
+                    #[allow(non_camel_case_types)]
+                    struct SplitBlobSvc<T: ContentAddressableStorage>(pub Arc<T>);
+                    impl<
+                        T: ContentAddressableStorage,
+                    > tonic::server::UnaryService<super::SplitBlobRequest>
+                    for SplitBlobSvc<T> {
+                        type Response = super::SplitBlobResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SplitBlobRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ContentAddressableStorage>::split_blob(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SplitBlobSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/build.bazel.remote.execution.v2.ContentAddressableStorage/SpliceBlob" => {
+                    #[allow(non_camel_case_types)]
+                    struct SpliceBlobSvc<T: ContentAddressableStorage>(pub Arc<T>);
+                    impl<
+                        T: ContentAddressableStorage,
+                    > tonic::server::UnaryService<super::SpliceBlobRequest>
+                    for SpliceBlobSvc<T> {
+                        type Response = super::SpliceBlobResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SpliceBlobRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ContentAddressableStorage>::splice_blob(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SpliceBlobSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

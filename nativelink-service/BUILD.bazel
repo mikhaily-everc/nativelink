@@ -33,6 +33,7 @@ rust_library(
         "//nativelink-store",
         "//nativelink-util",
         "@crates//:axum",
+        "@crates//:bincode",
         "@crates//:bytes",
         "@crates//:futures",
         "@crates//:http-body-util",

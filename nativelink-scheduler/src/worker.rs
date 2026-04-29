@@ -262,33 +262,48 @@ impl Worker {
     /// `running_action_infos`, decrement the pending counter, and send
     /// `StartAction` to the worker process. Does NOT re-debit platform
     /// properties — `reserve_budget` already did that.
+    ///
+    /// Combined (state + send) path. Preserved for the legacy one-shot
+    /// `Worker::run_action` entry. The matcher's reserve → commit path
+    /// uses the split `finalize_run_state_only` + `FinalizedRun::send`
+    /// pair so the `tx.send` can run outside the pool mutex.
     pub(crate) async fn finalize_run(
         &mut self,
         operation_id: OperationId,
         action_info: ActionInfoWithProps,
     ) -> Result<(), Error> {
-        let tx = &mut self.tx;
-        let running_action_infos = &mut self.running_action_infos;
-        let pending_action_count = &mut self.pending_action_count;
-        let worker_id = self.id.clone().into();
-        self.metrics
-            .run_action
-            .wrap(async move {
-                let action_info_clone = action_info.clone();
-                let operation_id_string = operation_id.to_string();
-                let start_execute = StartExecute {
-                    execute_request: Some(action_info_clone.inner.as_ref().into()),
-                    operation_id: operation_id_string,
-                    queued_timestamp: Some(action_info.inner.insert_timestamp.into()),
-                    platform: Some((&action_info.platform_properties).into()),
-                    worker_id,
-                };
-                running_action_infos.insert(operation_id, PendingActionInfoData { action_info });
-                *pending_action_count = pending_action_count.saturating_sub(1);
+        self.finalize_run_state_only(operation_id, action_info)
+            .send()
+    }
 
-                send_msg_to_worker(tx, update_for_worker::Update::StartAction(start_execute))
-            })
-            .await
+    /// State-only half of `finalize_run`: inserts the op into
+    /// `running_action_infos`, decrements `pending_action_count`, and
+    /// prepares the `StartAction` payload. Returns a `FinalizedRun` handle
+    /// whose `.send()` fires the worker notification via an unbounded
+    /// channel (non-blocking). The state mutation MUST happen under the
+    /// pool lock (for atomicity vs. `add_worker`/`remove_worker` and the
+    /// generation fence); `.send()` can safely run without it.
+    pub(crate) fn finalize_run_state_only(
+        &mut self,
+        operation_id: OperationId,
+        action_info: ActionInfoWithProps,
+    ) -> FinalizedRun {
+        let worker_id = self.id.clone().into();
+        let start_execute = StartExecute {
+            execute_request: Some(action_info.inner.as_ref().into()),
+            operation_id: operation_id.to_string(),
+            queued_timestamp: Some(action_info.inner.insert_timestamp.into()),
+            platform: Some((&action_info.platform_properties).into()),
+            worker_id,
+        };
+        self.running_action_infos
+            .insert(operation_id, PendingActionInfoData { action_info });
+        self.pending_action_count = self.pending_action_count.saturating_sub(1);
+        FinalizedRun {
+            tx: self.tx.clone(),
+            payload: update_for_worker::Update::StartAction(start_execute),
+            metrics: Arc::clone(&self.metrics),
+        }
     }
 
     pub(crate) fn generation(&self) -> WorkerGeneration {
@@ -362,6 +377,31 @@ impl Worker {
                 || u64::try_from(self.running_action_infos.len() + self.pending_action_count)
                     .unwrap_or(u64::MAX)
                     < self.max_inflight_tasks)
+    }
+}
+
+/// Deferred half of `Worker::finalize_run`: carries the cloned worker
+/// sender + the `StartAction` payload produced under the pool lock. The
+/// owner calls `.send()` AFTER dropping the pool lock so the worker-
+/// dispatch notification doesn't contend with the mutex.
+///
+/// `tx` is a cheap `Arc` clone (`tokio::mpsc::UnboundedSender`); `send`
+/// is non-blocking and fails only if the worker's receive side has been
+/// dropped.
+pub(crate) struct FinalizedRun {
+    tx: UnboundedSender<UpdateForWorker>,
+    payload: update_for_worker::Update,
+    metrics: Arc<Metrics>,
+}
+
+impl FinalizedRun {
+    /// Dispatch `StartAction` to the worker. Must be called exactly once
+    /// per `finalize_run_state_only` return value. Counts success/failure
+    /// via the same `run_action` metric wrapper as the combined path.
+    pub(crate) fn send(self) -> Result<(), Error> {
+        self.metrics
+            .run_action
+            .wrap_fn(|| send_msg_to_worker(&self.tx, self.payload))
     }
 }
 

@@ -931,6 +931,23 @@ pub trait SchedulerStore: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<<K as SchedulerStoreDecodeTo>::DecodeOutput>, Error>> + Send
     where
         K: SchedulerStoreKeyProvider + SchedulerStoreDecodeTo + Send;
+
+    /// Removes the given key from the store if present. Backends that do not
+    /// support point-deletes return `Code::Unimplemented`; callers use this for
+    /// opportunistic cleanup of orphaned auxiliary mappings and should treat
+    /// `Unimplemented` (and any transient error) as non-fatal.
+    fn delete_key<K>(&self, key: K) -> impl Future<Output = Result<(), Error>> + Send
+    where
+        K: SchedulerStoreKeyProvider + Send,
+    {
+        let _ = key;
+        async {
+            Err(make_err!(
+                Code::Unimplemented,
+                "SchedulerStore::delete_key is not implemented for this backend"
+            ))
+        }
+    }
 }
 
 /// A type that is used to let the scheduler store know what

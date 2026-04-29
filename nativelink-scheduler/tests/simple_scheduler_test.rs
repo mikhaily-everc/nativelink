@@ -3247,3 +3247,137 @@ async fn five_point_rollback_contract_via_resource_exhausted() -> Result<(), Err
     Ok(())
 }
 
+/// `SimpleSpec::max_concurrent_matches = Some(N)` is honored end-to-end:
+/// the scheduler's runtime-resolved ceiling matches the configured value,
+/// and matcher correctness (capacity not over-subscribed) is preserved
+/// under a custom concurrency limit smaller than the default.
+#[nativelink_test]
+async fn max_concurrent_matches_config_respected() -> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+
+    let mut prop_defs = HashMap::new();
+    prop_defs.insert("cpu".to_string(), PropertyType::Minimum);
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            supported_platform_properties: Some(prop_defs),
+            max_concurrent_matches: Some(3),
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    assert_eq!(
+        scheduler.max_concurrent_matches(),
+        3,
+        "spec.max_concurrent_matches = Some(3) must be honored"
+    );
+
+    // Worker with cpu Minimum=2 and 10 actions each needing 1 — matcher
+    // correctness (no over-subscription) must still hold with the custom
+    // ceiling below the default of 8.
+    let mut worker_props = PlatformProperties::default();
+    worker_props
+        .properties
+        .insert("cpu".to_string(), PlatformPropertyValue::Minimum(2));
+    let _rx = setup_new_worker(&scheduler, worker_id.clone(), worker_props).await?;
+
+    let action_props: HashMap<String, String> =
+        HashMap::from_iter([("cpu".to_string(), "1".to_string())]);
+
+    let mut listeners: Vec<Box<dyn ActionStateResult>> = Vec::new();
+    for i in 0..10u8 {
+        let digest = DigestInfo::new([i; 32], 512);
+        let listener = setup_action(
+            &scheduler,
+            digest,
+            action_props.clone(),
+            make_system_time(u64::from(i) + 1),
+        )
+        .await?;
+        listeners.push(listener);
+    }
+
+    scheduler.do_try_match_for_test().await?;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+
+    let mut executing = 0usize;
+    let mut queued = 0usize;
+    for listener in &listeners {
+        let (state, _) = listener.as_state().await?;
+        match state.stage {
+            ActionStage::Executing => executing += 1,
+            ActionStage::Queued => queued += 1,
+            ref other => panic!("unexpected stage {other:?}"),
+        }
+    }
+    assert_eq!(
+        executing, 2,
+        "worker capacity must not be over-subscribed under max_concurrent_matches=3"
+    );
+    assert_eq!(queued, 8, "remaining actions must stay Queued");
+
+    Ok(())
+}
+
+/// `SimpleSpec::max_concurrent_matches` falls back to
+/// `DEFAULT_MAX_CONCURRENT_MATCHES = 8` when unset (`None`) or set to the
+/// zero sentinel (`Some(0)`). Existing deployments that never set the
+/// field must continue to run at the shipped default.
+#[nativelink_test]
+async fn max_concurrent_matches_default_when_unset_or_zero() -> Result<(), Error> {
+    let task_change_notify_a = Arc::new(Notify::new());
+    let (scheduler_unset, _a) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify_a.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify_a,
+        MockInstantWrapped::default,
+        None,
+    );
+    assert_eq!(
+        scheduler_unset.max_concurrent_matches(),
+        8,
+        "None must resolve to DEFAULT_MAX_CONCURRENT_MATCHES = 8"
+    );
+
+    let task_change_notify_b = Arc::new(Notify::new());
+    let (scheduler_zero, _b) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            max_concurrent_matches: Some(0),
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify_b.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify_b,
+        MockInstantWrapped::default,
+        None,
+    );
+    assert_eq!(
+        scheduler_zero.max_concurrent_matches(),
+        8,
+        "Some(0) must resolve to DEFAULT_MAX_CONCURRENT_MATCHES = 8"
+    );
+
+    Ok(())
+}
+

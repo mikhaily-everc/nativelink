@@ -78,6 +78,14 @@ pub struct SchedulerMetrics {
     /// Double-disarm detections (logic bug, soft-warned and counted rather
     /// than panicking in release builds).
     pub reservation_disarm_bugs: AtomicU64,
+    /// Cumulative nanoseconds spent waiting to acquire `inner` mutex on the
+    /// match hot paths (`reserve_worker_for_action`, `commit_reservation`,
+    /// `release_reservation`). A high average wait indicates pool-mutex
+    /// contention is the bottleneck rather than per-call work.
+    pub inner_lock_wait_ns: AtomicU64,
+    /// Count of `inner` mutex acquisitions sampled on the match hot paths.
+    /// Paired with `inner_lock_wait_ns` to derive average wait per acquire.
+    pub inner_lock_wait_samples: AtomicU64,
 }
 
 /// Capacity of the bounded release channel. Sized for the worst-case burst
@@ -87,7 +95,7 @@ const RELEASE_CHANNEL_CAPACITY: usize = 256;
 
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::worker::{
-    ActionInfoWithProps, Worker, WorkerGeneration, WorkerTimestamp, WorkerUpdate,
+    ActionInfoWithProps, FinalizedRun, Worker, WorkerGeneration, WorkerTimestamp, WorkerUpdate,
 };
 use crate::worker_capability_index::WorkerCapabilityIndex;
 use crate::worker_registry::SharedWorkerRegistry;
@@ -430,81 +438,6 @@ impl ApiWorkerSchedulerImpl {
         worker_id
     }
 
-    async fn update_action(
-        &mut self,
-        worker_id: &WorkerId,
-        operation_id: &OperationId,
-        update: UpdateOperationType,
-    ) -> Result<(), Error> {
-        let worker = self.workers.get_mut(worker_id).err_tip(|| {
-            format!("Worker {worker_id} does not exist in SimpleScheduler::update_action")
-        })?;
-
-        // Ensure the worker is supposed to be running the operation.
-        if !worker.running_action_infos.contains_key(operation_id) {
-            let err = make_err!(
-                Code::Internal,
-                "Operation {operation_id} should not be running on worker {worker_id} in SimpleScheduler::update_action"
-            );
-            return Result::<(), _>::Err(err.clone())
-                .merge(self.immediate_evict_worker(worker_id, err, false).await);
-        }
-
-        let (is_finished, due_to_backpressure) = match &update {
-            UpdateOperationType::UpdateWithActionStage(action_stage) => {
-                (action_stage.is_finished(), false)
-            }
-            UpdateOperationType::KeepAlive => (false, false),
-            UpdateOperationType::UpdateWithError(err) => {
-                (true, err.code == Code::ResourceExhausted)
-            }
-            UpdateOperationType::UpdateWithDisconnect => (true, false),
-            UpdateOperationType::ExecutionComplete => {
-                // No update here, just restoring platform properties.
-                worker.execution_complete(operation_id);
-                self.worker_change_notify.notify_one();
-                return Ok(());
-            }
-        };
-
-        // Update the operation in the worker state manager.
-        {
-            let update_operation_res = self
-                .worker_state_manager
-                .update_operation(operation_id, worker_id, update)
-                .await
-                .err_tip(|| "in update_operation on SimpleScheduler::update_action");
-            if let Err(err) = update_operation_res {
-                error!(
-                    %operation_id,
-                    ?worker_id,
-                    ?err,
-                    "Failed to update_operation on update_action"
-                );
-                return Err(err);
-            }
-        }
-
-        if !is_finished {
-            return Ok(());
-        }
-
-        // Clear this action from the current worker if finished.
-        let complete_action_res = {
-            // Note: We need to run this before dealing with backpressure logic.
-            let complete_action_res = worker.complete_action(operation_id).await;
-
-            if (due_to_backpressure || !worker.can_accept_work()) && worker.has_actions() {
-                worker.is_paused = true;
-            }
-            complete_action_res
-        };
-
-        self.worker_change_notify.notify_one();
-
-        complete_action_res
-    }
-
     /// Notifies the specified worker to run the given action and handles errors by evicting
     /// the worker if the notification fails.
     async fn worker_notify_run_action(
@@ -698,7 +631,14 @@ impl ApiWorkerScheduler {
             .find_worker_calls
             .fetch_add(1, Ordering::Relaxed);
 
+        let wait_start = Instant::now();
         let mut inner = self.inner.lock().await;
+        self.metrics
+            .inner_lock_wait_ns
+            .fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.metrics
+            .inner_lock_wait_samples
+            .fetch_add(1, Ordering::Relaxed);
         let worker_count = inner.workers.len() as u64;
         let maybe_worker_id =
             inner.inner_find_worker_for_action(platform_properties, full_worker_logging);
@@ -771,7 +711,14 @@ impl ApiWorkerScheduler {
             .generation()
             .expect("commit_reservation called on disarmed reservation");
 
+        let wait_start = Instant::now();
         let mut inner = self.inner.lock().await;
+        self.metrics
+            .inner_lock_wait_ns
+            .fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.metrics
+            .inner_lock_wait_samples
+            .fetch_add(1, Ordering::Relaxed);
 
         // Phase 1: generation fence (read-only on `inner.workers`).
         let pool_generation = inner.workers.peek(&worker_id).map(Worker::generation);
@@ -808,19 +755,28 @@ impl ApiWorkerScheduler {
             }
         }
 
-        // Phase 2: disarm and finalize. Scoping `worker` inside a block
-        // releases the mutable borrow of `inner.workers` before we may need
-        // to call `inner.immediate_evict_worker` on the error path.
+        // Phase 2a (under lock): disarm and record the run in the worker's
+        // state. The mutation is atomic w.r.t. add_worker/remove_worker so
+        // the generation fence still holds — a concurrent reconnect minting
+        // a new generation cannot observe or inherit this op.
         let _payload = res.disarm();
-        let finalize_res = {
+        let finalized: FinalizedRun = {
             let worker = inner
                 .workers
                 .get_mut(&worker_id)
                 .expect("generation check held; worker still present under lock");
-            worker.finalize_run(operation_id, action_info).await
+            worker.finalize_run_state_only(operation_id, action_info)
         };
 
-        match finalize_res {
+        // Phase 2b (no lock): fire the `StartAction` notification via the
+        // worker's unbounded sender. The send is synchronous and
+        // non-blocking; taking it outside the pool mutex is the primary
+        // round-2 win — match-hot-path reserve/commit/release no longer
+        // contend with this dispatch.
+        drop(inner);
+        let send_res = finalized.send();
+
+        match send_res {
             Ok(()) => {
                 self.metrics
                     .reservations_committed
@@ -838,9 +794,37 @@ impl ApiWorkerScheduler {
                     Code::Internal,
                     "Worker command failed during commit, removing worker {worker_id} -- {notify_err:?}",
                 );
-                let evict_res = inner
-                    .immediate_evict_worker(&worker_id, err.clone(), is_disconnect)
-                    .await;
+
+                // Re-acquire the pool lock to evict the worker. Guard the
+                // eviction with a generation re-check: between `drop(inner)`
+                // and this re-acquire the worker may have been evicted and
+                // replaced (reconnect) already, in which case our op has
+                // already been drained + requeued by whichever path evicted
+                // the OLD worker. Blindly calling `immediate_evict_worker`
+                // would incorrectly evict the NEW generation under the same
+                // `WorkerId`.
+                let wait_start = Instant::now();
+                let mut inner = self.inner.lock().await;
+                self.metrics.inner_lock_wait_ns.fetch_add(
+                    wait_start.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                self.metrics
+                    .inner_lock_wait_samples
+                    .fetch_add(1, Ordering::Relaxed);
+                let current_generation = inner.workers.peek(&worker_id).map(Worker::generation);
+                let evict_res: Result<(), Error> =
+                    if current_generation == Some(expected_generation) {
+                        inner
+                            .immediate_evict_worker(&worker_id, err.clone(), is_disconnect)
+                            .await
+                    } else {
+                        // OLD worker is already gone (different generation
+                        // or absent). Its `running_action_infos` — which now
+                        // holds our op — was drained by that eviction path
+                        // and the op requeued. Nothing else to clean up.
+                        Ok(())
+                    };
                 self.metrics
                     .reservation_commit_failures
                     .fetch_add(1, Ordering::Relaxed);
@@ -860,7 +844,14 @@ impl ApiWorkerScheduler {
             return;
         };
         {
+            let wait_start = Instant::now();
             let mut inner = self.inner.lock().await;
+            self.metrics
+                .inner_lock_wait_ns
+                .fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.metrics
+                .inner_lock_wait_samples
+                .fetch_add(1, Ordering::Relaxed);
             if let Some(worker) = inner.workers.get_mut(&payload.worker_id) {
                 if worker.generation() == payload.generation {
                     worker.restore_budget(&payload.debits);
@@ -1005,8 +996,111 @@ impl WorkerScheduler for ApiWorkerScheduler {
         operation_id: &OperationId,
         update: UpdateOperationType,
     ) -> Result<(), Error> {
-        let mut inner = self.inner.lock().await;
-        inner.update_action(worker_id, operation_id, update).await
+        // Phase A (under pool lock): validate membership, classify the
+        // update, and short-circuit `ExecutionComplete` (which only touches
+        // in-memory worker state). Capture the state-manager + notify
+        // handles to drive Phase B without holding the lock.
+        let (is_finished, due_to_backpressure, worker_state_manager, worker_change_notify) = {
+            let wait_start = Instant::now();
+            let mut inner = self.inner.lock().await;
+            self.metrics.inner_lock_wait_ns.fetch_add(
+                wait_start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            self.metrics
+                .inner_lock_wait_samples
+                .fetch_add(1, Ordering::Relaxed);
+
+            let worker = inner.workers.get_mut(worker_id).err_tip(|| {
+                format!("Worker {worker_id} does not exist in SimpleScheduler::update_action")
+            })?;
+
+            if !worker.running_action_infos.contains_key(operation_id) {
+                let err = make_err!(
+                    Code::Internal,
+                    "Operation {operation_id} should not be running on worker {worker_id} in SimpleScheduler::update_action"
+                );
+                return Result::<(), _>::Err(err.clone())
+                    .merge(inner.immediate_evict_worker(worker_id, err, false).await);
+            }
+
+            let (is_finished, due_to_backpressure) = match &update {
+                UpdateOperationType::UpdateWithActionStage(action_stage) => {
+                    (action_stage.is_finished(), false)
+                }
+                UpdateOperationType::KeepAlive => (false, false),
+                UpdateOperationType::UpdateWithError(err) => {
+                    (true, err.code == Code::ResourceExhausted)
+                }
+                UpdateOperationType::UpdateWithDisconnect => (true, false),
+                UpdateOperationType::ExecutionComplete => {
+                    // Pure in-memory property restore — no state-manager
+                    // round trip; short-circuit under the lock and return.
+                    worker.execution_complete(operation_id);
+                    inner.worker_change_notify.notify_one();
+                    return Ok(());
+                }
+            };
+
+            (
+                is_finished,
+                due_to_backpressure,
+                inner.worker_state_manager.clone(),
+                inner.worker_change_notify.clone(),
+            )
+        };
+
+        // Phase B (no pool lock): run the state-manager update. This is
+        // the previously-contended Redis round trip — moving it outside
+        // the pool mutex is the primary round-2 win on this path.
+        let update_operation_res = worker_state_manager
+            .update_operation(operation_id, worker_id, update)
+            .await
+            .err_tip(|| "in update_operation on SimpleScheduler::update_action");
+        if let Err(err) = update_operation_res {
+            error!(
+                %operation_id,
+                ?worker_id,
+                ?err,
+                "Failed to update_operation on update_action"
+            );
+            return Err(err);
+        }
+
+        if !is_finished {
+            return Ok(());
+        }
+
+        // Phase C (re-acquire pool lock, is_finished branch only): clear
+        // the action from the worker and apply the backpressure pause
+        // check. The worker may have been evicted/replaced between B and
+        // C; the state-manager update in B already authoritatively
+        // recorded the finish, so if the worker is gone we early-return.
+        let complete_action_res = {
+            let wait_start = Instant::now();
+            let mut inner = self.inner.lock().await;
+            self.metrics.inner_lock_wait_ns.fetch_add(
+                wait_start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            self.metrics
+                .inner_lock_wait_samples
+                .fetch_add(1, Ordering::Relaxed);
+
+            let Some(worker) = inner.workers.get_mut(worker_id) else {
+                // Worker evicted between Phase B and Phase C. State
+                // manager has already captured the finish; nothing to do.
+                return Ok(());
+            };
+            let res = worker.complete_action(operation_id).await;
+            if (due_to_backpressure || !worker.can_accept_work()) && worker.has_actions() {
+                worker.is_paused = true;
+            }
+            res
+        };
+
+        worker_change_notify.notify_one();
+        complete_action_res
     }
 
     async fn worker_keep_alive_received(

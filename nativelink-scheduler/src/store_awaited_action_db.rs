@@ -482,10 +482,26 @@ impl SchedulerIndexProvider for SearchStateToAwaitedAction {
         Cow::Borrowed(self.0)
     }
 }
+// Both callers of `search_by_index_prefix(SearchStateToAwaitedAction(...))`
+// (`get_range_of_actions`, `get_all_awaited_actions`) only read
+// `.operation_id()` off each hit. Decoding the full ~1-2 KB `AwaitedAction`
+// JSON per item was the dominant cost of the matcher's
+// `get_queued_operations` drain (observed ~940 ms / cycle). Deserialize
+// into a partial struct that only binds `operation_id`; serde_json still
+// parses the JSON but skips HashMap/Arc/String allocations for the rest.
+#[derive(serde::Deserialize)]
+struct AwaitedActionOpIdOnly {
+    operation_id: OperationId,
+}
 impl SchedulerStoreDecodeTo for SearchStateToAwaitedAction {
-    type DecodeOutput = AwaitedAction;
-    fn decode(version: i64, data: Bytes) -> Result<Self::DecodeOutput, Error> {
-        awaited_action_decode(version, &data)
+    type DecodeOutput = OperationId;
+    fn decode(_version: i64, data: Bytes) -> Result<Self::DecodeOutput, Error> {
+        serde_json::from_slice::<AwaitedActionOpIdOnly>(&data)
+            .map(|x| x.operation_id)
+            .map_err(|e| {
+                Error::from_std_err(Code::InvalidArgument, &e)
+                    .append("In SearchStateToAwaitedAction::decode (operation_id only)")
+            })
     }
 }
 
@@ -778,6 +794,29 @@ where
                 client_operation_id,
                 operation_id
             );
+            // Opportunistic cleanup so orphaned cid_/ck_ entries don't accumulate
+            // forever. Errors here are non-fatal — the caller only cares about
+            // the Ok(None) result signaling the operation is gone.
+            if let Err(err) = self
+                .store
+                .delete_key(ClientIdToOperationId(client_operation_id))
+                .await
+            {
+                tracing::warn!(
+                    ?err,
+                    "Failed to delete orphaned client_id->operation_id mapping for {client_operation_id}"
+                );
+            }
+            if let Err(err) = self
+                .store
+                .delete_key(ClientKeepaliveKey(&operation_id))
+                .await
+            {
+                tracing::warn!(
+                    ?err,
+                    "Failed to delete orphaned client keepalive for {operation_id}"
+                );
+            }
             return Ok(None);
         }
 
@@ -932,10 +971,10 @@ where
             .search_by_index_prefix(SearchStateToAwaitedAction(get_state_prefix(state)))
             .await
             .err_tip(|| "In RedisAwaitedActionDb::get_range_of_actions")?
-            .map_ok(move |awaited_action| {
+            .map_ok(move |operation_id| {
                 OperationSubscriber::new(
                     None,
-                    OperationIdToAwaitedAction(Cow::Owned(awaited_action.operation_id().clone())),
+                    OperationIdToAwaitedAction(Cow::Owned(operation_id)),
                     Arc::downgrade(&self.store),
                     self.now_fn.clone(),
                 )
@@ -950,10 +989,10 @@ where
             .search_by_index_prefix(SearchStateToAwaitedAction(""))
             .await
             .err_tip(|| "In RedisAwaitedActionDb::get_range_of_actions")?
-            .map_ok(move |awaited_action| {
+            .map_ok(move |operation_id| {
                 OperationSubscriber::new(
                     None,
-                    OperationIdToAwaitedAction(Cow::Owned(awaited_action.operation_id().clone())),
+                    OperationIdToAwaitedAction(Cow::Owned(operation_id)),
                     Arc::downgrade(&self.store),
                     self.now_fn.clone(),
                 )

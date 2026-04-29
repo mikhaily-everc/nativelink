@@ -6,6 +6,12 @@ Fork of [TraceMachina/nativelink](https://github.com/TraceMachina/nativelink) wi
 
 - **ByteStream Write resume fix**: Accept data from offset 0 on UUID collision
 - **Directory cache fix**: Skip work dir pre-creation when directory cache is enabled to prevent hardlink failures
+- **REAPI SplitBlob/SpliceBlob**: Implements the `ContentAddressableStorage.SplitBlob`/`SpliceBlob`
+  RPCs (and the matching `CacheCapabilities.split_blob_support`/`splice_blob_support` flags) so
+  Bazel 9.1.0 clients can use `--experimental_remote_cache_chunking`. Opt-in per-instance via
+  `CasStoreConfig.splice_manifest_store`; when unset the RPCs return `UNIMPLEMENTED` and
+  capabilities advertise `false`. Manifests are bincode `DedupIndex`es stored in the manifest
+  backend; `SpliceBlob` verifies chunk presence + reassembled digest before persisting.
 
 ## Branch
 

@@ -16,34 +16,47 @@ use core::convert::Into;
 use core::pin::Pin;
 use std::collections::{HashMap, VecDeque};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, Stream};
 use futures::{StreamExt, TryStreamExt};
 use nativelink_config::cas_server::{CasStoreConfig, WithInstanceName};
-use nativelink_error::{Code, Error, ResultExt, error_if, make_input_err};
+use nativelink_error::{Code, Error, ResultExt, error_if, make_err, make_input_err};
 use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::{
     ContentAddressableStorage, ContentAddressableStorageServer as Server,
 };
 use nativelink_proto::build::bazel::remote::execution::v2::{
     BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
-    BatchUpdateBlobsResponse, Directory, FindMissingBlobsRequest, FindMissingBlobsResponse,
-    GetTreeRequest, GetTreeResponse, batch_read_blobs_response, batch_update_blobs_response,
+    BatchUpdateBlobsResponse, Digest, Directory, FindMissingBlobsRequest, FindMissingBlobsResponse,
+    GetTreeRequest, GetTreeResponse, SpliceBlobRequest, SpliceBlobResponse, SplitBlobRequest,
+    SplitBlobResponse, batch_read_blobs_response, batch_update_blobs_response, chunking_function,
     compressor,
 };
 use nativelink_proto::google::rpc::Status as GrpcStatus;
 use nativelink_store::ac_utils::get_and_decode_digest;
+use nativelink_store::dedup_store::DedupIndex;
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::digest_hasher::make_ctx_for_hash_func;
+use nativelink_util::digest_hasher::{
+    DigestHasher, default_digest_hasher_func, make_ctx_for_hash_func,
+};
 use nativelink_util::store_trait::{Store, StoreLike};
 use opentelemetry::context::FutureExt;
 use tonic::{Request, Response, Status};
 use tracing::{Instrument, Level, debug, error_span, instrument};
 
+/// Per-instance handle bundle consumed by SplitBlob/SpliceBlob.
+#[derive(Debug, Clone)]
+struct CasInstance {
+    cas_store: Store,
+    /// Optional side-table store for REAPI SplitBlob/SpliceBlob manifests
+    /// (see `CasStoreConfig::splice_manifest_store`).
+    manifest_store: Option<Store>,
+}
+
 #[derive(Debug)]
 pub struct CasServer {
-    stores: HashMap<String, Store>,
+    instances: HashMap<String, CasInstance>,
 }
 
 type GetTreeStream = Pin<Box<dyn Stream<Item = Result<GetTreeResponse, Status>> + Send + 'static>>;
@@ -53,18 +66,39 @@ impl CasServer {
         configs: &[WithInstanceName<CasStoreConfig>],
         store_manager: &StoreManager,
     ) -> Result<Self, Error> {
-        let mut stores = HashMap::with_capacity(configs.len());
+        let mut instances = HashMap::with_capacity(configs.len());
         for config in configs {
-            let store = store_manager.get_store(&config.cas_store).ok_or_else(|| {
+            let cas_store = store_manager.get_store(&config.cas_store).ok_or_else(|| {
                 make_input_err!("'cas_store': '{}' does not exist", config.cas_store)
             })?;
-            stores.insert(config.instance_name.clone(), store);
+            let manifest_store = match config.splice_manifest_store.as_ref() {
+                Some(name) => Some(store_manager.get_store(name).ok_or_else(|| {
+                    make_input_err!("'splice_manifest_store': '{name}' does not exist")
+                })?),
+                None => None,
+            };
+            instances.insert(
+                config.instance_name.clone(),
+                CasInstance {
+                    cas_store,
+                    manifest_store,
+                },
+            );
         }
-        Ok(Self { stores })
+        Ok(Self { instances })
     }
 
     pub fn into_service(self) -> Server<Self> {
         Server::new(self)
+    }
+
+    /// Returns the set of instance names that have a `splice_manifest_store`
+    /// configured and therefore support SplitBlob/SpliceBlob.
+    pub fn chunking_instances(&self) -> HashMap<String, bool> {
+        self.instances
+            .iter()
+            .map(|(name, instance)| (name.clone(), instance.manifest_store.is_some()))
+            .collect()
     }
 
     async fn inner_find_missing_blobs(
@@ -73,9 +107,10 @@ impl CasServer {
     ) -> Result<Response<FindMissingBlobsResponse>, Error> {
         let instance_name = &request.instance_name;
         let store = self
-            .stores
+            .instances
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
+            .cas_store
             .clone();
 
         let mut requested_blobs = Vec::with_capacity(request.blob_digests.len());
@@ -104,9 +139,10 @@ impl CasServer {
         let instance_name = &request.instance_name;
 
         let store = self
-            .stores
+            .instances
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
+            .cas_store
             .clone();
 
         // If we are a GrpcStore we shortcut here, as this is a special store.
@@ -159,9 +195,10 @@ impl CasServer {
         let instance_name = &request.instance_name;
 
         let store = self
-            .stores
+            .instances
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
+            .cas_store
             .clone();
 
         // If we are a GrpcStore we shortcut here, as this is a special store.
@@ -216,9 +253,10 @@ impl CasServer {
         let instance_name = &request.instance_name;
 
         let store = self
-            .stores
+            .instances
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
+            .cas_store
             .clone();
 
         // If we are a GrpcStore we shortcut here, as this is a special store.
@@ -301,6 +339,217 @@ impl CasServer {
             })
         })
         .right_stream())
+    }
+
+    async fn inner_split_blob(
+        &self,
+        request: SplitBlobRequest,
+    ) -> Result<Response<SplitBlobResponse>, Error> {
+        let instance_name = &request.instance_name;
+        let instance = self
+            .instances
+            .get(instance_name)
+            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+        let manifest_store = instance.manifest_store.as_ref().ok_or_else(|| {
+            make_err!(
+                Code::Unimplemented,
+                "SplitBlob is not enabled for instance '{instance_name}'"
+            )
+        })?;
+        let cas_store = &instance.cas_store;
+
+        let blob_digest_proto = request
+            .blob_digest
+            .err_tip(|| "Expected blob_digest in SplitBlobRequest")?;
+        let blob_digest = DigestInfo::try_from(blob_digest_proto.clone())
+            .err_tip(|| "Invalid blob_digest in SplitBlobRequest")?;
+
+        let index_bytes = manifest_store
+            .get_part_unchunked(blob_digest, 0, None)
+            .await
+            .map_err(|mut err| {
+                if err.code == Code::NotFound {
+                    err.messages.resize_with(1, String::new);
+                }
+                err
+            })
+            .err_tip(|| "Reading splice manifest")?;
+        let (manifest, _): (DedupIndex, _) =
+            bincode::serde::decode_from_slice(&index_bytes, bincode::config::legacy())
+                .map_err(|e| make_err!(Code::Internal, "Corrupt splice manifest: {e}"))?;
+
+        let chunk_keys: Vec<_> = manifest.entries.iter().map(|d| (*d).into()).collect();
+        let presence = cas_store
+            .has_many(&chunk_keys)
+            .await
+            .err_tip(|| "In SplitBlob chunk presence check")?;
+        if let Some(missing_idx) = presence.iter().position(Option::is_none) {
+            return Err(make_err!(
+                Code::NotFound,
+                "Chunk {} referenced by blob {} is missing from the CAS",
+                manifest.entries[missing_idx],
+                blob_digest
+            ));
+        }
+
+        let chunk_digests: Vec<Digest> = manifest.entries.into_iter().map(Into::into).collect();
+        Ok(Response::new(SplitBlobResponse {
+            chunk_digests,
+            chunking_function: chunking_function::Value::Unknown as i32,
+        }))
+    }
+
+    async fn inner_splice_blob(
+        &self,
+        request: SpliceBlobRequest,
+    ) -> Result<Response<SpliceBlobResponse>, Error> {
+        let instance_name = &request.instance_name;
+        let instance = self
+            .instances
+            .get(instance_name)
+            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+        let manifest_store = instance.manifest_store.as_ref().ok_or_else(|| {
+            make_err!(
+                Code::Unimplemented,
+                "SpliceBlob is not enabled for instance '{instance_name}'"
+            )
+        })?;
+        let cas_store = &instance.cas_store;
+
+        let blob_digest_proto = request
+            .blob_digest
+            .err_tip(|| "Expected blob_digest in SpliceBlobRequest")?;
+        let expected_blob_digest = DigestInfo::try_from(blob_digest_proto.clone())
+            .err_tip(|| "Invalid blob_digest in SpliceBlobRequest")?;
+
+        let mut chunk_digests = Vec::with_capacity(request.chunk_digests.len());
+        for chunk in request.chunk_digests {
+            chunk_digests.push(
+                DigestInfo::try_from(chunk)
+                    .err_tip(|| "Invalid chunk digest in SpliceBlobRequest")?,
+            );
+        }
+
+        let expected_size: u64 = chunk_digests.iter().map(DigestInfo::size_bytes).sum();
+        if expected_size != expected_blob_digest.size_bytes() {
+            return Err(make_err!(
+                Code::InvalidArgument,
+                "Sum of chunk sizes ({expected_size}) does not match blob size ({})",
+                expected_blob_digest.size_bytes()
+            ));
+        }
+
+        let chunk_keys: Vec<_> = chunk_digests.iter().map(|d| (*d).into()).collect();
+        let chunk_presence = cas_store
+            .has_many(&chunk_keys)
+            .await
+            .err_tip(|| "In SpliceBlob chunk presence check")?;
+        let missing: Vec<DigestInfo> = chunk_presence
+            .iter()
+            .zip(&chunk_digests)
+            .filter_map(|(present, digest)| present.is_none().then_some(*digest))
+            .collect();
+        if !missing.is_empty() {
+            return Err(make_err!(
+                Code::FailedPrecondition,
+                "SpliceBlob missing chunks from CAS: {}",
+                missing
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        // Manifest already persisted → short-circuit (spec-legal no-op).
+        if manifest_store
+            .has(expected_blob_digest)
+            .await
+            .err_tip(|| "Checking existing splice manifest")?
+            .is_some()
+        {
+            return Ok(Response::new(SpliceBlobResponse {
+                blob_digest: Some(blob_digest_proto),
+            }));
+        }
+
+        // Always re-fetch and verify the chunks before persisting either the blob
+        // or the manifest. The REAPI spec forbids trusting client-supplied
+        // digests, and a CAS hit on `expected_blob_digest` from a non-splice
+        // upload path tells us nothing about whether *these chunks* reassemble
+        // to that blob — the manifest must only attest a relationship we
+        // re-verified on this request.
+        let blob_already_cached = cas_store
+            .has(expected_blob_digest)
+            .await
+            .err_tip(|| "Checking existing spliced blob in CAS")?
+            .is_some();
+
+        let expected_size_usize = usize::try_from(expected_blob_digest.size_bytes())
+            .err_tip(|| "Blob size does not fit into usize")?;
+        let mut buffer = BytesMut::with_capacity(expected_size_usize.min(64 * 1024 * 1024));
+        let mut hasher = default_digest_hasher_func().hasher();
+        for (idx, chunk_digest) in chunk_digests.iter().enumerate() {
+            let data = cas_store
+                .get_part_unchunked(*chunk_digest, 0, None)
+                .await
+                .err_tip(|| format!("Fetching chunk {chunk_digest} during SpliceBlob"))?;
+            if data.len() as u64 != chunk_digest.size_bytes() {
+                return Err(make_err!(
+                    Code::DataLoss,
+                    "Chunk {chunk_digest} returned {} bytes, expected {}",
+                    data.len(),
+                    chunk_digest.size_bytes()
+                ));
+            }
+            // Per-chunk content verification: a same-length-different-content
+            // corruption (e.g. from a concurrent ByteStream.Write race on the
+            // same UUID) would otherwise only surface at the whole-blob hash
+            // step below, with no signal which chunk is poisoned.
+            let mut chunk_hasher = default_digest_hasher_func().hasher();
+            chunk_hasher.update(&data);
+            let computed_chunk = chunk_hasher.finalize_digest();
+            if computed_chunk != *chunk_digest {
+                return Err(make_err!(
+                    Code::DataLoss,
+                    "Chunk {idx} of blob {expected_blob_digest} corrupted in CAS: \
+                     stored bytes hash to {computed_chunk}, claimed digest is \
+                     {chunk_digest}. Evict and re-upload to repair."
+                ));
+            }
+            hasher.update(&data);
+            buffer.extend_from_slice(&data);
+        }
+        let computed = hasher.finalize_digest();
+        if computed != expected_blob_digest {
+            return Err(make_err!(
+                Code::InvalidArgument,
+                "Reassembled digest {computed} does not match expected {expected_blob_digest}"
+            ));
+        }
+
+        if !blob_already_cached {
+            // Persist the reassembled blob so non-chunking clients can still
+            // fetch it via BatchReadBlobs / ByteStream.Read.
+            cas_store
+                .update_oneshot(expected_blob_digest, buffer.freeze())
+                .await
+                .err_tip(|| "Persisting spliced blob")?;
+        }
+
+        let manifest = DedupIndex {
+            entries: chunk_digests,
+        };
+        let encoded = bincode::serde::encode_to_vec(&manifest, bincode::config::legacy())
+            .map_err(|e| make_err!(Code::Internal, "Encoding splice manifest: {e}"))?;
+        manifest_store
+            .update_oneshot(expected_blob_digest, encoded.into())
+            .await
+            .err_tip(|| "Persisting splice manifest")?;
+
+        Ok(Response::new(SpliceBlobResponse {
+            blob_digest: Some(blob_digest_proto),
+        }))
     }
 }
 
@@ -414,5 +663,51 @@ impl ContentAddressableStorage for CasServer {
             debug!(return = "Ok(<stream>)");
         }
         resp
+    }
+
+    #[instrument(
+        err,
+        ret(level = Level::DEBUG),
+        level = Level::ERROR,
+        skip_all,
+        fields(request = ?grpc_request.get_ref())
+    )]
+    async fn split_blob(
+        &self,
+        grpc_request: Request<SplitBlobRequest>,
+    ) -> Result<Response<SplitBlobResponse>, Status> {
+        let request = grpc_request.into_inner();
+        let digest_function = request.digest_function;
+        self.inner_split_blob(request)
+            .instrument(error_span!("cas_server_split_blob"))
+            .with_context(
+                make_ctx_for_hash_func(digest_function).err_tip(|| "In CasServer::split_blob")?,
+            )
+            .await
+            .err_tip(|| "Failed on split_blob() command")
+            .map_err(Into::into)
+    }
+
+    #[instrument(
+        err,
+        ret(level = Level::DEBUG),
+        level = Level::ERROR,
+        skip_all,
+        fields(request = ?grpc_request.get_ref())
+    )]
+    async fn splice_blob(
+        &self,
+        grpc_request: Request<SpliceBlobRequest>,
+    ) -> Result<Response<SpliceBlobResponse>, Status> {
+        let request = grpc_request.into_inner();
+        let digest_function = request.digest_function;
+        self.inner_splice_blob(request)
+            .instrument(error_span!("cas_server_splice_blob"))
+            .with_context(
+                make_ctx_for_hash_func(digest_function).err_tip(|| "In CasServer::splice_blob")?,
+            )
+            .await
+            .err_tip(|| "Failed on splice_blob() command")
+            .map_err(Into::into)
     }
 }

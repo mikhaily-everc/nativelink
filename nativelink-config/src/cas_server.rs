@@ -128,6 +128,19 @@ pub struct CasStoreConfig {
     /// This store name referenced here may be reused multiple times.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub cas_store: StoreRefName,
+
+    /// Optional store for persisting blob-to-chunk manifests used by the
+    /// REAPI `SplitBlob` / `SpliceBlob` RPCs (Bazel's
+    /// `--experimental_remote_cache_chunking`).
+    ///
+    /// When set, the server advertises
+    /// `CacheCapabilities.split_blob_support` and `splice_blob_support`
+    /// and implements both RPCs against this store. When unset, both RPCs
+    /// return `UNIMPLEMENTED` and the capability flags stay `false`.
+    ///
+    /// Default: unset (chunking RPCs disabled).
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub splice_manifest_store: Option<StoreRefName>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]

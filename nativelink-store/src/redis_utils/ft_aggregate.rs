@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use core::fmt::Debug;
+use core::time::Duration;
+use std::time::Instant;
 
 use futures::Stream;
 use redis::aio::ConnectionLike;
 use redis::{Arg, ErrorKind, RedisError, Value};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::redis_utils::aggregate_types::RedisCursorData;
 use crate::redis_utils::ft_cursor_read::ft_cursor_read;
@@ -50,6 +52,9 @@ where
         connection_manager: C,
         index: String,
         data: RedisCursorData,
+        aggregate_start: Instant,
+        first_batch_ms: u128,
+        cursor_rounds: u64,
     }
 
     let mut cmd = redis::cmd("FT.AGGREGATE");
@@ -69,9 +74,11 @@ where
     for key in &options.sort_by {
         ft_aggregate_cmd = ft_aggregate_cmd.arg(key).arg("ASC");
     }
+    let aggregate_start = Instant::now();
     let res = ft_aggregate_cmd
         .query_async::<Value>(&mut connection_manager)
         .await;
+    let first_batch_ms = aggregate_start.elapsed().as_millis();
     let data = match res {
         Ok(d) => d,
         Err(e) => {
@@ -103,6 +110,9 @@ where
         connection_manager,
         index,
         data: data.try_into()?,
+        aggregate_start,
+        first_batch_ms,
+        cursor_rounds: 0,
     };
 
     Ok(futures::stream::unfold(
@@ -114,6 +124,16 @@ where
                     return Some((Ok(map), Some(state)));
                 }
                 if state.data.cursor == 0 {
+                    let total_elapsed = state.aggregate_start.elapsed();
+                    if total_elapsed > Duration::from_millis(500) {
+                        warn!(
+                            index = %state.index,
+                            ft_aggregate_first_batch_ms = state.first_batch_ms as u64,
+                            ft_aggregate_cursor_rounds = state.cursor_rounds,
+                            ft_aggregate_total_ms = total_elapsed.as_millis() as u64,
+                            "Slow ft_aggregate"
+                        );
+                    }
                     return None;
                 }
                 let data_res = ft_cursor_read(
@@ -122,6 +142,7 @@ where
                     state.data.cursor,
                 )
                 .await;
+                state.cursor_rounds += 1;
                 state.data = match data_res {
                     Ok(data) => data,
                     Err(err) => return Some((Err(err), None)),

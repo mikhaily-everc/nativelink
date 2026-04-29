@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -63,13 +64,23 @@ const DEFAULT_CLIENT_ACTION_TIMEOUT_S: u64 = 60;
 /// If this changes, remember to change the documentation in the config.
 const DEFAULT_MAX_JOB_RETRIES: usize = 3;
 
-/// Maximum number of reserve→commit matches driven concurrently by
-/// `do_try_match`. Chosen so the matcher's peak Redis connection usage
+/// Default maximum number of reserve→commit matches driven concurrently
+/// by `do_try_match`. Chosen so the matcher's peak Redis connection usage
 /// (roughly one `assign_operation` round-trip per in-flight match) leaves
 /// headroom in the pool for subscriber polls and other command flows
-/// (`cas.json` `connection_pool_size: 20`). See the plan's "Resolved
-/// decisions" section for the rationale.
-const MAX_CONCURRENT_MATCHES: usize = 8;
+/// (`cas.json` `connection_pool_size: 20`). Override via
+/// `SimpleSpec::max_concurrent_matches`.
+const DEFAULT_MAX_CONCURRENT_MATCHES: usize = 8;
+
+/// Per-cycle aggregation of time spent in each phase of `do_try_match`.
+/// Populated concurrently by in-flight `match_one` futures; read once at
+/// cycle end to emit the slow-cycle warn log.
+#[derive(Default)]
+struct CyclePhaseMs {
+    reserve_pool_ns: AtomicU64,
+    assign_ns: AtomicU64,
+    commit_pool_ns: AtomicU64,
+}
 
 struct SimpleSchedulerActionStateResult {
     client_operation_id: OperationId,
@@ -155,6 +166,11 @@ pub struct SimpleScheduler {
     /// e.g. "worker busy", "can't find any worker"
     /// Set to None to disable. This is quite noisy, so we limit it
     worker_match_logging_interval: Option<Duration>,
+
+    /// Runtime-resolved value for the matcher's concurrency ceiling.
+    /// Sourced from `SimpleSpec::max_concurrent_matches` (with 0/None
+    /// falling back to `DEFAULT_MAX_CONCURRENT_MATCHES`).
+    max_concurrent_matches: usize,
 }
 
 impl core::fmt::Debug for SimpleScheduler {
@@ -236,6 +252,13 @@ impl SimpleScheduler {
         &self.matching_engine_state_manager
     }
 
+    /// Runtime-resolved matcher concurrency ceiling. Reflects the value of
+    /// `SimpleSpec::max_concurrent_matches` after the `None`/`Some(0)` →
+    /// `DEFAULT_MAX_CONCURRENT_MATCHES` fallback.
+    pub const fn max_concurrent_matches(&self) -> usize {
+        self.max_concurrent_matches
+    }
+
     async fn do_try_match(&self, full_worker_logging: bool) -> Result<(), Error> {
         let start = Instant::now();
 
@@ -247,23 +270,29 @@ impl SimpleScheduler {
         // outer `spawn!` `'static` requirement. A `Vec` + manual
         // `FuturesUnordered` pump loop sidesteps that and makes the
         // concurrency and priority-order semantics explicit.
-        let mut actions: std::collections::VecDeque<Box<dyn ActionStateResult>> = self
+        let stream = self
             .get_queued_operations()
             .await
-            .err_tip(|| "Failed to get queued operations in do_try_match")?
-            .collect::<Vec<_>>()
-            .await
-            .into();
+            .err_tip(|| "Failed to get queued operations in do_try_match")?;
+        let filter_setup_elapsed = start.elapsed();
 
-        let query_elapsed = start.elapsed();
-        if query_elapsed > Duration::from_secs(1) {
+        let mut actions: std::collections::VecDeque<Box<dyn ActionStateResult>> =
+            stream.collect::<Vec<_>>().await.into();
+
+        let collect_elapsed = start.elapsed();
+        let stream_drain_elapsed = collect_elapsed.saturating_sub(filter_setup_elapsed);
+        let queued_count = actions.len();
+        if collect_elapsed > Duration::from_secs(1) {
             warn!(
-                elapsed_ms = query_elapsed.as_millis(),
+                elapsed_ms = collect_elapsed.as_millis(),
+                filter_setup_ms = filter_setup_elapsed.as_millis(),
+                stream_drain_ms = stream_drain_elapsed.as_millis(),
+                queued_count,
                 "Slow get_queued_operations query"
             );
         }
 
-        // Drive up to `MAX_CONCURRENT_MATCHES` matches concurrently across
+        // Drive up to `max_concurrent_matches` matches concurrently across
         // their `.await` chains. Reservations are issued in
         // priority/`state_sort_key` order (stream was ordered; the VecDeque
         // preserves order; we pop from the front). Redis `assign_operation`
@@ -272,9 +301,11 @@ impl SimpleScheduler {
         // here is safe wrt. worker capacity and budget.
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut result: Result<(), Error> = Ok(());
+        let phase_ms = Arc::new(CyclePhaseMs::default());
+        let limit = self.max_concurrent_matches;
 
         // Initial fill.
-        while in_flight.len() < MAX_CONCURRENT_MATCHES {
+        while in_flight.len() < limit {
             let Some(action) = actions.pop_front() else {
                 break;
             };
@@ -283,6 +314,7 @@ impl SimpleScheduler {
                 Arc::clone(&self.worker_scheduler),
                 Arc::clone(&self.matching_engine_state_manager),
                 Arc::clone(&self.platform_property_manager),
+                Arc::clone(&phase_ms),
                 full_worker_logging,
             ));
         }
@@ -296,6 +328,7 @@ impl SimpleScheduler {
                     Arc::clone(&self.worker_scheduler),
                     Arc::clone(&self.matching_engine_state_manager),
                     Arc::clone(&self.platform_property_manager),
+                    Arc::clone(&phase_ms),
                     full_worker_logging,
                 ));
             }
@@ -303,9 +336,17 @@ impl SimpleScheduler {
 
         let total_elapsed = start.elapsed();
         if total_elapsed > Duration::from_secs(5) {
+            let ns_to_ms = |ns: u64| ns / 1_000_000;
             warn!(
                 total_ms = total_elapsed.as_millis(),
-                query_ms = query_elapsed.as_millis(),
+                collect_ms = collect_elapsed.as_millis(),
+                filter_setup_ms = filter_setup_elapsed.as_millis(),
+                stream_drain_ms = stream_drain_elapsed.as_millis(),
+                queued_count,
+                reserve_pool_ms = ns_to_ms(phase_ms.reserve_pool_ns.load(Ordering::Relaxed)),
+                redis_assign_ms = ns_to_ms(phase_ms.assign_ns.load(Ordering::Relaxed)),
+                commit_pool_ms = ns_to_ms(phase_ms.commit_pool_ns.load(Ordering::Relaxed)),
+                max_concurrent_matches = limit,
                 "Slow do_try_match cycle"
             );
         }
@@ -330,6 +371,7 @@ async fn match_one(
     workers: Arc<ApiWorkerScheduler>,
     state_manager: Arc<dyn MatchingEngineStateManager>,
     ppm: Arc<PlatformPropertyManager>,
+    phase_ms: Arc<CyclePhaseMs>,
     full_worker_logging: bool,
 ) -> Result<(), Error> {
     let (action_info, maybe_origin_metadata) = action_state_result
@@ -348,10 +390,15 @@ async fn match_one(
         platform_properties,
     };
 
-    let Some(reservation) = workers
+    let reserve_start = Instant::now();
+    let maybe_reservation = workers
         .reserve_worker_for_action(&action_info.platform_properties, full_worker_logging)
-        .await
-    else {
+        .await;
+    phase_ms.reserve_pool_ns.fetch_add(
+        reserve_start.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+    let Some(reservation) = maybe_reservation else {
         return Ok(());
     };
 
@@ -375,17 +422,26 @@ async fn match_one(
             action_state.client_operation_id.clone()
         };
 
+        let assign_start = Instant::now();
         let assign_result = state_manager
             .assign_operation(&operation_id, Ok(&worker_id))
             .await;
+        phase_ms
+            .assign_ns
+            .fetch_add(assign_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         match assign_result {
             Ok(()) => {
                 debug!(%worker_id, %operation_id, ?action_info, "Notifying worker of operation");
-                match workers
+                let commit_start = Instant::now();
+                let commit_result = workers
                     .commit_reservation(reservation, operation_id.clone(), action_info)
-                    .await
-                {
+                    .await;
+                phase_ms.commit_pool_ns.fetch_add(
+                    commit_start.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                match commit_result {
                     Ok(()) => Ok(()),
                     Err((Some(res), commit_err)) => {
                         // Commit failed BEFORE finalize_run mutated any
@@ -516,6 +572,16 @@ impl SimpleScheduler {
         if max_job_retries == 0 {
             max_job_retries = DEFAULT_MAX_JOB_RETRIES;
         }
+
+        let max_concurrent_matches = spec
+            .max_concurrent_matches
+            .map(|v| v as usize)
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_MATCHES);
+        info!(
+            max_concurrent_matches,
+            "scheduler matcher concurrency resolved"
+        );
 
         let worker_change_notify = Arc::new(Notify::new());
 
@@ -685,6 +751,7 @@ impl SimpleScheduler {
                 maybe_origin_event_tx,
                 task_worker_matching_spawn,
                 worker_match_logging_interval,
+                max_concurrent_matches,
             }
         });
         (action_scheduler, worker_scheduler_clone)

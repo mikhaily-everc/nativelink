@@ -166,6 +166,16 @@ pub struct SimpleSpec {
         deserialize_with = "convert_duration_with_shellexpand_and_negative"
     )]
     pub worker_match_logging_interval_s: i64,
+
+    /// Maximum number of reserve→commit matches the matcher drives
+    /// concurrently per `do_try_match` cycle. Higher values improve
+    /// throughput under worker saturation but contend for Redis
+    /// connections in the scheduler store pool (`connection_pool_size`).
+    /// `None` or `Some(0)` falls back to the built-in default (8).
+    ///
+    /// Default: 8
+    #[serde(default)]
+    pub max_concurrent_matches: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]

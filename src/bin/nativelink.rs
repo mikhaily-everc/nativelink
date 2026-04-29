@@ -261,6 +261,18 @@ async fn inner_main(
             .transpose()
             .err_tip(|| "Could not create Execution service")?;
 
+        // Build the CAS server up front so we can expose its per-instance
+        // "chunking support" map to the Capabilities service below.
+        let cas_server = services
+            .cas
+            .map(|cfg| CasServer::new(&cfg, &store_manager))
+            .transpose()
+            .err_tip(|| "Could not create CAS service")?;
+        let chunking_enabled_for_instance = cas_server
+            .as_ref()
+            .map(CasServer::chunking_instances)
+            .unwrap_or_default();
+
         let tonic_services = Routes::builder()
             .routes()
             .add_optional_service(
@@ -272,15 +284,7 @@ async fn inner_main(
                     })
                     .err_tip(|| "Could not create AC service")?,
             )
-            .add_optional_service(
-                services
-                    .cas
-                    .map_or(Ok(None), |cfg| {
-                        CasServer::new(&cfg, &store_manager)
-                            .map(|v| Some(service_setup!(v.into_service(), http_config)))
-                    })
-                    .err_tip(|| "Could not create CAS service")?,
-            )
+            .add_optional_service(cas_server.map(|v| service_setup!(v.into_service(), http_config)))
             .add_optional_service(
                 execution_server
                     .clone()
@@ -317,12 +321,13 @@ async fn inner_main(
                     .err_tip(|| "Could not create ByteStream service")?,
             )
             .add_optional_service(
-                OptionFuture::from(
-                    services
-                        .capabilities
-                        .as_ref()
-                        .map(|cfg| CapabilitiesServer::new(cfg, &action_schedulers)),
-                )
+                OptionFuture::from(services.capabilities.as_ref().map(|cfg| {
+                    CapabilitiesServer::new(
+                        cfg,
+                        &action_schedulers,
+                        chunking_enabled_for_instance.clone(),
+                    )
+                }))
                 .await
                 .map_or(Ok::<Option<CapabilitiesServer>, Error>(None), |server| {
                     Ok(Some(server?))

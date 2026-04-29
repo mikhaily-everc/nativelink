@@ -1709,7 +1709,15 @@ where
             ft_create(connection_manager, index, create_options, schema).await
         };
 
+        let get_connection_start = Instant::now();
         let (connection_manager, connect_id) = self.connection_manager.get_connection().await?;
+        let get_connection_elapsed = get_connection_start.elapsed();
+        if get_connection_elapsed > Duration::from_millis(50) {
+            warn!(
+                ?get_connection_elapsed,
+                "Slow RedisManager::get_connection on search_by_index_prefix"
+            );
+        }
         let stream = match run_ft_aggregate(connection_manager.clone()).await {
             Err(err)
                 if err.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::ReadOnly) =>
@@ -1885,5 +1893,20 @@ where
                 format!("In RedisStore::get_with_version::notversioned::decode {key}")
             })?,
         ))
+    }
+
+    async fn delete_key<K>(&self, key: K) -> Result<(), Error>
+    where
+        K: SchedulerStoreKeyProvider + Send,
+    {
+        let store_key = key.get_key();
+        let redis_key = self.encode_key(&store_key);
+        let mut client = self.get_client().await?;
+        client
+            .connection_manager
+            .del::<_, ()>(redis_key.as_ref())
+            .await
+            .err_tip(|| format!("In RedisStore::delete_key for {redis_key}"))?;
+        Ok(())
     }
 }
