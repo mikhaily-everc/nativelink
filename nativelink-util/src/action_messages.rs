@@ -712,8 +712,10 @@ pub struct ActionResult {
     // Inline fallback for stdout/stderr when CAS upload fails on a failed action.
     // Lets the action result still reach the client with the real error message
     // instead of being lost to RST_STREAM. Empty when the upload succeeded.
-    pub stdout_raw: Bytes,
-    pub stderr_raw: Bytes,
+    // Vec<u8> (not Bytes) so the struct's derived Serialize/Deserialize work
+    // without pulling in the `bytes/serde` feature.
+    pub stdout_raw: Vec<u8>,
+    pub stderr_raw: Vec<u8>,
     pub execution_metadata: ExecutionMetadata,
     pub server_logs: HashMap<String, DigestInfo>,
     pub error: Option<Error>,
@@ -730,8 +732,8 @@ impl Default for ActionResult {
             exit_code: INTERNAL_ERROR_EXIT_CODE,
             stdout_digest: DigestInfo::new([0u8; 32], 0),
             stderr_digest: DigestInfo::new([0u8; 32], 0),
-            stdout_raw: Bytes::new(),
-            stderr_raw: Bytes::new(),
+            stdout_raw: Vec::new(),
+            stderr_raw: Vec::new(),
             execution_metadata: ExecutionMetadata {
                 worker: String::new(),
                 queued_timestamp: SystemTime::UNIX_EPOCH,
@@ -940,9 +942,9 @@ impl TryFrom<ActionResult> for ProtoActionResult {
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
             exit_code: val.exit_code,
-            stdout_raw: val.stdout_raw,
+            stdout_raw: Bytes::from(val.stdout_raw),
             stdout_digest: Some(val.stdout_digest.into()),
-            stderr_raw: val.stderr_raw,
+            stderr_raw: Bytes::from(val.stderr_raw),
             stderr_digest: Some(val.stderr_digest.into()),
             execution_metadata: Some(val.execution_metadata.into()),
         })
@@ -1005,8 +1007,8 @@ impl TryFrom<ProtoActionResult> for ActionResult {
                 .stderr_digest
                 .err_tip(|| "Expected stderr_digest to be set on ExecuteResponse msg")?
                 .try_into()?,
-            stdout_raw: val.stdout_raw,
-            stderr_raw: val.stderr_raw,
+            stdout_raw: val.stdout_raw.to_vec(),
+            stderr_raw: val.stderr_raw.to_vec(),
             execution_metadata: val
                 .execution_metadata
                 .err_tip(|| "Expected execution_metadata to be set on ExecuteResponse msg")?
@@ -1048,8 +1050,8 @@ impl TryFrom<ExecuteResponse> for ActionStage {
                 .stderr_digest
                 .err_tip(|| "Expected stderr_digest to be set on ExecuteResponse msg")?
                 .try_into()?,
-            stdout_raw: proto_action_result.stdout_raw,
-            stderr_raw: proto_action_result.stderr_raw,
+            stdout_raw: proto_action_result.stdout_raw.to_vec(),
+            stderr_raw: proto_action_result.stderr_raw.to_vec(),
             execution_metadata: proto_action_result
                 .execution_metadata
                 .err_tip(|| "Expected execution_metadata to be set on ExecuteResponse msg")?

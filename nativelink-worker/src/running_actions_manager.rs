@@ -1469,13 +1469,15 @@ impl RunningActionImpl {
         let exit_code = execution_result.exit_code;
         let stdout_bytes = execution_result.stdout;
         let stderr_bytes = execution_result.stderr;
-        let (stdout_fallback, stderr_fallback) = if exit_code != 0 {
+        // Vec<u8> (not Bytes) — flows into ActionResult.stdout_raw/stderr_raw,
+        // which use Vec<u8> so the struct's derived Serialize works.
+        let (stdout_fallback, stderr_fallback): (Vec<u8>, Vec<u8>) = if exit_code != 0 {
             (
-                Bytes::copy_from_slice(&stdout_bytes[..stdout_bytes.len().min(INLINE_FALLBACK_CAP)]),
-                Bytes::copy_from_slice(&stderr_bytes[..stderr_bytes.len().min(INLINE_FALLBACK_CAP)]),
+                stdout_bytes[..stdout_bytes.len().min(INLINE_FALLBACK_CAP)].to_vec(),
+                stderr_bytes[..stderr_bytes.len().min(INLINE_FALLBACK_CAP)].to_vec(),
             )
         } else {
-            (Bytes::new(), Bytes::new())
+            (Vec::new(), Vec::new())
         };
 
         let stdout_digest_fut = self.metrics().upload_stdout.wrap({
@@ -1493,7 +1495,7 @@ impl RunningActionImpl {
                             elapsed_ms = start.elapsed().as_millis(),
                             "upload_results: stdout upload completed",
                         );
-                        Result::<(DigestInfo, Bytes), Error>::Ok((digest, Bytes::new()))
+                        Result::<(DigestInfo, Vec<u8>), Error>::Ok((digest, Vec::new()))
                     }
                     Err(e) if !stdout_fallback.is_empty() => {
                         warn!(
@@ -1522,7 +1524,7 @@ impl RunningActionImpl {
                             elapsed_ms = start.elapsed().as_millis(),
                             "upload_results: stderr upload completed",
                         );
-                        Result::<(DigestInfo, Bytes), Error>::Ok((digest, Bytes::new()))
+                        Result::<(DigestInfo, Vec<u8>), Error>::Ok((digest, Vec::new()))
                     }
                     Err(e) if !stderr_fallback.is_empty() => {
                         warn!(
