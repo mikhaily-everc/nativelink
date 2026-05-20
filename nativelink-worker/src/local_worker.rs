@@ -37,6 +37,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId};
+use nativelink_util::background_spawn;
 use nativelink_util::common::fs;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
@@ -387,36 +388,27 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     let instance_name = maybe_instance_name
                                         .err_tip(|| "`instance_name` could not be resolved; this is likely an internal error in local_worker.")?;
                                     match res {
-                                        Ok(mut action_result) => {
-                                            // Save in the action cache before notifying the scheduler that we've completed.
+                                        Ok(action_result) => {
+                                            // Deliver the action result to the scheduler IMMEDIATELY and run
+                                            // cache_action_result in the background.
                                             //
-                                            // Bound this so a slow / hung cache write (e.g. flaky CAS S3 backend
-                                            // doing its 60s-per-attempt × 6 retries) cannot block delivery of the
-                                            // action result. If the worker pod is SIGTERM'd while stuck in this
-                                            // cache write, the scheduler sees a worker disconnect, the action gets
-                                            // cancelled ("Job cancelled because it attempted to execute too many
-                                            // times"), and Bazel never sees the actual (often successful or with
-                                            // useful stderr) action result.
-                                            const CACHE_ACTION_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
-                                            if let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) {
-                                                match tokio::time::timeout(
-                                                    CACHE_ACTION_RESULT_TIMEOUT,
-                                                    running_actions_manager.cache_action_result(digest_info, &mut action_result, digest_hasher),
-                                                ).await {
-                                                    Ok(Ok(())) => {}
-                                                    Ok(Err(err)) => error!(
-                                                        ?err,
-                                                        ?action_digest,
-                                                        "Error saving action in store",
-                                                    ),
-                                                    Err(_) => warn!(
-                                                        ?action_digest,
-                                                        timeout_s = CACHE_ACTION_RESULT_TIMEOUT.as_secs(),
-                                                        "cache_action_result timed out; proceeding with execution_response without cached AC entry",
-                                                    ),
-                                                }
-                                            }
-                                            let action_stage = ActionStage::Completed(action_result);
+                                            // Rationale: the scheduler only needs the ActionResult itself to
+                                            // tell the client the action is complete; the AC store + historical
+                                            // store entries cache_action_result writes are an optimization for
+                                            // future re-runs, not part of the result contract. Waiting on those
+                                            // writes (which can hang for minutes if CAS S3/Redis backends are
+                                            // slow, retrying internally for 60s × 6 attempts) used to block
+                                            // delivery — and if the worker pod was SIGTERM'd while stuck in the
+                                            // cache write, the scheduler would treat it as a worker disconnect,
+                                            // cancel the action ("Job cancelled because it attempted to execute
+                                            // too many times"), and Bazel would never see the actual exit_code
+                                            // / stderr (e.g. the real "cannot find symbol" javac error).
+                                            //
+                                            // Trade-off: `action_result.message` (the worker-browser link to
+                                            // the cached HistoricalExecuteResponse) is now empty in the result
+                                            // sent to the client, because we don't wait for the historical
+                                            // upload to compute the URL. That's a cosmetic loss only.
+                                            let action_stage = ActionStage::Completed(action_result.clone());
                                             grpc_client.execution_response(
                                                 ExecuteResult{
                                                     instance_name,
@@ -426,6 +418,34 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             )
                                             .await
                                             .err_tip(|| "Error while calling execution_response")?;
+
+                                            // Fire-and-forget AC + historical upload. Use a generous timeout
+                                            // (the client is no longer waiting on this) but bound it so a
+                                            // hung backend doesn't leak the task forever.
+                                            if let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) {
+                                                let ram = running_actions_manager.clone();
+                                                let action_digest_for_log = action_digest.clone();
+                                                let mut action_result = action_result;
+                                                const BACKGROUND_CACHE_TIMEOUT: Duration = Duration::from_secs(120);
+                                                background_spawn!("cache_action_result_background", async move {
+                                                    match tokio::time::timeout(
+                                                        BACKGROUND_CACHE_TIMEOUT,
+                                                        ram.cache_action_result(digest_info, &mut action_result, digest_hasher),
+                                                    ).await {
+                                                        Ok(Ok(())) => {}
+                                                        Ok(Err(err)) => error!(
+                                                            ?err,
+                                                            action_digest = ?action_digest_for_log,
+                                                            "Error saving action in store (background)",
+                                                        ),
+                                                        Err(_) => warn!(
+                                                            action_digest = ?action_digest_for_log,
+                                                            timeout_s = BACKGROUND_CACHE_TIMEOUT.as_secs(),
+                                                            "cache_action_result timed out in background",
+                                                        ),
+                                                    }
+                                                });
+                                            }
                                         },
                                         Err(e) => {
                                             let is_cas_blob_missing = e.code == Code::NotFound
