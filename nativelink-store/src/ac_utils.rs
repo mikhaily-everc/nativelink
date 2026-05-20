@@ -23,11 +23,9 @@ use bytes::BytesMut;
 use futures::TryFutureExt;
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_util::common::DigestInfo;
-use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
+use nativelink_util::digest_hasher::DigestHasher;
 use nativelink_util::store_trait::{StoreKey, StoreLike};
-use opentelemetry::context::Context;
 use prost::Message;
-use tracing::warn;
 
 // NOTE(aaronmondal) From some local testing it looks like action cache items are rarely greater than
 // 1.2k. Giving a bit more just in case to reduce allocs.
@@ -109,31 +107,15 @@ pub fn message_to_digest(
 pub async fn serialize_and_upload_message<'a, T: Message>(
     message: &'a T,
     cas_store: Pin<&'a impl StoreLike>,
-    // Kept in the signature for API back-compat with upstream callers, but the
-    // value is IGNORED on purpose. See the body for why.
-    _ignored_hasher: &mut impl DigestHasher,
+    hasher: &mut impl DigestHasher,
 ) -> Result<DigestInfo, Error> {
     let mut buffer = BytesMut::with_capacity(message.encoded_len());
     message
         .encode(&mut buffer)
         .err_tip(|| "In serialize_and_upload_message: encode")?;
     let frozen = buffer.freeze();
-
-    // Use the OpenTelemetry-context digest function instead of the
-    // caller-supplied `hasher`. The hash function we pick here MUST match what
-    // GrpcStore::update encodes into the upload's resource_name
-    // (`.../blobs/<digest_function>/<hash>/<size>`), which itself reads from
-    // the OTel context. If callers pass a hasher whose algorithm differs from
-    // the OTel context (e.g. sha256 vs blake3), the declared digest does not
-    // match the data CAS hashes on receipt → VerifyStore reports
-    // "hash mismatch" with bytes_received == expected_size on a solo upload.
-    let digest_func = Context::current()
-        .get::<DigestHasherFunc>()
-        .map_or_else(default_digest_hasher_func, |v| *v);
-    let mut hasher = digest_func.hasher();
     hasher.update(&frozen);
     let digest = hasher.finalize_digest();
-
     // Note: For unknown reasons we appear to be hitting:
     // https://github.com/rust-lang/rust/issues/92096
     // or a smiliar issue if we try to use the non-store driver function, so we

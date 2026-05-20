@@ -43,12 +43,12 @@ use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::store_trait::Store;
 use nativelink_util::{spawn, tls_utils};
-use opentelemetry::context::Context;
+use opentelemetry::context::{Context, FutureExt as _};
 use tokio::sync::{broadcast, mpsc};
 use tokio::{process, time};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Streaming;
-use tracing::{Level, debug, error, event, info, info_span, instrument, trace, warn};
+use tracing::{Instrument, Level, debug, error, event, info, info_span, instrument, trace, warn};
 
 use crate::running_actions_manager::{
     ExecutionConfiguration, Metrics as RunningActionManagerMetrics, RunningAction,
@@ -447,58 +447,68 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
                             let add_future_channel = add_future_channel.clone();
 
-                            info_span!(
+                            let span = info_span!(
                                 "worker_start_action_ctx",
                                 operation_id = operation_id_to_log,
                                 digest_function = %digest_hasher.to_string(),
-                            ).in_scope(|| {
-                                let _guard = Context::current_with_value(digest_hasher)
-                                    .attach();
+                            );
 
-                                let actions_in_flight = actions_in_flight.clone();
-                                let actions_notify = actions_notify.clone();
-                                let actions_in_flight_fail = actions_in_flight.clone();
-                                let actions_notify_fail = actions_notify.clone();
-                                actions_in_flight.fetch_add(1, Ordering::Release);
+                            let actions_in_flight = actions_in_flight.clone();
+                            let actions_notify = actions_notify.clone();
+                            let actions_in_flight_fail = actions_in_flight.clone();
+                            let actions_notify_fail = actions_notify.clone();
+                            actions_in_flight.fetch_add(1, Ordering::Release);
 
-                                futures.push(
-                                    spawn!("worker_start_action", start_action_fut).map(move |res| {
-                                        let res = match res {
-                                            Ok(action_res) => action_res,
-                                            Err(join_err) => {
-                                                error!(
-                                                    ?join_err,
-                                                    "worker_start_action task panicked or was cancelled; publishing InternalError",
-                                                );
-                                                Err(make_err!(
-                                                    Code::Internal,
-                                                    "worker_start_action panicked or was cancelled: {join_err}"
-                                                ))
-                                            }
-                                        };
-                                        if let Err(err) = &res {
-                                            error!(?err, "Error executing action");
+                            // Carry the `digest_hasher` in OTel context THROUGH the spawned
+                            // task. Using a synchronous `.attach()` guard here would only
+                            // bind the context to this thread for the duration of the
+                            // `in_scope` block; the spawned future runs LATER on a
+                            // different tokio task, where Context::current() would not
+                            // find the DigestHasherFunc and downstream code (e.g.
+                            // GrpcStore::update encoding the digest_function into the
+                            // upload's resource_name) would fall back to the default
+                            // (sha256). That mismatch with `digest_hasher` produces the
+                            // VerifyStore "hash mismatch" cascade on CAS.
+                            let ctx = Context::current_with_value(digest_hasher);
+                            let action_fut_with_ctx = start_action_fut.instrument(span).with_context(ctx);
+
+                            futures.push(
+                                spawn!("worker_start_action", action_fut_with_ctx).map(move |res| {
+                                    let res = match res {
+                                        Ok(action_res) => action_res,
+                                        Err(join_err) => {
+                                            error!(
+                                                ?join_err,
+                                                "worker_start_action task panicked or was cancelled; publishing InternalError",
+                                            );
+                                            Err(make_err!(
+                                                Code::Internal,
+                                                "worker_start_action panicked or was cancelled: {join_err}"
+                                            ))
                                         }
-                                        add_future_channel
-                                            .send(make_publish_future(res).then(move |res| {
-                                                actions_in_flight.fetch_sub(1, Ordering::Release);
-                                                actions_notify.notify_one();
-                                                core::future::ready(res)
-                                            }).boxed())
-                                            .map_err(|err|
-                                                Error::from_std_err(Code::Internal, &err).append("LocalWorker could not send future")
-                                                )?;
-                                        Ok(())
-                                    })
-                                    .or_else(move |err| {
-                                        // If the make_publish_future is not run we still need to notify.
-                                        actions_in_flight_fail.fetch_sub(1, Ordering::Release);
-                                        actions_notify_fail.notify_one();
-                                        core::future::ready(Err(err))
-                                    })
-                                    .boxed()
-                                );
-                            });
+                                    };
+                                    if let Err(err) = &res {
+                                        error!(?err, "Error executing action");
+                                    }
+                                    add_future_channel
+                                        .send(make_publish_future(res).then(move |res| {
+                                            actions_in_flight.fetch_sub(1, Ordering::Release);
+                                            actions_notify.notify_one();
+                                            core::future::ready(res)
+                                        }).boxed())
+                                        .map_err(|err|
+                                            Error::from_std_err(Code::Internal, &err).append("LocalWorker could not send future")
+                                            )?;
+                                    Ok(())
+                                })
+                                .or_else(move |err| {
+                                    // If the make_publish_future is not run we still need to notify.
+                                    actions_in_flight_fail.fetch_sub(1, Ordering::Release);
+                                    actions_notify_fail.notify_one();
+                                    core::future::ready(Err(err))
+                                })
+                                .boxed()
+                            );
                         }
                     }
                 },
