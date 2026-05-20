@@ -109,36 +109,30 @@ pub fn message_to_digest(
 pub async fn serialize_and_upload_message<'a, T: Message>(
     message: &'a T,
     cas_store: Pin<&'a impl StoreLike>,
-    hasher: &mut impl DigestHasher,
+    // Kept in the signature for API back-compat with upstream callers, but the
+    // value is IGNORED on purpose. See the body for why.
+    _ignored_hasher: &mut impl DigestHasher,
 ) -> Result<DigestInfo, Error> {
     let mut buffer = BytesMut::with_capacity(message.encoded_len());
     message
         .encode(&mut buffer)
         .err_tip(|| "In serialize_and_upload_message: encode")?;
     let frozen = buffer.freeze();
+
+    // Use the OpenTelemetry-context digest function instead of the
+    // caller-supplied `hasher`. The hash function we pick here MUST match what
+    // GrpcStore::update encodes into the upload's resource_name
+    // (`.../blobs/<digest_function>/<hash>/<size>`), which itself reads from
+    // the OTel context. If callers pass a hasher whose algorithm differs from
+    // the OTel context (e.g. sha256 vs blake3), the declared digest does not
+    // match the data CAS hashes on receipt → VerifyStore reports
+    // "hash mismatch" with bytes_received == expected_size on a solo upload.
+    let digest_func = Context::current()
+        .get::<DigestHasherFunc>()
+        .map_or_else(default_digest_hasher_func, |v| *v);
+    let mut hasher = digest_func.hasher();
     hasher.update(&frozen);
     let digest = hasher.finalize_digest();
-
-    // Pre-upload self-check: re-hash the EXACT bytes we are about to ship and
-    // confirm they match the declared digest. If they don't, the bug is here in
-    // the worker (not network corruption or CAS); log loudly with both hashes
-    // so we can correlate to the CAS-side `VerifyStore: hash mismatch` log.
-    {
-        let digest_func = Context::current()
-            .get::<DigestHasherFunc>()
-            .map_or_else(default_digest_hasher_func, |v| *v);
-        let mut verify_hasher = digest_func.hasher();
-        verify_hasher.update(&frozen);
-        let verify_digest = verify_hasher.finalize_digest();
-        if verify_digest.packed_hash() != digest.packed_hash() {
-            warn!(
-                declared_hash = %digest.packed_hash(),
-                reverify_hash = %verify_digest.packed_hash(),
-                bytes_len = frozen.len(),
-                "serialize_and_upload_message: PRE-UPLOAD self-check FAILED — declared digest does not match re-hashed payload. This points at a hasher / encoding bug on the worker.",
-            );
-        }
-    }
 
     // Note: For unknown reasons we appear to be hitting:
     // https://github.com/rust-lang/rust/issues/92096
