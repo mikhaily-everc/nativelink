@@ -48,7 +48,11 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     ) -> Result<(), Error>;
 
     /// Removes worker from pool and reschedule any tasks that might be running on it.
-    async fn remove_worker(&self, worker_id: &WorkerId) -> Result<(), Error>;
+    /// `reason` is propagated as the cause when in-flight actions on this worker are
+    /// either re-queued (`max_job_retries` budget) or cancelled (budget exhausted),
+    /// so that Bazel sees the real reason (e.g. `BrokenPipe`) instead of the generic
+    /// `"Received request to remove worker"`.
+    async fn remove_worker(&self, worker_id: &WorkerId, reason: Error) -> Result<(), Error>;
 
     /// Evict all workers from the scheduler, setting their actions back to queued.
     async fn shutdown(&self, shutdown_guard: ShutdownGuard);

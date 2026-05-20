@@ -277,6 +277,10 @@ impl WorkerConnection {
 
         background_spawn!("worker_api", async move {
             let mut had_going_away = false;
+            // Capture the last observed worker-side error so it can be propagated
+            // through `remove_worker` and surface to Bazel as the action's cancellation
+            // cause, instead of the generic "Received request to remove worker".
+            let mut last_err: Option<Error> = None;
             while let Some(maybe_update) = connection.next().await {
                 let update = match maybe_update.map(|u| u.update) {
                     Ok(Some(update)) => update,
@@ -284,8 +288,10 @@ impl WorkerConnection {
                         tracing::warn!(worker_id=?instance.worker_id, "Empty update");
                         continue;
                     }
-                    Err(err) => {
+                    Err(status) => {
+                        let err: Error = status.into();
                         tracing::warn!(worker_id=?instance.worker_id, ?err, "Error from worker");
+                        last_err = Some(err);
                         break;
                     }
                 };
@@ -311,11 +317,19 @@ impl WorkerConnection {
                 };
                 if let Err(err) = result {
                     tracing::warn!(worker_id=?instance.worker_id, ?err, "Error processing worker message");
+                    last_err = Some(err);
                 }
             }
             tracing::debug!(worker_id=?instance.worker_id, "Update for scheduler dropped");
             if !had_going_away {
-                drop(instance.scheduler.remove_worker(&instance.worker_id).await);
+                let reason = last_err.unwrap_or_else(|| {
+                    make_err!(
+                        Code::Unavailable,
+                        "Worker {} update stream closed without explicit goodbye",
+                        instance.worker_id,
+                    )
+                });
+                drop(instance.scheduler.remove_worker(&instance.worker_id, reason).await);
             }
         });
     }
@@ -330,7 +344,14 @@ impl WorkerConnection {
 
     async fn inner_going_away(&self, _going_away_request: GoingAwayRequest) -> Result<(), Error> {
         self.scheduler
-            .remove_worker(&self.worker_id)
+            .remove_worker(
+                &self.worker_id,
+                make_err!(
+                    Code::Aborted,
+                    "Worker {} sent GoingAwayRequest (graceful shutdown)",
+                    self.worker_id,
+                ),
+            )
             .await
             .err_tip(|| "While calling WorkerApiServer::inner_going_away")?;
         Ok(())

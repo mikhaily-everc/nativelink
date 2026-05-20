@@ -1215,16 +1215,12 @@ impl WorkerScheduler for ApiWorkerScheduler {
         Ok(())
     }
 
-    async fn remove_worker(&self, worker_id: &WorkerId) -> Result<(), Error> {
+    async fn remove_worker(&self, worker_id: &WorkerId, reason: Error) -> Result<(), Error> {
         self.worker_registry.remove_worker(worker_id).await;
 
         let mut inner = self.inner.lock().await;
         inner
-            .immediate_evict_worker(
-                worker_id,
-                make_err!(Code::Internal, "Received request to remove worker"),
-                false,
-            )
+            .immediate_evict_worker(worker_id, reason, false)
             .await
     }
 

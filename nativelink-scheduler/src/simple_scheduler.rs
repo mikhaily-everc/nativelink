@@ -928,8 +928,8 @@ impl WorkerScheduler for SimpleScheduler {
             .await
     }
 
-    async fn remove_worker(&self, worker_id: &WorkerId) -> Result<(), Error> {
-        self.worker_scheduler.remove_worker(worker_id).await
+    async fn remove_worker(&self, worker_id: &WorkerId, reason: Error) -> Result<(), Error> {
+        self.worker_scheduler.remove_worker(worker_id, reason).await
     }
 
     async fn shutdown(&self, shutdown_guard: ShutdownGuard) {
