@@ -23,9 +23,11 @@ use bytes::BytesMut;
 use futures::TryFutureExt;
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_util::common::DigestInfo;
-use nativelink_util::digest_hasher::DigestHasher;
+use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::store_trait::{StoreKey, StoreLike};
+use opentelemetry::context::Context;
 use prost::Message;
+use tracing::warn;
 
 // NOTE(aaronmondal) From some local testing it looks like action cache items are rarely greater than
 // 1.2k. Giving a bit more just in case to reduce allocs.
@@ -116,6 +118,28 @@ pub async fn serialize_and_upload_message<'a, T: Message>(
     let frozen = buffer.freeze();
     hasher.update(&frozen);
     let digest = hasher.finalize_digest();
+
+    // Pre-upload self-check: re-hash the EXACT bytes we are about to ship and
+    // confirm they match the declared digest. If they don't, the bug is here in
+    // the worker (not network corruption or CAS); log loudly with both hashes
+    // so we can correlate to the CAS-side `VerifyStore: hash mismatch` log.
+    {
+        let digest_func = Context::current()
+            .get::<DigestHasherFunc>()
+            .map_or_else(default_digest_hasher_func, |v| *v);
+        let mut verify_hasher = digest_func.hasher();
+        verify_hasher.update(&frozen);
+        let verify_digest = verify_hasher.finalize_digest();
+        if verify_digest.packed_hash() != digest.packed_hash() {
+            warn!(
+                declared_hash = %digest.packed_hash(),
+                reverify_hash = %verify_digest.packed_hash(),
+                bytes_len = frozen.len(),
+                "serialize_and_upload_message: PRE-UPLOAD self-check FAILED — declared digest does not match re-hashed payload. This points at a hasher / encoding bug on the worker.",
+            );
+        }
+    }
+
     // Note: For unknown reasons we appear to be hitting:
     // https://github.com/rust-lang/rust/issues/92096
     // or a smiliar issue if we try to use the non-store driver function, so we
