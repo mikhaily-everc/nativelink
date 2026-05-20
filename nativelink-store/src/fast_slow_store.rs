@@ -488,12 +488,24 @@ impl StoreDriver for FastSlowStore {
                     "FastSlowStore::update: completed with NotFound error(s)",
                 );
             } else {
+                // Log per-branch errors verbatim so we can tell which leg
+                // failed FIRST (the others cascade with "Sender dropped").
+                let data_stream_err = data_stream_res
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{e:?}"));
+                let fast_err = fast_res.as_ref().err().map(|e| format!("{e:?}"));
+                let slow_err = slow_res.as_ref().err().map(|e| format!("{e:?}"));
                 warn!(
                     key = %key_debug,
                     elapsed_ms = total_elapsed.as_millis(),
+                    bytes_sent = bytes_sent,
                     data_stream_ok = data_stream_res.is_ok(),
                     fast_store_ok = fast_res.is_ok(),
                     slow_store_ok = slow_res.is_ok(),
+                    ?data_stream_err,
+                    ?fast_err,
+                    ?slow_err,
                     "FastSlowStore::update: completed with error(s)",
                 );
             }

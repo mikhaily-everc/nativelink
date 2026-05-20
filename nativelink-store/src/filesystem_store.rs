@@ -774,11 +774,25 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         mut reader: DropCloserReadHalf,
     ) -> Result<(), Error> {
         let mut data_size = 0;
+        let recv_start = std::time::Instant::now();
         loop {
-            let mut data = reader
-                .recv()
-                .await
-                .err_tip(|| "Failed to receive data in filesystem store")?;
+            let data_result = reader.recv().await;
+            let mut data = match data_result {
+                Ok(data) => data,
+                Err(e) => {
+                    // The "Sender dropped before sending EOF" cascade we see
+                    // on upload corruption hits this branch. Log enough state
+                    // to correlate the temp file path with the failure context.
+                    warn!(
+                        ?final_key,
+                        bytes_received = data_size,
+                        elapsed_ms = recv_start.elapsed().as_millis(),
+                        err = ?e,
+                        "filesystem_store::update_file: reader dropped before EOF",
+                    );
+                    return Err(e).err_tip(|| "Failed to receive data in filesystem store");
+                }
+            };
             let data_len = data.len();
             if data_len == 0 {
                 break; // EOF.

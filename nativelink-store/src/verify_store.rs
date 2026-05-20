@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,6 +31,13 @@ use nativelink_util::store_trait::{
     RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use opentelemetry::context::Context;
+use tracing::{info, warn};
+
+// Process-wide counter of in-flight VerifyStore::update calls. Useful when
+// debugging the upload-corruption pattern (hash mismatch + S3 "0 bytes received"
+// + filesystem temp-file errors) — high concurrency at the moment of failure
+// would point at a shared-state leak between concurrent writes.
+static VERIFY_STORE_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, MetricsComponent)]
 pub struct VerifyStore {
@@ -120,6 +128,21 @@ impl VerifyStore {
                     let hash_result = digest.packed_hash();
                     if original_hash != hash_result {
                         self.hash_verification_failures.inc();
+                        // Log enough state to debug the cross-upload-data-bleed
+                        // hypothesis: if concurrent_uploads > 1 at the moment of
+                        // mismatch, a shared-state leak between writes is the
+                        // most likely culprit; if = 1, the client genuinely sent
+                        // wrong data.
+                        let concurrent =
+                            VERIFY_STORE_INFLIGHT.load(Ordering::Relaxed);
+                        warn!(
+                            declared_hash = %original_hash,
+                            computed_hash = %hash_result,
+                            bytes_received = sum_size,
+                            expected_size = ?maybe_expected_digest_size,
+                            concurrent_uploads = concurrent,
+                            "VerifyStore: hash mismatch — data received does not match declared digest",
+                        );
                         return Err(make_input_err!(
                             "Hashes do not match, got: {original_hash} but digest hash was {hash_result}",
                         ));
@@ -196,6 +219,18 @@ impl StoreDriver for VerifyStore {
         };
         let (tx, rx) = make_buf_channel_pair();
 
+        let inflight_at_start = VERIFY_STORE_INFLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+        // Spammy on every successful upload, so info-level and guarded by a
+        // threshold — only surface when concurrency is unusually high.
+        if inflight_at_start >= 16 {
+            info!(
+                declared_hash = %digest.packed_hash(),
+                declared_size = digest_size,
+                concurrent_uploads = inflight_at_start,
+                "VerifyStore: high in-flight upload concurrency",
+            );
+        }
+
         let update_fut = self.inner_store.update(digest, rx, size_info);
         let check_fut = self.inner_check_update(
             tx,
@@ -206,6 +241,8 @@ impl StoreDriver for VerifyStore {
         );
 
         let (update_res, check_res) = tokio::join!(update_fut, check_fut);
+
+        VERIFY_STORE_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
 
         update_res.merge(check_res)
     }
