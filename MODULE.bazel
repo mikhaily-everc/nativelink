@@ -10,14 +10,18 @@ bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "rules_python", version = "2.0.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 
-# hermetic-llvm: zero-sysroot, fully hermetic LLVM cross-compilation toolchain.
-# Inside Nix, lre.bazelrc registers @local-remote-execution//generated-cc/...
-# via --extra_toolchains, which outranks the MODULE.bazel registration below,
-# so Nix users keep getting LRE-CC unchanged. Outside Nix (no lre.bazelrc),
-# these hermetic toolchains replace the host autodetect path.
+# LLVM bazel_dep retained for `@llvm//constraints/libc:*` constraint values
+# referenced in tools/bazel/oci/BUILD.bazel and tools/bazel/platforms/BUILD.bazel,
+# plus the `--@llvm//config:experimental_stub_libgcc_s` flag in this file's
+# .bazelrc. The cc_toolchain is intentionally NOT registered: Zig hermetic_cc
+# (registered in root via bazelrc/configs/{linux,macos}.bazelrc) handles every
+# linux rustc link action. The previous linux→darwin cross-compile path that
+# needed `@llvm//toolchain` was used only by @rules_rust//tools/upstream_wrapper
+# :rustfmt under //tools/lint:format's macos_binary transition — //tools/lint
+# now aliases the prebuilt rustfmt sh_binary directly, bypassing the
+# rust_binary that required a linker. Dropping the registration saves the
+# ~400-600 MB clang+lld+libc++ CAS fetch on every cache-hit rustc action.
 bazel_dep(name = "llvm", version = "0.7.7")
-
-register_toolchains("@llvm//toolchain:all")
 
 # We use the Nix Python install, as per https://rules-python.readthedocs.io/en/latest/toolchains.html#local-toolchain
 # Can't use the rules_python download versions as it breaks with the genrule stuff in nativelink-proto
@@ -72,15 +76,6 @@ archive_override(
     urls = [
         "https://github.com/hermeticbuild/rules_rust/archive/cf176d81c12d9c8f6420c7d433b0af0f08d2abb1.tar.gz",
     ],
-)
-
-# Route any rules_rs internal `@rules_rust` references through the same
-# top-level bazel_dep so the entire build sees one rules_rust.
-rules_rust_ext = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
-
-override_repo(
-    rules_rust_ext,
-    rules_rust = "rules_rust",
 )
 
 crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")

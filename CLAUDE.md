@@ -62,6 +62,8 @@ docker inspect --format='{{index .RepoDigests 0}}' \
 bazel run //tools/rbe/k8s:nativelink.apply --config=local
 ```
 
+After editing `tools/rbe/k8s/configs/worker-specs/worker-specs.json` or `configs/default-pod-spec-template/pod-spec.yaml`, the apply updates the ConfigMap but does not restart the worker-provisioner — `kubectl -n mlrc-gradle-cache rollout restart deployment/worker-provisioner` to pick up the new spec.
+
 ## Updating from Upstream
 
 ```bash

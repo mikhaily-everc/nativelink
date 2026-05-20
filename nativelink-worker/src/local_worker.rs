@@ -181,16 +181,45 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // Skip the first interval as it happens immediately and we don't need a keep alive until timeout/2 has passed
         interval.tick().await;
 
-        // Explicitly spawn the keep alive loop so it goes onto a different thread from the execute commands
+        // Explicitly spawn the keep alive loop so it goes onto a different thread from the execute commands.
+        //
+        // The loop never exits on a single KeepAlive failure. A transient gRPC error
+        // (HTTP/2 blip, brief NLB reset, etc.) used to `return` here and kill the
+        // task forever — the worker process kept running but stopped heartbeating,
+        // so the scheduler declared the worker dead after `worker_timeout_s`, re-queued
+        // its action via `UpdateWithDisconnect` (which does NOT increment `attempts`),
+        // and the cycle repeated on a fresh worker. Net effect: real action failures
+        // never reached the client; builds saw `UNAVAILABLE: io exception` after the
+        // outer NLB connection finally reset. Tonic's `Channel` auto-reconnects on
+        // transient HTTP/2 failures, so retrying on the next interval tick is the
+        // right behavior.
         drop(
             spawn!("keep alives", async move {
+                let mut consecutive_failures: u64 = 0;
                 loop {
                     interval.tick().await;
-                    if let Err(e) = grpc_client.keep_alive(KeepAliveRequest {}).await {
-                        error!(?e, "Failed to send KeepAlive in LocalWorker");
-                        return;
+                    match grpc_client.keep_alive(KeepAliveRequest {}).await {
+                        Ok(_) => {
+                            if consecutive_failures > 0 {
+                                info!(consecutive_failures, "KeepAlive recovered");
+                            }
+                            consecutive_failures = 0;
+                            debug!("Sent KeepAlive");
+                        }
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            // Power-of-two gating: log at 1, 2, 4, 8, 16, ... so a
+                            // single blip is visible but a sustained outage doesn't
+                            // flood logs at the 2.5s interval cadence.
+                            if consecutive_failures.is_power_of_two() {
+                                warn!(
+                                    ?e,
+                                    consecutive_failures,
+                                    "Failed to send KeepAlive in LocalWorker; will retry on next interval",
+                                );
+                            }
+                        }
                     }
-                    debug!("Sent KeepAlive");
                 }
             })
             .await,
@@ -434,7 +463,19 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
                                 futures.push(
                                     spawn!("worker_start_action", start_action_fut).map(move |res| {
-                                        let res = res.err_tip(|| "Failed to launch spawn")?;
+                                        let res = match res {
+                                            Ok(action_res) => action_res,
+                                            Err(join_err) => {
+                                                error!(
+                                                    ?join_err,
+                                                    "worker_start_action task panicked or was cancelled; publishing InternalError",
+                                                );
+                                                Err(make_err!(
+                                                    Code::Internal,
+                                                    "worker_start_action panicked or was cancelled: {join_err}"
+                                                ))
+                                            }
+                                        };
                                         if let Err(err) = &res {
                                             error!(?err, "Error executing action");
                                         }
@@ -576,6 +617,8 @@ pub async fn new_local_worker(
     let directory_cache = if let Some(cache_config) = &config.directory_cache {
         use std::path::PathBuf;
 
+        use nativelink_store::filesystem_store::FilesystemStore;
+
         use crate::directory_cache::{
             DirectoryCache, DirectoryCacheConfig as WorkerDirCacheConfig,
         };
@@ -590,12 +633,30 @@ pub async fn new_local_worker(
         };
 
         let worker_cache_config = WorkerDirCacheConfig {
-            max_entries: cache_config.max_entries,
             max_size_bytes: cache_config.max_size_bytes,
             cache_root,
         };
 
-        match DirectoryCache::new(worker_cache_config, Store::new(fast_slow_store.clone())).await {
+        // The cache hardlinks from the filesystem-store fast tier of
+        // `fast_slow_store`. Mirrors the downcast in
+        // `RunningActionsManagerImpl::new_with_callbacks` so both consumers
+        // see the same FilesystemStore Arc.
+        let filesystem_store_for_cache = fast_slow_store
+            .fast_store()
+            .downcast_ref::<FilesystemStore>(None)
+            .err_tip(|| {
+                "Expected FastSlowStore.fast_store to be a FilesystemStore when directory_cache is enabled"
+            })?
+            .get_arc()
+            .err_tip(|| "FilesystemStore's internal Arc was lost")?;
+
+        match DirectoryCache::new(
+            worker_cache_config,
+            fast_slow_store.clone(),
+            filesystem_store_for_cache,
+        )
+        .await
+        {
             Ok(cache) => {
                 tracing::info!("Directory cache initialized successfully");
                 Some(Arc::new(cache))

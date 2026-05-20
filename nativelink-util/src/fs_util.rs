@@ -16,6 +16,8 @@ use core::future::Future;
 use core::pin::Pin;
 use std::path::Path;
 
+use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, TryStreamExt};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err};
 use tokio::fs;
 
@@ -37,7 +39,7 @@ use tokio::fs;
 ///
 /// # Errors
 /// - Source directory doesn't exist
-/// - Destination already exists
+/// - Destination exists and is non-empty
 /// - Cross-filesystem hardlinking attempted
 /// - Filesystem doesn't support hardlinks
 /// - Permission denied
@@ -48,13 +50,42 @@ pub async fn hardlink_directory_tree(src_dir: &Path, dst_dir: &Path) -> Result<(
         src_dir.display()
     );
 
-    error_if!(
-        dst_dir.exists(),
-        "Destination directory already exists: {}",
-        dst_dir.display()
-    );
+    // Accept either a non-existent destination or an existing empty one.
+    // Reject only a non-empty destination — that preserves the original
+    // intent of the guard (no silent merge over pre-existing content) while
+    // allowing callers (e.g. RunningActionImpl) to pre-create the work dir
+    // before staging inputs into it.
+    match fs::read_dir(dst_dir).await {
+        Ok(mut entries) => {
+            if entries
+                .next_entry()
+                .await
+                .err_tip(|| {
+                    format!(
+                        "Failed to inspect destination directory: {}",
+                        dst_dir.display(),
+                    )
+                })?
+                .is_some()
+            {
+                return Err(make_err!(
+                    Code::AlreadyExists,
+                    "Destination directory is not empty: {}",
+                    dst_dir.display(),
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(make_err!(
+                Code::Internal,
+                "Failed to read destination directory {}: {e}",
+                dst_dir.display(),
+            ));
+        }
+    }
 
-    // Create the root destination directory
+    // Create the root destination directory (idempotent if it already exists empty)
     fs::create_dir_all(dst_dir).await.err_tip(|| {
         format!(
             "Failed to create destination directory: {}",
@@ -66,15 +97,22 @@ pub async fn hardlink_directory_tree(src_dir: &Path, dst_dir: &Path) -> Result<(
     hardlink_directory_tree_recursive(src_dir, dst_dir).await
 }
 
-/// Internal recursive function to hardlink directory contents
+/// Internal recursive function to hardlink directory contents. Each
+/// per-entry op (file hardlink, subdir recurse, symlink) runs concurrently
+/// via `FuturesUnordered`, matching the style of `download_to_directory` in
+/// `nativelink-worker/src/running_actions_manager.rs`. No concurrency cap —
+/// the codebase norm for input-staging fan-out.
 fn hardlink_directory_tree_recursive<'a>(
     src: &'a Path,
     dst: &'a Path,
-) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+) -> BoxFuture<'a, Result<(), Error>> {
     Box::pin(async move {
         let mut entries = fs::read_dir(src)
             .await
             .err_tip(|| format!("Failed to read directory: {}", src.display()))?;
+
+        let futures: FuturesUnordered<BoxFuture<'_, Result<(), Error>>> =
+            FuturesUnordered::new();
 
         while let Some(entry) = entries
             .next_entry()
@@ -89,7 +127,6 @@ fn hardlink_directory_tree_recursive<'a>(
                     os_str
                 )
             })?;
-
             let dst_path = dst.join(&file_name);
             let metadata = entry
                 .metadata()
@@ -97,49 +134,55 @@ fn hardlink_directory_tree_recursive<'a>(
                 .err_tip(|| format!("Failed to get metadata for: {}", entry_path.display()))?;
 
             if metadata.is_dir() {
-                // Create subdirectory and recurse
-                fs::create_dir(&dst_path)
-                    .await
-                    .err_tip(|| format!("Failed to create directory: {}", dst_path.display()))?;
-
-                hardlink_directory_tree_recursive(&entry_path, &dst_path).await?;
+                futures.push(Box::pin(async move {
+                    fs::create_dir(&dst_path).await.err_tip(|| {
+                        format!("Failed to create directory: {}", dst_path.display())
+                    })?;
+                    hardlink_directory_tree_recursive(&entry_path, &dst_path).await
+                }));
             } else if metadata.is_file() {
-                // Hardlink the file
-                fs::hard_link(&entry_path, &dst_path)
-                    .await
-                    .err_tip(|| {
+                futures.push(Box::pin(async move {
+                    fs::hard_link(&entry_path, &dst_path).await.err_tip(|| {
                         format!(
                             "Failed to hardlink {} to {}. This may occur if the source and destination are on different filesystems",
                             entry_path.display(),
                             dst_path.display()
                         )
-                    })?;
+                    })
+                }));
             } else if metadata.is_symlink() {
-                // Read the symlink target and create a new symlink
-                let target = fs::read_link(&entry_path)
-                    .await
-                    .err_tip(|| format!("Failed to read symlink: {}", entry_path.display()))?;
-
-                #[cfg(unix)]
-                fs::symlink(&target, &dst_path)
-                    .await
-                    .err_tip(|| format!("Failed to create symlink: {}", dst_path.display()))?;
-
-                #[cfg(windows)]
-                {
-                    if target.is_dir() {
-                        fs::symlink_dir(&target, &dst_path).await.err_tip(|| {
-                            format!("Failed to create directory symlink: {}", dst_path.display())
-                        })?;
-                    } else {
-                        fs::symlink_file(&target, &dst_path).await.err_tip(|| {
-                            format!("Failed to create file symlink: {}", dst_path.display())
-                        })?;
+                futures.push(Box::pin(async move {
+                    let target = fs::read_link(&entry_path).await.err_tip(|| {
+                        format!("Failed to read symlink: {}", entry_path.display())
+                    })?;
+                    #[cfg(unix)]
+                    fs::symlink(&target, &dst_path).await.err_tip(|| {
+                        format!("Failed to create symlink: {}", dst_path.display())
+                    })?;
+                    #[cfg(windows)]
+                    {
+                        if target.is_dir() {
+                            fs::symlink_dir(&target, &dst_path).await.err_tip(|| {
+                                format!(
+                                    "Failed to create directory symlink: {}",
+                                    dst_path.display()
+                                )
+                            })?;
+                        } else {
+                            fs::symlink_file(&target, &dst_path).await.err_tip(|| {
+                                format!(
+                                    "Failed to create file symlink: {}",
+                                    dst_path.display()
+                                )
+                            })?;
+                        }
                     }
-                }
+                    Ok(())
+                }));
             }
         }
 
+        futures.try_collect::<Vec<()>>().await?;
         Ok(())
     })
 }
@@ -376,14 +419,33 @@ mod tests {
     }
 
     #[nativelink_test("crate")]
-    async fn test_hardlink_existing_destination() -> Result<(), Error> {
+    async fn test_hardlink_empty_destination_succeeds() -> Result<(), Error> {
         let (temp_dir, src_dir) = create_test_directory().await?;
         let dst_dir = temp_dir.path().join("existing");
 
         fs::create_dir(&dst_dir).await?;
 
-        let result = hardlink_directory_tree(&src_dir, &dst_dir).await;
-        assert!(result.is_err());
+        hardlink_directory_tree(&src_dir, &dst_dir).await?;
+
+        // Verify the tree was actually staged into the pre-existing empty dir.
+        let content = fs::read(dst_dir.join("file1.txt")).await?;
+        assert_eq!(content, b"Hello, World!");
+
+        Ok(())
+    }
+
+    #[nativelink_test("crate")]
+    async fn test_hardlink_non_empty_destination_errors() -> Result<(), Error> {
+        let (temp_dir, src_dir) = create_test_directory().await?;
+        let dst_dir = temp_dir.path().join("existing");
+
+        fs::create_dir(&dst_dir).await?;
+        fs::write(dst_dir.join("sentinel.txt"), b"pre-existing").await?;
+
+        let err = hardlink_directory_tree(&src_dir, &dst_dir)
+            .await
+            .expect_err("non-empty destination must error");
+        assert_eq!(err.code, Code::AlreadyExists);
 
         Ok(())
     }

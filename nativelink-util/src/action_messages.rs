@@ -709,6 +709,11 @@ pub struct ActionResult {
     pub exit_code: i32,
     pub stdout_digest: DigestInfo,
     pub stderr_digest: DigestInfo,
+    // Inline fallback for stdout/stderr when CAS upload fails on a failed action.
+    // Lets the action result still reach the client with the real error message
+    // instead of being lost to RST_STREAM. Empty when the upload succeeded.
+    pub stdout_raw: Bytes,
+    pub stderr_raw: Bytes,
     pub execution_metadata: ExecutionMetadata,
     pub server_logs: HashMap<String, DigestInfo>,
     pub error: Option<Error>,
@@ -725,6 +730,8 @@ impl Default for ActionResult {
             exit_code: INTERNAL_ERROR_EXIT_CODE,
             stdout_digest: DigestInfo::new([0u8; 32], 0),
             stderr_digest: DigestInfo::new([0u8; 32], 0),
+            stdout_raw: Bytes::new(),
+            stderr_raw: Bytes::new(),
             execution_metadata: ExecutionMetadata {
                 worker: String::new(),
                 queued_timestamp: SystemTime::UNIX_EPOCH,
@@ -933,9 +940,9 @@ impl TryFrom<ActionResult> for ProtoActionResult {
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
             exit_code: val.exit_code,
-            stdout_raw: Bytes::default(),
+            stdout_raw: val.stdout_raw,
             stdout_digest: Some(val.stdout_digest.into()),
-            stderr_raw: Bytes::default(),
+            stderr_raw: val.stderr_raw,
             stderr_digest: Some(val.stderr_digest.into()),
             execution_metadata: Some(val.execution_metadata.into()),
         })
@@ -998,6 +1005,8 @@ impl TryFrom<ProtoActionResult> for ActionResult {
                 .stderr_digest
                 .err_tip(|| "Expected stderr_digest to be set on ExecuteResponse msg")?
                 .try_into()?,
+            stdout_raw: val.stdout_raw,
+            stderr_raw: val.stderr_raw,
             execution_metadata: val
                 .execution_metadata
                 .err_tip(|| "Expected execution_metadata to be set on ExecuteResponse msg")?
@@ -1039,6 +1048,8 @@ impl TryFrom<ExecuteResponse> for ActionStage {
                 .stderr_digest
                 .err_tip(|| "Expected stderr_digest to be set on ExecuteResponse msg")?
                 .try_into()?,
+            stdout_raw: proto_action_result.stdout_raw,
+            stderr_raw: proto_action_result.stderr_raw,
             execution_metadata: proto_action_result
                 .execution_metadata
                 .err_tip(|| "Expected execution_metadata to be set on ExecuteResponse msg")?

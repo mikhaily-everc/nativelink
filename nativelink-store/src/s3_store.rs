@@ -121,6 +121,22 @@ where
                 .timeout_config(
                     aws_config::timeout::TimeoutConfig::builder()
                         .connect_timeout(Duration::from_secs(15))
+                        // Per-attempt timeout — bounds a single S3 request (incl.
+                        // identity resolution + network). Without this, a stalled
+                        // request (e.g. IRSA token refresh hanging, dead keep-alive
+                        // socket the SDK is still holding open) can pend forever
+                        // and cause callers (CAS `find_missing_blobs`, worker
+                        // `cas_store.has()`) to hang indefinitely. 60s gives the
+                        // body enough time to drain so mid-stream cancellation
+                        // doesn't tear down the upstream buf_channel and starve
+                        // the outer Retrier (see s3_store.rs::update).
+                        .operation_attempt_timeout(Duration::from_secs(60))
+                        // Total operation timeout — bounds the full retry chain.
+                        // Sized for 5 attempts * 60s = 300s with backoff headroom.
+                        .operation_timeout(Duration::from_secs(360))
+                        // Default identity resolution is 5s which is too aggressive
+                        // for IRSA token refresh under burst load.
+                        .read_timeout(Duration::from_secs(60))
                         .build(),
                 )
                 .region(Region::new(Cow::Owned(spec.region.clone())))

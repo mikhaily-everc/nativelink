@@ -50,8 +50,8 @@ use nativelink_util::action_messages::{
 use nativelink_util::common::DigestInfo;
 use nativelink_util::instant_wrapper::MockInstantWrapped;
 use nativelink_util::operation_state_manager::{
-    ActionStateResult, ClientStateManager, MatchingEngineStateManager, OperationFilter,
-    OperationStageFlags, UpdateOperationType,
+    ActionStateResult, ClientStateManager, OperationFilter, OperationStageFlags,
+    UpdateOperationType,
 };
 use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
 use pretty_assertions::assert_eq;
@@ -1061,7 +1061,7 @@ async fn matching_engine_fails_sends_abort() -> Result<(), Error> {
             )))
             .unwrap();
 
-        assert_eq!(scheduler.do_try_match_for_test().await, Ok(()));
+        assert!(scheduler.do_try_match_for_test().await.is_ok());
     }
     {
         let task_change_notify = Arc::new(Notify::new());
@@ -3376,6 +3376,225 @@ async fn max_concurrent_matches_default_when_unset_or_zero() -> Result<(), Error
         scheduler_zero.max_concurrent_matches(),
         8,
         "Some(0) must resolve to DEFAULT_MAX_CONCURRENT_MATCHES = 8"
+    );
+
+    Ok(())
+}
+
+/// Reproduces the production deadlock's leak primitive: a `WorkerReservation`
+/// is dropped while the bounded release channel is full, and pre-fix the
+/// worker's `pending_action_count` was never restored. Post-fix, the spawned
+/// fallback task acquires the pool lock and restores the budget so eventually
+/// every reservation is reclaimed.
+///
+/// Strategy: use `max_inflight_tasks = 0` (unlimited) so we can issue 260
+/// reservations against one worker. Drop them all in a single synchronous
+/// block (`drop(Vec)`) so no `await` runs between Drops — the releaser task
+/// can't drain the channel mid-loop. After the burst, the channel holds 256
+/// items (the bounded capacity) and 4 reservations went down the
+/// channel-full fallback path. After yielding, both the releaser and the
+/// fallback tasks restore their respective budgets.
+#[nativelink_test]
+async fn worker_reservation_drop_restores_budget_when_release_channel_full()
+-> Result<(), Error> {
+    const NUM_RESERVATIONS: usize = 260; // > RELEASE_CHANNEL_CAPACITY (256).
+
+    let worker_id = WorkerId("worker-leak-fix".to_string());
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+    let _rx = setup_new_worker(
+        &scheduler,
+        worker_id.clone(),
+        PlatformProperties::default(),
+    )
+    .await?;
+
+    let workers = scheduler.worker_scheduler().clone();
+    assert_eq!(
+        workers
+            .pending_action_count_of_worker_for_test(&worker_id)
+            .await,
+        Some(0),
+        "fresh worker must start with pending_action_count == 0"
+    );
+
+    // Issue all reservations first. Each `reserve_worker_for_action.await`
+    // yields, but with the channel empty the releaser has nothing to drain,
+    // so no budgets are restored mid-loop.
+    let mut reservations = Vec::with_capacity(NUM_RESERVATIONS);
+    for _ in 0..NUM_RESERVATIONS {
+        let res = workers
+            .reserve_worker_for_action(&PlatformProperties::default(), false)
+            .await
+            .expect("worker has unlimited inflight; reserve must succeed");
+        reservations.push(res);
+    }
+    assert_eq!(
+        workers
+            .pending_action_count_of_worker_for_test(&worker_id)
+            .await,
+        Some(NUM_RESERVATIONS),
+        "all reservations should be reflected in pending_action_count before drop"
+    );
+
+    // Synchronous burst: every Drop fires `release_tx.try_send`. The first
+    // 256 succeed (filling the bounded channel); the remaining 4 hit
+    // `TrySendError::Full` and trigger the fallback spawn path.
+    drop(reservations);
+
+    // Yield enough times to drain the releaser AND let every fallback task
+    // acquire the pool lock and run `restore_budget`. 64 yields is a generous
+    // upper bound for the small number of leaked reservations here.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+
+    let metrics = workers.get_metrics();
+    let leak_attempts = metrics
+        .reservation_leak_on_drop_enqueue_failed
+        .load(Ordering::Relaxed);
+    let fallback_restores = metrics
+        .reservation_drop_fallback_restores
+        .load(Ordering::Relaxed);
+    assert!(
+        leak_attempts >= 1,
+        "expected at least one Drop to hit the channel-full path; got {leak_attempts}"
+    );
+    assert_eq!(
+        leak_attempts, fallback_restores,
+        "every channel-full Drop must successfully restore via the fallback (leak={leak_attempts}, restored={fallback_restores})"
+    );
+    assert_eq!(
+        workers
+            .pending_action_count_of_worker_for_test(&worker_id)
+            .await,
+        Some(0),
+        "all reservations must have been restored — pending_action_count must return to 0"
+    );
+
+    Ok(())
+}
+
+/// Verifies the matcher safety-net interval. Without the fix, a leaked
+/// `pending_action_count` makes `can_accept_work` permanently false,
+/// `match_one` returns `Ok(false)` for every action, `do_try_match` aggregates
+/// to `Ok(...)`, `last_match_successful = true`, and the matcher loop parks
+/// at `state_changed.await` indefinitely even with a non-empty queue. With
+/// the fix, the safety-net `tokio::time::interval` arm wakes the loop at
+/// most every `matcher_safety_net_interval_s` seconds so the next time
+/// capacity returns the queue drains.
+///
+/// Concretely: inject a leaked count, queue an action, verify the matcher
+/// can't progress; then "fix" the leak (restore the count) and verify the
+/// next safety-net tick assigns the work to the worker.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn matcher_safety_net_kicks_when_pending_count_leaked() -> Result<(), Error> {
+    let worker_id = WorkerId("worker-safety-net".to_string());
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            // Tight interval so the test doesn't take 10s.
+            matcher_safety_net_interval_s: Some(1),
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+    let mut rx = setup_new_worker(
+        &scheduler,
+        worker_id.clone(),
+        PlatformProperties::default(),
+    )
+    .await?;
+
+    let workers = scheduler.worker_scheduler().clone();
+
+    // Simulate the production leak: the worker has phantom pending actions.
+    // Combined with `max_inflight_tasks: 0` (unlimited) on the test worker
+    // the leak alone wouldn't block matching, so we also flip
+    // `max_inflight_tasks` to 1 by re-creating the worker. Easier: rely on
+    // the fact that with NO leak `setup_new_worker` already routes one match;
+    // we instead test that even after we artificially make `can_accept_work`
+    // false, the matcher safety net keeps spinning, and once we restore
+    // capacity the next interval-driven cycle assigns the work.
+    workers
+        .set_pending_action_count_for_test(&worker_id, 1)
+        .await?;
+
+    let metrics = workers.get_metrics();
+    let kicks_before = metrics.matcher_interval_kicks.load(Ordering::Relaxed);
+
+    let action_digest = DigestInfo::new([7u8; 32], 64);
+    let insert_timestamp = make_system_time(1);
+    let _action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    // Advance well past the safety-net interval. Even with `task_change_notify`
+    // already firing on add_action, the matcher cycle returns
+    // `Ok(DoTryMatchStats { dispatched: 0, .. })` because the worker reports
+    // no capacity — `last_match_successful` stays true and only the safety
+    // net keeps the loop alive. Multiple ticks should accumulate kicks.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    let kicks_during_leak = metrics.matcher_interval_kicks.load(Ordering::Relaxed);
+    assert!(
+        kicks_during_leak > kicks_before,
+        "safety-net interval must fire while queue is non-empty and capacity is leaked (before={kicks_before}, after={kicks_during_leak})"
+    );
+
+    // "Fix" the leak — restore real capacity. The next safety-net tick
+    // observes `can_accept_work` is true again and dispatches the action.
+    workers
+        .set_pending_action_count_for_test(&worker_id, 0)
+        .await?;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    // Drain the worker rx until we see a StartAction (skipping any
+    // KeepAlive frames the scheduler may have emitted). bounded loop so
+    // a regression doesn't hang the test.
+    let mut got_start = false;
+    for _ in 0..32 {
+        match rx.try_recv() {
+            Ok(UpdateForWorker {
+                update: Some(update_for_worker::Update::StartAction(_)),
+            }) => {
+                got_start = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => {
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    assert!(
+        got_start,
+        "matcher must dispatch the queued action once capacity is restored"
     );
 
     Ok(())

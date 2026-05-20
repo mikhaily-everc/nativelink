@@ -318,9 +318,17 @@ impl Worker {
         self.pending_action_count
     }
 
-    #[cfg(test)]
     pub fn pending_action_count_for_test(&self) -> usize {
         self.pending_action_count
+    }
+
+    /// Force-sets `pending_action_count`. Tests use this to simulate the
+    /// production leak (channel-saturated Drops that pre-fix never decremented
+    /// the counter) so the matcher safety net can be exercised against a
+    /// stuck `can_accept_work() == false` state without needing 256 real
+    /// reservation churns.
+    pub fn set_pending_action_count_for_test(&mut self, count: usize) {
+        self.pending_action_count = count;
     }
 
     pub(crate) fn execution_complete(&mut self, operation_id: &OperationId) {

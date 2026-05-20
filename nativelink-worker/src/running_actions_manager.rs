@@ -128,6 +128,13 @@ pub fn download_to_directory<'a>(
     current_directory: &'a str,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
+        // Ensure the destination exists. Idempotent — every existing caller
+        // either already created it (action setup, tests) or just created it
+        // for recursion. Owning the dir-create here removes the implicit
+        // ordering contract between this function and its callers.
+        fs::create_dir_all(current_directory)
+            .await
+            .err_tip(|| format!("Failed to create work directory {current_directory}"))?;
         let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
             .await
             .err_tip(|| "Converting digest to Directory")?;
@@ -278,6 +285,7 @@ pub async fn prepare_action_inputs(
     filesystem_store: Pin<&FilesystemStore>,
     digest: &DigestInfo,
     work_directory: &str,
+    metrics: &Metrics,
 ) -> Result<(), Error> {
     // Try cache first if available
     if let Some(cache) = directory_cache {
@@ -298,11 +306,10 @@ pub async fn prepare_action_inputs(
                     ?e,
                     "Directory cache failed, falling back to traditional download"
                 );
-                // Ensure work directory exists for traditional path
-                fs::create_dir_all(Path::new(work_directory))
-                    .await
-                    .err_tip(|| format!("Error creating work directory {work_directory}"))?;
-                // Fall through to traditional path
+                metrics.directory_cache_fallback.inc();
+                // Fall through to traditional path. `download_to_directory`
+                // creates the work directory itself, so no setup is needed
+                // even if the cache partially populated state before failing.
             }
         }
     }
@@ -508,6 +515,11 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
     digest_uploaders: Arc<Mutex<HashMap<DigestInfo, DigestUploader>>>,
 ) -> BoxFuture<'a, Result<(Directory, VecDeque<ProtoDirectory>), Error>> {
     Box::pin(async move {
+        let upload_dir_start = std::time::Instant::now();
+        trace!(
+            full_dir_path = ?full_dir_path,
+            "upload_directory: entry"
+        );
         let file_futures = FuturesUnordered::new();
         let dir_futures = FuturesUnordered::new();
         let symlink_futures = FuturesUnordered::new();
@@ -588,12 +600,30 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
             }
         }
 
+        let file_count = file_futures.len();
+        let dir_count = dir_futures.len();
+        let symlink_count = symlink_futures.len();
+        trace!(
+            full_dir_path = ?full_dir_path,
+            file_count,
+            dir_count,
+            symlink_count,
+            scan_elapsed_ms = upload_dir_start.elapsed().as_millis(),
+            "upload_directory: starting try_join3"
+        );
+        let join_start = std::time::Instant::now();
         let (mut file_nodes, dir_entries, mut symlinks) = try_join3(
             file_futures.try_collect::<Vec<FileNode>>(),
             dir_futures.try_collect::<Vec<(DirectoryNode, VecDeque<Directory>)>>(),
             symlink_futures.try_collect::<Vec<SymlinkNode>>(),
         )
         .await?;
+        trace!(
+            full_dir_path = ?full_dir_path,
+            join_elapsed_ms = join_start.elapsed().as_millis(),
+            total_elapsed_ms = upload_dir_start.elapsed().as_millis(),
+            "upload_directory: try_join3 completed"
+        );
 
         let mut directory_nodes = Vec::with_capacity(dir_entries.len());
         // For efficiency we use a deque because it allows cheap concat of Vecs.
@@ -829,14 +859,9 @@ impl RunningActionImpl {
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
             let (command, ()) = try_join(command_fut, async {
-                // Only pre-create the work directory if directory cache is disabled.
-                // When directory cache is enabled, it creates the directory via hardlink
-                // from the cache, which fails if the directory already exists.
-                if self.running_actions_manager.directory_cache.is_none() {
-                    fs::create_dir(&self.work_directory)
-                        .await
-                        .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
-                }
+                fs::create_dir(&self.work_directory)
+                    .await
+                    .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
                 // Now the work directory has been created, we have to clean up.
                 self.did_cleanup.store(false, Ordering::Release);
                 // Download the input files/folder and place them into the temp directory.
@@ -849,6 +874,7 @@ impl RunningActionImpl {
                         filesystem_store_pin,
                         &self.action_info.input_root_digest,
                         &self.work_directory,
+                        self.metrics(),
                     ))
                     .await
             })
@@ -1419,49 +1445,96 @@ impl RunningActionImpl {
         let mut output_file_symlinks = vec![];
 
         if execution_result.exit_code != 0 {
-            let stdout = core::str::from_utf8(&execution_result.stdout).unwrap_or("<no-utf8>");
-            let stderr = core::str::from_utf8(&execution_result.stderr).unwrap_or("<no-utf8>");
+            const LOG_PREVIEW_CAP: usize = 1000;
+            let stdout_preview = String::from_utf8_lossy(
+                &execution_result.stdout[..min(execution_result.stdout.len(), LOG_PREVIEW_CAP)],
+            );
+            let stderr_preview = String::from_utf8_lossy(
+                &execution_result.stderr[..min(execution_result.stderr.len(), LOG_PREVIEW_CAP)],
+            );
             error!(
                 exit_code = ?execution_result.exit_code,
-                stdout = ?stdout[..min(stdout.len(), 1000)],
-                stderr = ?stderr[..min(stderr.len(), 1000)],
+                stdout = %stdout_preview,
+                stderr = %stderr_preview,
                 "Command returned non-zero exit code",
             );
         }
 
-        let stdout_digest_fut = self.metrics().upload_stdout.wrap(async {
-            let start = std::time::Instant::now();
-            let data = execution_result.stdout;
-            let data_len = data.len();
-            let digest = compute_buf_digest(&data, &mut hasher.hasher());
-            cas_store
-                .update_oneshot(digest, data)
-                .await
-                .err_tip(|| "Uploading stdout")?;
-            debug!(
-                ?digest,
-                data_len,
-                elapsed_ms = start.elapsed().as_millis(),
-                "upload_results: stdout upload completed",
-            );
-            Result::<DigestInfo, Error>::Ok(digest)
+        // For a failed action, capture a truncated copy of stdout/stderr to use
+        // as an inline fallback if the CAS upload fails. Without this, a flaky
+        // CAS backend turns a real compile/test failure into RST_STREAM on the
+        // client, hiding the actual error message.
+        // Cap matches Bazel's default --remote_max_inline_size.
+        const INLINE_FALLBACK_CAP: usize = 16 * 1024;
+        let exit_code = execution_result.exit_code;
+        let stdout_bytes = execution_result.stdout;
+        let stderr_bytes = execution_result.stderr;
+        let (stdout_fallback, stderr_fallback) = if exit_code != 0 {
+            (
+                Bytes::copy_from_slice(&stdout_bytes[..stdout_bytes.len().min(INLINE_FALLBACK_CAP)]),
+                Bytes::copy_from_slice(&stderr_bytes[..stderr_bytes.len().min(INLINE_FALLBACK_CAP)]),
+            )
+        } else {
+            (Bytes::new(), Bytes::new())
+        };
+
+        let stdout_digest_fut = self.metrics().upload_stdout.wrap({
+            let stdout_fallback = stdout_fallback.clone();
+            async move {
+                let start = std::time::Instant::now();
+                let data = stdout_bytes;
+                let data_len = data.len();
+                let digest = compute_buf_digest(&data, &mut hasher.hasher());
+                match cas_store.update_oneshot(digest, data).await {
+                    Ok(()) => {
+                        debug!(
+                            ?digest,
+                            data_len,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "upload_results: stdout upload completed",
+                        );
+                        Result::<(DigestInfo, Bytes), Error>::Ok((digest, Bytes::new()))
+                    }
+                    Err(e) if !stdout_fallback.is_empty() => {
+                        warn!(
+                            ?e,
+                            fallback_len = stdout_fallback.len(),
+                            "upload_results: stdout upload failed, falling back to inline raw",
+                        );
+                        Ok((DigestInfo::new([0u8; 32], 0), stdout_fallback))
+                    }
+                    Err(e) => Err(e).err_tip(|| "Uploading stdout"),
+                }
+            }
         });
-        let stderr_digest_fut = self.metrics().upload_stderr.wrap(async {
-            let start = std::time::Instant::now();
-            let data = execution_result.stderr;
-            let data_len = data.len();
-            let digest = compute_buf_digest(&data, &mut hasher.hasher());
-            cas_store
-                .update_oneshot(digest, data)
-                .await
-                .err_tip(|| "Uploading  stderr")?;
-            debug!(
-                ?digest,
-                data_len,
-                elapsed_ms = start.elapsed().as_millis(),
-                "upload_results: stderr upload completed",
-            );
-            Result::<DigestInfo, Error>::Ok(digest)
+        let stderr_digest_fut = self.metrics().upload_stderr.wrap({
+            let stderr_fallback = stderr_fallback.clone();
+            async move {
+                let start = std::time::Instant::now();
+                let data = stderr_bytes;
+                let data_len = data.len();
+                let digest = compute_buf_digest(&data, &mut hasher.hasher());
+                match cas_store.update_oneshot(digest, data).await {
+                    Ok(()) => {
+                        debug!(
+                            ?digest,
+                            data_len,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "upload_results: stderr upload completed",
+                        );
+                        Result::<(DigestInfo, Bytes), Error>::Ok((digest, Bytes::new()))
+                    }
+                    Err(e) if !stderr_fallback.is_empty() => {
+                        warn!(
+                            ?e,
+                            fallback_len = stderr_fallback.len(),
+                            "upload_results: stderr upload failed, falling back to inline raw",
+                        );
+                        Ok((DigestInfo::new([0u8; 32], 0), stderr_fallback))
+                    }
+                    Err(e) => Err(e).err_tip(|| "Uploading stderr"),
+                }
+            }
         });
 
         debug!(
@@ -1493,8 +1566,8 @@ impl RunningActionImpl {
             success = upload_result.is_ok(),
             "upload_results: all uploads completed",
         );
-        let (stdout_digest, stderr_digest) = match upload_result {
-            Ok((stdout_digest, stderr_digest, ())) => (stdout_digest, stderr_digest),
+        let ((stdout_digest, stdout_raw), (stderr_digest, stderr_raw)) = match upload_result {
+            Ok((stdout, stderr, ())) => (stdout, stderr),
             Err(e) => return Err(e).err_tip(|| "Error while uploading results"),
         };
 
@@ -1515,9 +1588,11 @@ impl RunningActionImpl {
                 output_folders,
                 output_directory_symlinks,
                 output_file_symlinks,
-                exit_code: execution_result.exit_code,
+                exit_code,
                 stdout_digest,
                 stderr_digest,
+                stdout_raw,
+                stderr_raw,
                 execution_metadata,
                 server_logs: HashMap::default(), // TODO(palfrey) Not implemented.
                 error: state.error.clone(),
@@ -2504,4 +2579,17 @@ pub struct Metrics {
     upload_stderr: AsyncCounterWrapper,
     #[metric(help = "Total number of task timeouts.")]
     task_timeouts: CounterWithTime,
+    #[metric(
+        help = "Number of times the directory cache failed and fell back to download_to_directory."
+    )]
+    directory_cache_fallback: CounterWithTime,
+}
+
+impl Metrics {
+    /// Current value of the `directory_cache_fallback` counter. Exposed
+    /// for integration tests in `nativelink-worker/tests/` (separate crate
+    /// boundary makes the field itself inaccessible).
+    pub fn directory_cache_fallback_count(&self) -> u64 {
+        self.directory_cache_fallback.counter.load(Ordering::Acquire)
+    }
 }

@@ -892,11 +892,6 @@ pub struct LocalWorkerConfig {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct DirectoryCacheConfig {
-    /// Maximum number of cached directories.
-    /// Default: 1000
-    #[serde(default = "default_directory_cache_max_entries")]
-    pub max_entries: usize,
-
     /// Maximum total size in bytes for all cached directories (0 = unlimited).
     /// Default: 10737418240 (10 GB)
     #[serde(
@@ -910,10 +905,6 @@ pub struct DirectoryCacheConfig {
     /// Default: `{work_directory}/../directory_cache`
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub cache_root: String,
-}
-
-const fn default_directory_cache_max_entries() -> usize {
-    1000
 }
 
 const fn default_directory_cache_max_size_bytes() -> u64 {

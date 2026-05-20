@@ -146,7 +146,7 @@ pub struct SimpleSpec {
     /// prevent one rogue job from infinitely retrying and taking up a lot of
     /// resources when the task itself is the one causing the server to go
     /// into a bad state.
-    /// Default: 3
+    /// Default: 0 (no retries — the value is used verbatim)
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_job_retries: usize,
 
@@ -176,6 +176,20 @@ pub struct SimpleSpec {
     /// Default: 8
     #[serde(default)]
     pub max_concurrent_matches: Option<u32>,
+
+    /// Maximum interval (seconds) between matcher cycles, regardless of
+    /// whether `task_change_notify` or `worker_change_notify` fires. Acts as
+    /// a safety net: if a future regression silently kills a notify path or
+    /// per-worker budget accounting leaks (so `can_accept_work` is always
+    /// false and every cycle reports `Ok(())`), the matcher's
+    /// `state_changed.await` would otherwise park forever even with a
+    /// non-empty queue. This interval guarantees the matcher re-checks the
+    /// queue at least every N seconds. `None` or `Some(0)` falls back to the
+    /// built-in default (10 seconds).
+    ///
+    /// Default: 10
+    #[serde(default)]
+    pub matcher_safety_net_interval_s: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]

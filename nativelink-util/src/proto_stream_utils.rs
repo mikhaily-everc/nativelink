@@ -24,6 +24,7 @@ use nativelink_error::{Error, ResultExt, error_if, make_input_err};
 use nativelink_proto::google::bytestream::{ReadResponse, WriteRequest};
 use parking_lot::Mutex;
 use tonic::{Status, Streaming};
+use tracing::trace;
 
 use crate::resource_info::ResourceInfo;
 
@@ -305,12 +306,25 @@ where
         // If this is the first or second call after a failure and we have
         // cached messages, then use the cached write requests.
         let cached_message = local_state.resumed_message();
-        if cached_message.is_some() {
-            return Poll::Ready(cached_message);
+        if let Some(msg) = cached_message {
+            trace!(
+                path = "resumed",
+                instance_name = %local_state.instance_name,
+                write_offset = msg.write_offset,
+                data_len = msg.data.len(),
+                finish_write = msg.finish_write,
+                "WriteStateWrapper::poll_next yielding",
+            );
+            return Poll::Ready(Some(msg));
         }
         // Read a new write request from the downstream.
         let Poll::Ready(maybe_message) = Pin::new(&mut local_state.read_stream).poll_next(cx)
         else {
+            trace!(
+                path = "pending",
+                instance_name = %local_state.instance_name,
+                "WriteStateWrapper::poll_next pending on downstream",
+            );
             return Poll::Pending;
         };
         // Update the instance name in the write request and forward it on.
@@ -329,20 +343,46 @@ where
                         }
                         Err(err) => {
                             local_state.read_stream_error = Some(err);
+                            trace!(
+                                path = "resource_info_err",
+                                instance_name = %local_state.instance_name,
+                                "WriteStateWrapper::poll_next yielding None after resource_info error",
+                            );
                             return Poll::Ready(None);
                         }
                     }
                 }
+                trace!(
+                    path = "fresh",
+                    instance_name = %local_state.instance_name,
+                    write_offset = message.write_offset,
+                    data_len = message.data.len(),
+                    finish_write = message.finish_write,
+                    "WriteStateWrapper::poll_next yielding",
+                );
                 // Cache the last request in case there is an error to allow
                 // the upload to be resumed.
                 local_state.push_message(message.clone());
                 Some(message)
             }
             Some(Err(err)) => {
+                trace!(
+                    path = "read_stream_err",
+                    instance_name = %local_state.instance_name,
+                    ?err,
+                    "WriteStateWrapper::poll_next yielding None after read_stream error",
+                );
                 local_state.read_stream_error = Some(err);
                 None
             }
-            None => None,
+            None => {
+                trace!(
+                    path = "eof",
+                    instance_name = %local_state.instance_name,
+                    "WriteStateWrapper::poll_next yielding None (EOF)",
+                );
+                None
+            }
         };
         Poll::Ready(result)
     }

@@ -24,7 +24,7 @@ use nativelink_config::stores::Retry;
 use nativelink_error::{Code, Error, make_err};
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::{Channel, Endpoint, channel};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::background_spawn;
 use crate::retry::{self, Retrier, RetryResult};
@@ -265,7 +265,7 @@ impl ConnectionManagerWorker {
                 "Connection failed, reconnecting"
             );
         } else {
-            info!(
+            debug!(
                 ?connection_index,
                 endpoint = ?endpoint.uri(),
                 "Creating new connection"
@@ -313,7 +313,12 @@ impl ConnectionManagerWorker {
             .then_some(())
             .and_then(|()| self.available_channels.pop_front())
         {
-            debug!(reason, "ConnectionManager: request running");
+            debug!(
+                reason,
+                endpoint_index = channel.identifier.endpoint_index,
+                connection_index = channel.identifier.connection_index,
+                "ConnectionManager: request running",
+            );
             self.provide_channel(channel, tx);
         } else {
             debug!(
@@ -345,7 +350,12 @@ impl ConnectionManagerWorker {
         {
             if let Some(channel) = self.available_channels.pop_front() {
                 if let Some((reason, tx)) = self.waiting_connections.pop_front() {
-                    debug!(reason, "ConnectionManager: channel available, running");
+                    debug!(
+                        reason,
+                        endpoint_index = channel.identifier.endpoint_index,
+                        connection_index = channel.identifier.connection_index,
+                        "ConnectionManager: channel available, running",
+                    );
                     self.provide_channel(channel, tx);
                 } else {
                     // This should never happen, but better than an unwrap.

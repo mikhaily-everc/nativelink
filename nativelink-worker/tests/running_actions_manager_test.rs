@@ -68,6 +68,7 @@ mod tests {
     use nativelink_util::store_trait::{Store, StoreLike};
     #[cfg(target_os = "linux")]
     use nativelink_worker::namespace_utils;
+    use nativelink_worker::directory_cache::{DirectoryCache, DirectoryCacheConfig};
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
         RunningActionsManagerArgs, RunningActionsManagerImpl, download_to_directory,
@@ -4161,6 +4162,164 @@ exit 1
             .await?;
 
         assert_eq!(from_utf8(&out_content)?, "./my_sh");
+
+        Ok(())
+    }
+
+    /// Regression test for the directory-cache work-dir interaction.
+    ///
+    /// Wires a `DirectoryCache: Some(...)` into the manager and runs
+    /// `prepare_action` twice with the same `input_root_digest`. The first
+    /// call constructs a cache entry; the second must hit it. Neither call
+    /// should fall through to `download_to_directory`, which is what would
+    /// happen if the work-dir lifecycle were broken (the historical bug
+    /// before commit 6760a95b — `hardlink_directory_tree` refusing a
+    /// pre-existing destination).
+    #[nativelink_test]
+    async fn directory_cache_repopulates_on_repeated_runs()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "foo_worker_id";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, _, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let cache_root = PathBuf::from(make_temp_path("dir_cache_root"));
+        let directory_cache = Arc::new(
+            DirectoryCache::new(
+                DirectoryCacheConfig {
+                    max_size_bytes: 10 * 1024 * 1024,
+                    cache_root,
+                },
+                Store::new(cas_store.clone()),
+            )
+            .await?,
+        );
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config: &UploadActionResultConfig {
+                    upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: Some(directory_cache.clone()),
+                #[cfg(target_os = "linux")]
+                use_namespaces: use_namespaces(),
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Input root: one nested empty subdir. Enough to exercise the
+        // directory-cache hardlink path (proto fetch + subdir creation).
+        let inner_dir_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory {
+                directories: vec![DirectoryNode {
+                    name: "some_cwd".to_string(),
+                    digest: Some(inner_dir_digest.into()),
+                }],
+                ..Default::default()
+            },
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let command = Command {
+            arguments: vec!["touch".to_string(), "./some_cwd/marker".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        // Helper: stage inputs once.
+        let prepare_once = || async {
+            let operation_id = OperationId::default().to_string();
+            let execute_request = ExecuteRequest {
+                action_digest: Some(action_digest.into()),
+                ..Default::default()
+            };
+            let running_action = running_actions_manager
+                .create_and_add_action(
+                    WORKER_ID.to_string(),
+                    StartExecute {
+                        execute_request: Some(execute_request),
+                        operation_id,
+                        queued_timestamp: None,
+                        platform: action.platform.clone(),
+                        worker_id: WORKER_ID.to_string(),
+                    },
+                )
+                .await?;
+            let running_action = running_action.clone().prepare_action().await?;
+            running_action.cleanup().await?;
+            Ok::<(), Error>(())
+        };
+
+        // First run — cold cache. Cache must be populated.
+        prepare_once().await?;
+        let stats = directory_cache.stats().await;
+        assert!(
+            stats.entries >= 1,
+            "expected directory cache to be populated after first run, got {stats:?}"
+        );
+        let entries_after_first = stats.entries;
+
+        // Second run — warm cache. No new entries, no fallback.
+        prepare_once().await?;
+        let stats = directory_cache.stats().await;
+        assert_eq!(
+            stats.entries, entries_after_first,
+            "second run with identical input_root_digest must not grow the cache"
+        );
+
+        let fallback_count = running_actions_manager
+            .metrics()
+            .directory_cache_fallback_count();
+        assert_eq!(
+            fallback_count, 0,
+            "directory_cache_fallback must remain 0 — cache succeeded on both runs"
+        );
 
         Ok(())
     }

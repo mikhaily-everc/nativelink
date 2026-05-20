@@ -1229,6 +1229,20 @@ pub struct GrpcSpec {
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
     pub rpc_timeout_s: u64,
 
+    /// Maximum time (seconds) to wait for a connection from the connection
+    /// pool before returning a retryable error. When the pool is exhausted
+    /// (e.g. all channels busy with large concurrent uploads), small
+    /// follow-up requests that would otherwise stall up to `rpc_timeout_s`
+    /// instead bail out after this shorter budget so the outer Retrier can
+    /// re-enter and request a fresh channel.
+    ///
+    /// A value of 0 (the default) means pool-wait shares the
+    /// `rpc_timeout_s` budget, preserving the legacy behavior.
+    ///
+    /// Default: 0 (disabled — pool-wait shares rpc_timeout_s)
+    #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    pub pool_wait_timeout_s: u64,
+
     /// Use legacy `ByteStream` resource name format, omitting the digest
     /// function component from the path.
     ///

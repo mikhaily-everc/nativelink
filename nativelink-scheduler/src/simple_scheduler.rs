@@ -60,10 +60,6 @@ const DEFAULT_WORKER_TIMEOUT_S: u64 = 5;
 /// If this changes, remember to change the documentation in the config.
 const DEFAULT_CLIENT_ACTION_TIMEOUT_S: u64 = 60;
 
-/// Default times a job can retry before failing.
-/// If this changes, remember to change the documentation in the config.
-const DEFAULT_MAX_JOB_RETRIES: usize = 3;
-
 /// Default maximum number of reserve→commit matches driven concurrently
 /// by `do_try_match`. Chosen so the matcher's peak Redis connection usage
 /// (roughly one `assign_operation` round-trip per in-flight match) leaves
@@ -71,6 +67,28 @@ const DEFAULT_MAX_JOB_RETRIES: usize = 3;
 /// (`cas.json` `connection_pool_size: 20`). Override via
 /// `SimpleSpec::max_concurrent_matches`.
 const DEFAULT_MAX_CONCURRENT_MATCHES: usize = 8;
+
+/// Default upper bound on the time between matcher cycles when neither
+/// `task_change_notify` nor `worker_change_notify` fires. Acts as a safety
+/// net so that any future regression that silently drops notifications, or
+/// a per-worker budget leak that makes every worker report
+/// `!can_accept_work`, cannot park `do_try_match` indefinitely with a
+/// non-empty queue. Override via `SimpleSpec::matcher_safety_net_interval_s`.
+const DEFAULT_MATCHER_SAFETY_NET_INTERVAL_S: u64 = 10;
+
+/// Outcome of a single `do_try_match` cycle. Used by the matcher loop to
+/// distinguish "made progress" from "saw queued work but couldn't dispatch
+/// any of it" — the latter is a leak/starvation signal that bumps the
+/// `do_try_match_starved_cycles` counter.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DoTryMatchStats {
+    /// Number of queued ops the cycle observed when it started.
+    pub queued: usize,
+    /// Number of those ops that successfully completed `commit_reservation`
+    /// during this cycle. `match_one`'s benign no-progress paths (no worker
+    /// available, op aborted by state manager) do NOT count as dispatched.
+    pub dispatched: usize,
+}
 
 /// Per-cycle aggregation of time spent in each phase of `do_try_match`.
 /// Populated concurrently by in-flight `match_one` futures; read once at
@@ -233,7 +251,7 @@ impl SimpleScheduler {
             .err_tip(|| "In SimpleScheduler::get_queued_operations getting filter result")
     }
 
-    pub async fn do_try_match_for_test(&self) -> Result<(), Error> {
+    pub async fn do_try_match_for_test(&self) -> Result<DoTryMatchStats, Error> {
         self.do_try_match(true).await
     }
 
@@ -259,7 +277,7 @@ impl SimpleScheduler {
         self.max_concurrent_matches
     }
 
-    async fn do_try_match(&self, full_worker_logging: bool) -> Result<(), Error> {
+    async fn do_try_match(&self, full_worker_logging: bool) -> Result<DoTryMatchStats, Error> {
         let start = Instant::now();
 
         // Drain the queued-operations stream into an owned Vec before
@@ -301,6 +319,7 @@ impl SimpleScheduler {
         // here is safe wrt. worker capacity and budget.
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut result: Result<(), Error> = Ok(());
+        let mut dispatched: usize = 0;
         let phase_ms = Arc::new(CyclePhaseMs::default());
         let limit = self.max_concurrent_matches;
 
@@ -319,9 +338,17 @@ impl SimpleScheduler {
             ));
         }
 
-        // Drain + refill loop.
+        // Drain + refill loop. `match_one` returns Ok(true) only when the
+        // commit_reservation succeeded and an action was actually dispatched
+        // to a worker. The benign no-progress paths (no worker available,
+        // op aborted upstream) return Ok(false), and surface here so the
+        // matcher loop can detect "saw work but couldn't place it".
         while let Some(r) = in_flight.next().await {
-            result = result.merge(r);
+            match &r {
+                Ok(true) => dispatched += 1,
+                Ok(false) | Err(_) => {}
+            }
+            result = result.merge(r.map(|_| ()));
             if let Some(action) = actions.pop_front() {
                 in_flight.push(match_one(
                     action,
@@ -351,7 +378,10 @@ impl SimpleScheduler {
             );
         }
 
-        result
+        result.map(|()| DoTryMatchStats {
+            queued: queued_count,
+            dispatched,
+        })
     }
 }
 
@@ -366,6 +396,10 @@ impl SimpleScheduler {
 /// `UpdateWithError` handling) and therefore does NOT bump
 /// `awaited_action.attempts`. The worker's debited budget is refunded via
 /// `release_reservation`. See the plan's five-point rollback contract.
+/// Returns `Ok(true)` iff `commit_reservation` succeeded and the action was
+/// dispatched to a worker. The benign no-progress paths (no worker available,
+/// op aborted by the state manager) return `Ok(false)` so `do_try_match` can
+/// distinguish "made progress" from "saw work but couldn't place it".
 async fn match_one(
     action_state_result: Box<dyn ActionStateResult>,
     workers: Arc<ApiWorkerScheduler>,
@@ -373,7 +407,7 @@ async fn match_one(
     ppm: Arc<PlatformPropertyManager>,
     phase_ms: Arc<CyclePhaseMs>,
     full_worker_logging: bool,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let (action_info, maybe_origin_metadata) = action_state_result
         .as_action_info()
         .await
@@ -399,7 +433,7 @@ async fn match_one(
         Ordering::Relaxed,
     );
     let Some(reservation) = maybe_reservation else {
-        return Ok(());
+        return Ok(false);
     };
 
     let worker_id = reservation
@@ -442,7 +476,7 @@ async fn match_one(
                     Ordering::Relaxed,
                 );
                 match commit_result {
-                    Ok(()) => Ok(()),
+                    Ok(()) => Ok(true),
                     Err((Some(res), commit_err)) => {
                         // Commit failed BEFORE finalize_run mutated any
                         // worker state (generation fence or worker-gone).
@@ -483,7 +517,7 @@ async fn match_one(
                 // Op was cancelled or already assigned elsewhere; the state
                 // manager has already moved on. Release our reservation.
                 workers.release_reservation(reservation).await;
-                Ok(())
+                Ok(false)
             }
             Err(assign_err) => {
                 // Assign itself failed. State is unchanged or already
@@ -568,10 +602,7 @@ impl SimpleScheduler {
             );
         }
 
-        let mut max_job_retries = spec.max_job_retries;
-        if max_job_retries == 0 {
-            max_job_retries = DEFAULT_MAX_JOB_RETRIES;
-        }
+        let max_job_retries = spec.max_job_retries;
 
         let max_concurrent_matches = spec
             .max_concurrent_matches
@@ -581,6 +612,16 @@ impl SimpleScheduler {
         info!(
             max_concurrent_matches,
             "scheduler matcher concurrency resolved"
+        );
+
+        let safety_net_interval_s = spec
+            .matcher_safety_net_interval_s
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MATCHER_SAFETY_NET_INTERVAL_S);
+        let safety_net_interval = Duration::from_secs(safety_net_interval_s);
+        info!(
+            safety_net_interval_s,
+            "matcher safety-net interval resolved"
         );
 
         let worker_change_notify = Arc::new(Notify::new());
@@ -615,16 +656,38 @@ impl SimpleScheduler {
                 spawn!("simple_scheduler_task_worker_matching", async move {
                     let mut last_match_successful = true;
                     let mut worker_match_logging_last: Option<Instant> = None;
+                    // Safety-net interval: ensures the matcher re-runs at least
+                    // every `safety_net_interval` even if neither
+                    // `task_change_notify` nor `worker_change_notify` fires. Burn
+                    // the immediate-fire first tick so startup doesn't trigger a
+                    // bogus interval-driven cycle before any state exists.
+                    let mut safety_net_interval_timer =
+                        tokio::time::interval(safety_net_interval);
+                    safety_net_interval_timer.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Delay,
+                    );
+                    safety_net_interval_timer.tick().await;
                     // Break out of the loop only when the inner is dropped.
                     loop {
                         let task_change_fut = task_change_notify.notified();
                         let worker_change_fut = worker_change_notify.notified();
                         tokio::pin!(task_change_fut);
                         tokio::pin!(worker_change_fut);
-                        // Wait for either of these futures to be ready.
                         let state_changed = future::select(task_change_fut, worker_change_fut);
+                        // `interval_driven` flips true iff the safety-net
+                        // interval fired before either notify or the
+                        // last-match-failed backoff sleep. Used to bump the
+                        // `matcher_interval_kicks` metric and gate a one-line
+                        // diagnostic log on non-empty queues — confirms the
+                        // safety net is what woke us, not a notify.
+                        let mut interval_driven = false;
                         if last_match_successful {
-                            let _ = state_changed.await;
+                            tokio::select! {
+                                _ = state_changed => {}
+                                _ = safety_net_interval_timer.tick() => {
+                                    interval_driven = true;
+                                }
+                            }
                         } else {
                             // If the last match failed, then run again after a short sleep.
                             // This resolves issues where we tried to re-schedule a job to
@@ -632,7 +695,14 @@ impl SimpleScheduler {
                             // hard loop if there's something wrong inside do_try_match.
                             let sleep_fut = tokio::time::sleep(Duration::from_millis(100));
                             tokio::pin!(sleep_fut);
-                            let _ = future::select(state_changed, sleep_fut).await;
+                            let backoff_or_change =
+                                future::select(state_changed, sleep_fut);
+                            tokio::select! {
+                                _ = backoff_or_change => {}
+                                _ = safety_net_interval_timer.tick() => {
+                                    interval_driven = true;
+                                }
+                            }
                         }
 
                         let result = match weak_inner.upgrade() {
@@ -718,10 +788,43 @@ impl SimpleScheduler {
                             // down, so we need to resolve our future.
                             None => return,
                         };
-                        last_match_successful = result.is_ok();
-                        if let Err(err) = result {
-                            error!(?err, "Error while running do_try_match");
+                        // `result` is `Result<DoTryMatchStats, Error>`. We
+                        // examine the stats independently of error status
+                        // because either branch is informative for telemetry.
+                        let metrics = match weak_inner.upgrade() {
+                            Some(scheduler) => Some(Arc::clone(
+                                scheduler.worker_scheduler.get_metrics(),
+                            )),
+                            None => None,
+                        };
+                        match &result {
+                            Ok(stats) => {
+                                if interval_driven {
+                                    if let Some(m) = metrics.as_ref() {
+                                        m.matcher_interval_kicks
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    if stats.queued > 0 {
+                                        info!(
+                                            queued = stats.queued,
+                                            dispatched = stats.dispatched,
+                                            interval_s = safety_net_interval_s,
+                                            "matcher safety-net tick on non-empty queue"
+                                        );
+                                    }
+                                }
+                                if stats.queued > 0 && stats.dispatched == 0 {
+                                    if let Some(m) = metrics.as_ref() {
+                                        m.do_try_match_starved_cycles
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                error!(?err, "Error while running do_try_match");
+                            }
                         }
+                        last_match_successful = result.is_ok();
 
                         on_matching_engine_run().await;
                     }

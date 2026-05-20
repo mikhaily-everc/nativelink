@@ -86,6 +86,20 @@ pub struct SchedulerMetrics {
     /// Count of `inner` mutex acquisitions sampled on the match hot paths.
     /// Paired with `inner_lock_wait_ns` to derive average wait per acquire.
     pub inner_lock_wait_samples: AtomicU64,
+    /// `do_try_match` cycles where the queue had at least one queued op and
+    /// zero ops were dispatched. Persistent nonzero values are the smoking
+    /// gun for a worker-budget leak (every worker reports `!can_accept_work`).
+    pub do_try_match_starved_cycles: AtomicU64,
+    /// `do_try_match` cycles initiated by the safety-net interval rather than
+    /// by `task_change_notify` / `worker_change_notify`. Should stay near
+    /// zero in healthy operation; growth means the notify path is failing or
+    /// the queue is being drained slower than the safety-net cadence.
+    pub matcher_interval_kicks: AtomicU64,
+    /// Drop-time channel-saturation events that successfully restored worker
+    /// budget via the spawned fallback (rather than leaking like the legacy
+    /// behaviour). Counted alongside `reservation_leak_on_drop_enqueue_failed`
+    /// so the diff measures how much budget was reclaimed by the fallback.
+    pub reservation_drop_fallback_restores: AtomicU64,
 }
 
 /// Capacity of the bounded release channel. Sized for the worst-case burst
@@ -110,6 +124,13 @@ struct WorkerReservationInner {
     generation: WorkerGeneration,
     debits: Vec<(String, PlatformPropertyValue)>,
     release_tx: mpsc::Sender<WorkerReservationInner>,
+    /// Weak ref to the owning scheduler so the `Drop` fallback (used when
+    /// `release_tx` is saturated) can spawn an async task that takes the
+    /// pool lock and restores the worker's budget directly. Without this,
+    /// channel-full saturation leaks `pending_action_count` permanently
+    /// (until the worker is evicted), which over time pushes every worker's
+    /// `can_accept_work` to false and parks the matcher.
+    scheduler: Weak<ApiWorkerScheduler>,
 }
 
 /// Handle representing an exclusive claim on a worker's budget slot for a
@@ -165,13 +186,46 @@ impl Drop for WorkerReservation {
                 // `reservations_released` there.
             }
             Err(TrySendError::Full(dropped)) => {
-                error!(
-                    worker_id = %dropped.worker_id,
-                    "release channel saturated; worker budget will leak until worker eviction"
-                );
+                // Channel saturated. Rather than leak the budget (the legacy
+                // behaviour, which under sustained reservation churn pushed
+                // every worker's `pending_action_count` past `max_inflight`,
+                // making `can_accept_work` permanently false and parking the
+                // matcher), spawn a fallback task that takes the pool lock
+                // directly and restores the worker's budget. Same generation
+                // fence as the releaser task so a concurrently-replaced
+                // worker is not perturbed.
                 self.metrics
                     .reservation_leak_on_drop_enqueue_failed
                     .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    worker_id = %dropped.worker_id,
+                    "release channel saturated; restoring worker budget via fallback task"
+                );
+                let metrics = Arc::clone(&self.metrics);
+                let weak = dropped.scheduler.clone();
+                let worker_id = dropped.worker_id.clone();
+                let generation = dropped.generation;
+                let debits = dropped.debits;
+                tokio::spawn(async move {
+                    let Some(scheduler) = weak.upgrade() else {
+                        // Scheduler dropped between Drop and the spawn
+                        // running; pool is gone, nothing to restore.
+                        return;
+                    };
+                    let mut inner = scheduler.inner.lock().await;
+                    if let Some(worker) = inner.workers.get_mut(&worker_id)
+                        && worker.generation() == generation
+                    {
+                        worker.restore_budget(&debits);
+                    }
+                    drop(inner);
+                    metrics
+                        .reservation_drop_fallback_restores
+                        .fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .reservations_released
+                        .fetch_add(1, Ordering::Relaxed);
+                });
             }
             Err(TrySendError::Closed(_)) => {
                 // Scheduler shutting down; worker pool is being torn down too.
@@ -547,6 +601,14 @@ pub struct ApiWorkerScheduler {
     /// cancellation cleanup on the releaser task. Cloned into every
     /// reservation handle. Capacity is `RELEASE_CHANNEL_CAPACITY`.
     release_tx: mpsc::Sender<WorkerReservationInner>,
+
+    /// Self-referential weak handle, populated via `Arc::new_cyclic` in
+    /// `ApiWorkerScheduler::new`. Cloned into every issued `WorkerReservation`
+    /// so that the `Drop` fallback (channel-saturated path) can spawn an
+    /// async task that re-acquires the pool lock and restores worker
+    /// budget — closing the leak window that previously deadlocked the
+    /// matcher under reservation churn.
+    weak_self: Weak<ApiWorkerScheduler>,
 }
 
 impl ApiWorkerScheduler {
@@ -561,7 +623,7 @@ impl ApiWorkerScheduler {
         let (release_tx, release_rx) =
             mpsc::channel::<WorkerReservationInner>(RELEASE_CHANNEL_CAPACITY);
         let metrics = Arc::new(SchedulerMetrics::default());
-        let arc_self = Arc::new(Self {
+        let arc_self = Arc::new_cyclic(|weak_self| Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
                 worker_state_manager,
@@ -579,6 +641,7 @@ impl ApiWorkerScheduler {
             worker_registry,
             metrics: Arc::clone(&metrics),
             release_tx,
+            weak_self: weak_self.clone(),
         });
 
         // Releaser task: drains reservations that were Drop-enqueued by
@@ -681,6 +744,7 @@ impl ApiWorkerScheduler {
                 generation,
                 debits,
                 release_tx: self.release_tx.clone(),
+                scheduler: self.weak_self.clone(),
             }),
             metrics: Arc::clone(&self.metrics),
         })
@@ -955,6 +1019,36 @@ impl ApiWorkerScheduler {
             make_input_err!("WorkerId '{}' does not exist in workers map", worker_id)
         })?;
         worker.keep_alive()
+    }
+
+    /// Returns the worker's `pending_action_count` if the worker exists. Used
+    /// by tests verifying the Drop-fallback budget-restore path.
+    pub async fn pending_action_count_of_worker_for_test(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Option<usize> {
+        let inner = self.inner.lock().await;
+        inner
+            .workers
+            .peek(worker_id)
+            .map(Worker::pending_action_count_for_test)
+    }
+
+    /// Force-sets the worker's `pending_action_count`. Used by tests to
+    /// simulate the production leak that this fix closes — pre-fix, channel-
+    /// saturation Drops would leak `pending_action_count`, making
+    /// `can_accept_work` return `false` indefinitely.
+    pub async fn set_pending_action_count_for_test(
+        &self,
+        worker_id: &WorkerId,
+        count: usize,
+    ) -> Result<(), Error> {
+        let mut inner = self.inner.lock().await;
+        let worker = inner.workers.get_mut(worker_id).ok_or_else(|| {
+            make_input_err!("WorkerId '{}' does not exist in workers map", worker_id)
+        })?;
+        worker.set_pending_action_count_for_test(count);
+        Ok(())
     }
 }
 

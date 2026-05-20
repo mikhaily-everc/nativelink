@@ -116,6 +116,9 @@ pub struct GrpcStore {
     connection_manager: ConnectionManager,
     /// Per-RPC timeout. `Duration::ZERO` means disabled.
     rpc_timeout: Duration,
+    /// Pool-wait timeout. `Duration::ZERO` means disabled (pool-wait shares
+    /// `rpc_timeout`).
+    pool_wait_timeout: Duration,
     use_legacy_resource_names: bool,
     headers: Vec<(MetadataKey<Ascii>, MetadataValue<Ascii>)>,
     forward_headers: Vec<String>,
@@ -144,6 +147,7 @@ impl GrpcStore {
         }
 
         let rpc_timeout = Duration::from_secs(spec.rpc_timeout_s);
+        let pool_wait_timeout = Duration::from_secs(spec.pool_wait_timeout_s);
 
         let mut headers = Vec::with_capacity(spec.headers.len());
         for (name, value) in &spec.headers {
@@ -176,6 +180,7 @@ impl GrpcStore {
                 jitter_fn,
             ),
             rpc_timeout,
+            pool_wait_timeout,
             use_legacy_resource_names: spec.use_legacy_resource_names,
             headers,
             // We lowercase keys as HTTP headers are case-insensitive so we should match all cases
@@ -410,9 +415,11 @@ impl GrpcStore {
         let write_start = std::time::Instant::now();
         let instance_name = self.instance_name.clone();
         let rpc_timeout = self.rpc_timeout;
+        let pool_wait_timeout = self.pool_wait_timeout;
         trace!(
             instance_name = %instance_name,
             rpc_timeout_s = rpc_timeout.as_secs(),
+            pool_wait_timeout_s = pool_wait_timeout.as_secs(),
             "GrpcStore::write: starting ByteStream write",
         );
         let mut attempt: u32 = 0;
@@ -433,40 +440,95 @@ impl GrpcStore {
                         "GrpcStore::write: requesting connection from pool",
                     );
                     let conn_start = std::time::Instant::now();
-                    let rpc_fut = self.connection_manager.connection("write".into()).and_then(
-                        |channel| {
-                            let conn_elapsed = conn_start.elapsed();
-                            let instance_for_rpc = instance_name.clone();
-                            let conn_elapsed_ms =
-                                u64::try_from(conn_elapsed.as_millis()).unwrap_or(u64::MAX);
-                            trace!(
-                                instance_name = %instance_for_rpc,
-                                conn_elapsed_ms,
-                                "GrpcStore::write: got connection, starting ByteStream.Write RPC",
-                            );
-                            let rpc_start = std::time::Instant::now();
-                            let local_state_for_rpc = local_state.clone();
-                            async move {
-                                let res = ByteStreamClient::new(channel)
-                                    .write(enrich_request(
-                                        Request::new(WriteStateWrapper::new(local_state_for_rpc)),
-                                        &self.headers,
-                                        &self.forward_headers,
-                                    ))
-                                    .await
-                                    .err_tip(|| "in GrpcStore::write");
-                                let rpc_elapsed_ms = u64::try_from(rpc_start.elapsed().as_millis())
-                                    .unwrap_or(u64::MAX);
-                                trace!(
-                                    instance_name = %instance_for_rpc,
-                                    rpc_elapsed_ms,
-                                    success = res.is_ok(),
-                                    "GrpcStore::write: ByteStream.Write RPC returned",
+                    let conn_fut = self.connection_manager.connection("write".into());
+                    // Phase 1: acquire a channel from the pool, optionally
+                    // bounded by `pool_wait_timeout` so pool exhaustion
+                    // surfaces as a retryable error sooner than `rpc_timeout`.
+                    let channel = if pool_wait_timeout > Duration::ZERO {
+                        match tokio::time::timeout(pool_wait_timeout, conn_fut).await {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(err)) => {
+                                let mut local_state_locked = local_state.lock();
+                                if local_state_locked.can_resume() {
+                                    local_state_locked.resume();
+                                }
+                                drop(local_state_locked);
+                                warn!(
+                                    instance_name = %instance_name,
+                                    attempt,
+                                    ?err,
+                                    "GrpcStore::write: connection acquisition errored, retrying",
                                 );
-                                res
+                                return Some((RetryResult::Retry(err), local_state));
                             }
-                        },
+                            Err(_elapsed) => {
+                                let mut local_state_locked = local_state.lock();
+                                if local_state_locked.can_resume() {
+                                    local_state_locked.resume();
+                                }
+                                drop(local_state_locked);
+                                warn!(
+                                    instance_name = %instance_name,
+                                    attempt,
+                                    pool_wait_timeout_s = pool_wait_timeout.as_secs(),
+                                    "GrpcStore::write: pool-wait timeout exceeded, retrying with fresh attempt",
+                                );
+                                #[allow(unused_qualifications)]
+                                return Some((
+                                    RetryResult::Retry(nativelink_error::make_err!(
+                                        nativelink_error::Code::Unavailable,
+                                        "GrpcStore::write pool-wait timed out after {}s",
+                                        pool_wait_timeout.as_secs()
+                                    )),
+                                    local_state,
+                                ));
+                            }
+                        }
+                    } else {
+                        match conn_fut.await {
+                            Ok(c) => c,
+                            Err(err) => {
+                                let mut local_state_locked = local_state.lock();
+                                if local_state_locked.can_resume() {
+                                    local_state_locked.resume();
+                                }
+                                drop(local_state_locked);
+                                return Some((RetryResult::Retry(err), local_state));
+                            }
+                        }
+                    };
+                    let conn_elapsed_ms =
+                        u64::try_from(conn_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    trace!(
+                        instance_name = %instance_name,
+                        conn_elapsed_ms,
+                        "GrpcStore::write: got connection, starting ByteStream.Write RPC",
                     );
+
+                    // Phase 2: issue the ByteStream.Write RPC, bounded by
+                    // `rpc_timeout` independently of pool-wait above.
+                    let rpc_start = std::time::Instant::now();
+                    let local_state_for_rpc = local_state.clone();
+                    let instance_for_rpc = instance_name.clone();
+                    let rpc_fut = async move {
+                        let res = ByteStreamClient::new(channel)
+                            .write(enrich_request(
+                                Request::new(WriteStateWrapper::new(local_state_for_rpc)),
+                                &self.headers,
+                                &self.forward_headers,
+                            ))
+                            .await
+                            .err_tip(|| "in GrpcStore::write");
+                        let rpc_elapsed_ms = u64::try_from(rpc_start.elapsed().as_millis())
+                            .unwrap_or(u64::MAX);
+                        trace!(
+                            instance_name = %instance_for_rpc,
+                            rpc_elapsed_ms,
+                            success = res.is_ok(),
+                            "GrpcStore::write: ByteStream.Write RPC returned",
+                        );
+                        res
+                    };
 
                     let result = if rpc_timeout > Duration::ZERO {
                         match tokio::time::timeout(rpc_timeout, rpc_fut).await {
@@ -829,6 +891,7 @@ impl StoreDriver for GrpcStore {
                 error!("GrpcStore::update() polled stream after error was returned");
                 return None;
             }
+            let recv_start = std::time::Instant::now();
             let data = match local_state
                 .reader
                 .recv()
@@ -838,18 +901,37 @@ impl StoreDriver for GrpcStore {
                 Ok(data) => data,
                 Err(err) => {
                     local_state.did_error = true;
+                    trace!(
+                        resource_name = %local_state.resource_name,
+                        bytes_received = local_state.bytes_received,
+                        ?err,
+                        "GrpcStore::update unfold yielding Err from reader.recv()",
+                    );
                     return Some((Err(err), local_state));
                 }
             };
+            let recv_elapsed_ms =
+                u64::try_from(recv_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             let write_offset = local_state.bytes_received;
+            let finish_write = data.is_empty();
+            let data_len = data.len();
             local_state.bytes_received += data.len() as i64;
+
+            trace!(
+                resource_name = %local_state.resource_name,
+                write_offset,
+                data_len,
+                finish_write,
+                recv_elapsed_ms,
+                "GrpcStore::update unfold yielding WriteRequest",
+            );
 
             Some((
                 Ok(WriteRequest {
                     resource_name: local_state.resource_name.clone(),
                     write_offset,
-                    finish_write: data.is_empty(), // EOF is when no data was polled.
+                    finish_write, // EOF is when no data was polled.
                     data,
                 }),
                 local_state,
