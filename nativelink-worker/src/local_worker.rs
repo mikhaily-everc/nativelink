@@ -389,14 +389,33 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     match res {
                                         Ok(mut action_result) => {
                                             // Save in the action cache before notifying the scheduler that we've completed.
-                                            if let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) &&
-                                                let Err(err) = running_actions_manager.cache_action_result(digest_info, &mut action_result, digest_hasher).await {
-                                                    error!(
+                                            //
+                                            // Bound this so a slow / hung cache write (e.g. flaky CAS S3 backend
+                                            // doing its 60s-per-attempt × 6 retries) cannot block delivery of the
+                                            // action result. If the worker pod is SIGTERM'd while stuck in this
+                                            // cache write, the scheduler sees a worker disconnect, the action gets
+                                            // cancelled ("Job cancelled because it attempted to execute too many
+                                            // times"), and Bazel never sees the actual (often successful or with
+                                            // useful stderr) action result.
+                                            const CACHE_ACTION_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+                                            if let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) {
+                                                match tokio::time::timeout(
+                                                    CACHE_ACTION_RESULT_TIMEOUT,
+                                                    running_actions_manager.cache_action_result(digest_info, &mut action_result, digest_hasher),
+                                                ).await {
+                                                    Ok(Ok(())) => {}
+                                                    Ok(Err(err)) => error!(
                                                         ?err,
                                                         ?action_digest,
                                                         "Error saving action in store",
-                                                    );
+                                                    ),
+                                                    Err(_) => warn!(
+                                                        ?action_digest,
+                                                        timeout_s = CACHE_ACTION_RESULT_TIMEOUT.as_secs(),
+                                                        "cache_action_result timed out; proceeding with execution_response without cached AC entry",
+                                                    ),
                                                 }
+                                            }
                                             let action_stage = ActionStage::Completed(action_result);
                                             grpc_client.execution_response(
                                                 ExecuteResult{
