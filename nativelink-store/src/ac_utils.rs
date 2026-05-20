@@ -96,21 +96,33 @@ pub fn message_to_digest(
 }
 
 /// Takes a proto message and will serialize it and upload it to the provided store.
+///
+/// Hash AFTER `freeze()` so the digest is computed from the EXACT bytes being
+/// uploaded. The previous flow used `message_to_digest` which hashed via a
+/// `&mut BytesMut` view BEFORE freeze; under the threadsafety conditions
+/// flagged in this file's top-of-file TODO, the digest could end up not
+/// matching the frozen `Bytes` actually shipped to CAS — producing the
+/// hash-mismatch upload corruption we see in CAS logs (declared_hash differs
+/// from computed_hash with bytes_received == expected_size on solo uploads).
 pub async fn serialize_and_upload_message<'a, T: Message>(
     message: &'a T,
     cas_store: Pin<&'a impl StoreLike>,
     hasher: &mut impl DigestHasher,
 ) -> Result<DigestInfo, Error> {
     let mut buffer = BytesMut::with_capacity(message.encoded_len());
-    let digest = message_to_digest(message, &mut buffer, hasher)
-        .err_tip(|| "In serialize_and_upload_message")?;
+    message
+        .encode(&mut buffer)
+        .err_tip(|| "In serialize_and_upload_message: encode")?;
+    let frozen = buffer.freeze();
+    hasher.update(&frozen);
+    let digest = hasher.finalize_digest();
     // Note: For unknown reasons we appear to be hitting:
     // https://github.com/rust-lang/rust/issues/92096
     // or a smiliar issue if we try to use the non-store driver function, so we
     // are using the store driver function here.
     cas_store
         .as_store_driver_pin()
-        .update_oneshot(digest.into(), buffer.freeze())
+        .update_oneshot(digest.into(), frozen)
         .await
         .err_tip(|| "In serialize_and_upload_message")?;
     Ok(digest)
