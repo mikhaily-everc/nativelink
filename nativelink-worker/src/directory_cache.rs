@@ -282,7 +282,7 @@ impl DirectoryCache {
             let result = hardlink_directory_tree(&metadata.path, dest_path).await;
             metadata.ref_count.fetch_sub(1, Ordering::AcqRel);
             match result {
-                Ok(()) => return Ok(true),
+                Ok(_clone_method) => return Ok(true),
                 Err(e) => {
                     warn!(
                         ?digest,
@@ -315,7 +315,7 @@ impl DirectoryCache {
             metadata.ref_count.fetch_add(1, Ordering::AcqRel);
             let result = hardlink_directory_tree(&metadata.path, dest_path).await;
             metadata.ref_count.fetch_sub(1, Ordering::AcqRel);
-            return result.map(|()| true);
+            return result.map(|_clone_method| true);
         }
 
         // Construct the canonical cache entry. `construct_directory` returns

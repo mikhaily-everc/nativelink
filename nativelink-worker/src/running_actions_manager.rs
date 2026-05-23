@@ -65,6 +65,7 @@ use nativelink_util::action_messages::{
 };
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::fs_util::set_dir_writable_recursive;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
@@ -82,9 +83,16 @@ use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+use crate::persistent_worker::{
+    Input as PersistentWorkerInput, PersistentWorkerPool, WireFormat, WorkRequest, WorkerKey,
+};
+
 /// For simplicity we use a fixed exit code for cases when our program is terminated
 /// due to a signal.
 const EXIT_CODE_FOR_SIGNAL: i32 = 9;
+
+const SUPPORTS_WORKERS_PROPERTY: &str = "supports-workers";
+const REQUIRES_WORKER_PROTOCOL_PROPERTY: &str = "requires-worker-protocol";
 
 /// Default strategy for uploading historical results.
 /// Note: If this value changes the config documentation
@@ -111,9 +119,57 @@ struct SideChannelInfo {
     failure: Option<SideChannelFailureReason>,
 }
 
+fn action_supports_persistent_workers(
+    action_info: &ActionInfo,
+) -> Option<Result<WireFormat, Error>> {
+    if action_info
+        .platform_properties
+        .get(SUPPORTS_WORKERS_PROPERTY)
+        .is_none_or(|value| value != "1")
+    {
+        return None;
+    }
+
+    let protocol = action_info
+        .platform_properties
+        .get(REQUIRES_WORKER_PROTOCOL_PROPERTY)
+        .map_or("proto", String::as_str);
+    Some(WireFormat::parse(protocol))
+}
+
+fn os_args_to_strings(args: &[&OsStr]) -> Result<Vec<String>, Error> {
+    args.iter()
+        .map(|arg| {
+            arg.to_str().map(str::to_owned).ok_or_else(|| {
+                make_err!(
+                    Code::InvalidArgument,
+                    "Persistent worker command arguments must be valid UTF-8: {arg:?}"
+                )
+            })
+        })
+        .collect()
+}
+
+fn persistent_worker_request_arguments(argv: &[String]) -> Vec<String> {
+    argv.iter()
+        .skip(1)
+        .skip_while(|arg| !arg.starts_with('@'))
+        .cloned()
+        .collect()
+}
+/// Maximum number of file-materialization (hardlink) or subdirectory
+/// recursion futures polled concurrently per directory level. Higher values
+/// drown APFS's per-volume metadata lock with `hardlink(2)` syscalls and
+/// regress overall throughput vs lower-contention concurrency.
+///
+/// 64 is well above the inflection point on any modern Linux filesystem,
+/// so this is also a no-op on Linux beyond replacing tokio scheduling
+/// overhead.
+const DOWNLOAD_TO_DIRECTORY_CONCURRENCY: usize = 64;
+
 /// Aggressively download the digests of files and make a local folder from it. This function
-/// will spawn unbounded number of futures to try and get these downloaded. The store itself
-/// should be rate limited if spawning too many requests at once is an issue.
+/// gates each directory level to at most `DOWNLOAD_TO_DIRECTORY_CONCURRENCY`
+/// concurrent in-flight materialization futures.
 /// We require the `FilesystemStore` to be the `fast` store of `FastSlowStore`. This is for
 /// efficiency reasons. We will request the `FastSlowStore` to populate the entry then we will
 /// assume the `FilesystemStore` has the file available immediately after and hardlink the file
@@ -138,7 +194,7 @@ pub fn download_to_directory<'a>(
         let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
             .await
             .err_tip(|| "Converting digest to Directory")?;
-        let mut futures = FuturesUnordered::new();
+        let mut futures = Vec::new();
 
         for file in directory.files {
             let digest: DigestInfo = file
@@ -160,8 +216,18 @@ pub fn download_to_directory<'a>(
                     .populate_fast_store(digest.into())
                     .and_then(move |()| async move {
                         if is_zero_digest(digest) {
-                            let mut file_slot = fs::create_file(&dest).await?;
-                            file_slot.write_all(&[]).await?;
+                            // Zero-digest files are never persisted by the
+                            // FilesystemStore, so materialise them directly
+                            // in the worker exec dir. Attach context so a
+                            // failure here is diagnosable as a missing
+                            // empty file rather than a generic IO error.
+                            let mut file_slot = fs::create_file(&dest)
+                                .await
+                                .err_tip(|| format!("Could not create zero-digest file at {dest}"))?;
+                            file_slot
+                                .write_all(&[])
+                                .await
+                                .err_tip(|| format!("Could not write zero-digest file at {dest}"))?;
                         }
                         else {
                             let file_entry = filesystem_store
@@ -268,7 +334,15 @@ pub fn download_to_directory<'a>(
             );
         }
 
-        while futures.try_next().await?.is_some() {}
+        // Gate concurrency: at most DOWNLOAD_TO_DIRECTORY_CONCURRENCY futures
+        // polled at once for this directory level. Previously all futures were
+        // pushed into an unbounded FuturesUnordered, which on macOS produced
+        // thousands of parallel hardlink(2) calls fighting APFS's per-volume
+        // metadata lock and regressing throughput vs serial.
+        futures::stream::iter(futures)
+            .buffer_unordered(DOWNLOAD_TO_DIRECTORY_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
         Ok(())
     }
     .boxed()
@@ -279,6 +353,13 @@ pub fn download_to_directory<'a>(
 ///
 /// This provides a significant performance improvement for repeated builds
 /// with the same input directories.
+///
+/// `work_directory` must already exist and be empty when this is called: the
+/// caller pre-creates it so that, on the fallback path, `download_to_directory`
+/// has a destination to write into. The directory cache, however, materializes
+/// the tree with `hardlink_directory_tree` / APFS `clonefile(2)`, both of which
+/// require the destination to *not* exist — so this function removes the empty
+/// directory before invoking the cache and recreates it if the cache fails.
 pub async fn prepare_action_inputs(
     directory_cache: &Option<Arc<crate::directory_cache::DirectoryCache>>,
     cas_store: &FastSlowStore,
@@ -289,11 +370,29 @@ pub async fn prepare_action_inputs(
 ) -> Result<(), Error> {
     // Try cache first if available
     if let Some(cache) = directory_cache {
+        // `clonefile(2)` and `hardlink_directory_tree` both require the
+        // destination to not exist. Remove the empty directory the caller
+        // pre-created; without this the cache fails its precondition on every
+        // action and silently falls back to the slow download path.
+        fs::remove_dir(work_directory)
+            .await
+            .err_tip(|| format!("Failed to clear pre-created work directory {work_directory}"))?;
         match cache
             .get_or_create(*digest, Path::new(work_directory))
             .await
         {
             Ok(cache_hit) => {
+                // The materialized tree's directories inherit the cache
+                // entry's read-only mode (0o555 on the macOS clonefile path).
+                // Bazel actions declare outputs at paths nested inside input
+                // subdirectories, and creating those files needs write
+                // permission on the parent directory. Make every directory in
+                // the tree writable; files are left read-only — they may be
+                // CAS-hardlinked and chmoding them would corrupt the shared
+                // inode for other in-flight actions.
+                set_dir_writable_recursive(Path::new(work_directory))
+                    .await
+                    .err_tip(|| "Failed to make cached input directories writable")?;
                 trace!(
                     ?digest,
                     work_directory, cache_hit, "Successfully prepared inputs via directory cache"
@@ -307,9 +406,16 @@ pub async fn prepare_action_inputs(
                     "Directory cache failed, falling back to traditional download"
                 );
                 metrics.directory_cache_fallback.inc();
-                // Fall through to traditional path. `download_to_directory`
-                // creates the work directory itself, so no setup is needed
-                // even if the cache partially populated state before failing.
+                // The cache may have materialized a partial tree before
+                // failing. `hardlink_directory_tree` (called by
+                // `download_to_directory` for any DirectoryNode children)
+                // rejects a non-empty destination, so discard any partial
+                // state and recreate the work directory before falling
+                // through to the traditional path.
+                let _cleanup = fs::remove_dir_all(work_directory).await;
+                fs::create_dir(work_directory)
+                    .await
+                    .err_tip(|| format!("Failed to recreate work directory {work_directory}"))?;
             }
         }
     }
@@ -994,7 +1100,126 @@ impl RunningActionImpl {
         //                    level more effectively and adjust this.
         info!(?args, "Executing command");
 
-        let program = self.canonicalise_path(args[0], &command_proto.working_directory)?;
+        let program = self
+            .canonicalise_path(args[0], &command_proto.working_directory)
+            .err_tip(|| format!("Canonicalisation failure. Command={args:#?}"))?;
+        if let Some(wire_format_result) = action_supports_persistent_workers(&self.action_info) {
+            match wire_format_result {
+                Ok(wire_format) => {
+                    let command_argv = os_args_to_strings(&args)?;
+                    let key = WorkerKey::from_argv(&command_argv, wire_format)?;
+                    let request = WorkRequest {
+                        arguments: persistent_worker_request_arguments(&command_argv),
+                        inputs: Vec::<PersistentWorkerInput>::new(),
+                        request_id: 0,
+                        cancel: false,
+                        verbosity: 0,
+                        sandbox_dir: if command_proto.working_directory.is_empty() {
+                            self.work_directory.clone()
+                        } else {
+                            format!(
+                                "{}/{}",
+                                self.work_directory, command_proto.working_directory
+                            )
+                        },
+                    };
+                    let worker_cwd =
+                        PathBuf::from(&self.running_actions_manager.root_action_directory);
+
+                    match self
+                        .running_actions_manager
+                        .persistent_worker_pool
+                        .acquire(key.clone(), &program, &worker_cwd)
+                        .await
+                    {
+                        Ok(mut lease) => {
+                            let timer = self.metrics().child_process.begin_timer();
+                            let dispatch_result = {
+                                let dispatch_fut =
+                                    lease.worker().dispatch_with_timeout(&request, self.timeout);
+                                tokio::pin!(dispatch_fut);
+                                tokio::select! {
+                                    result = &mut dispatch_fut => Some(result),
+                                    _ = &mut kill_channel_rx => None,
+                                }
+                            };
+                            let response = match dispatch_result {
+                                Some(Ok(response)) => {
+                                    lease.release(true).await;
+                                    response
+                                }
+                                Some(Err(err)) => {
+                                    lease.release(false).await;
+                                    return Err(err).err_tip(|| {
+                                        format!("Dispatching action to persistent worker {key:?}")
+                                    });
+                                }
+                                None => {
+                                    drop(timer);
+                                    lease.release(false).await;
+                                    {
+                                        let mut state = self.state.lock();
+                                        state.error = Error::merge_option(
+                                            state.error.take(),
+                                            Some(Error::new(
+                                                Code::Cancelled,
+                                                format!(
+                                                    "Persistent worker command '{}' was killed by scheduler",
+                                                    args.join(OsStr::new(" ")).to_string_lossy()
+                                                ),
+                                            )),
+                                        );
+                                        state.command_proto = Some(command_proto);
+                                        state.execution_result =
+                                            Some(RunningActionImplExecutionResult {
+                                                stdout: Bytes::new(),
+                                                stderr: Bytes::new(),
+                                                exit_code: EXIT_CODE_FOR_SIGNAL,
+                                            });
+                                        state.execution_metadata.execution_completed_timestamp =
+                                            (self.running_actions_manager.callbacks.now_fn)();
+                                    }
+                                    return Ok(self);
+                                }
+                            };
+                            timer.measure();
+
+                            if response.exit_code == 0 {
+                                self.metrics().child_process_success_error_code.inc();
+                            } else {
+                                self.metrics().child_process_failure_error_code.inc();
+                            }
+                            info!(?args, ?key, "Persistent worker command complete");
+                            {
+                                let mut state = self.state.lock();
+                                state.command_proto = Some(command_proto);
+                                state.execution_result = Some(RunningActionImplExecutionResult {
+                                    stdout: Bytes::new(),
+                                    stderr: Bytes::from(response.output),
+                                    exit_code: response.exit_code,
+                                });
+                                state.execution_metadata.execution_completed_timestamp =
+                                    (self.running_actions_manager.callbacks.now_fn)();
+                            }
+                            return Ok(self);
+                        }
+                        Err(err) => {
+                            info!(
+                                ?err,
+                                ?key,
+                                "Falling back to one-shot execution; persistent worker unavailable"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    info!(
+                        ?err,
+                        "Falling back to one-shot execution; unsupported persistent worker protocol"
+                    );
+                }
+            }
+        }
 
         let mut command_builder = process::Command::new(program);
         #[cfg(target_family = "unix")]
@@ -1227,7 +1452,22 @@ impl RunningActionImpl {
                         )
                     };
 
-                    let exit_code = exit_status.code().map_or(EXIT_CODE_FOR_SIGNAL, |exit_code| {
+                    let exit_code = exit_status.code().map_or_else(|| {
+                        // No exit code means the runner was terminated by a
+                        // signal. SIGKILL on Linux is the kernel OOM killer's
+                        // weapon of choice, so flag this for operators trying
+                        // to correlate action failures with kubectl-top
+                        // memory pressure.
+                        warn!(
+                            ?args,
+                            "Runner subprocess terminated by signal (no exit code); likely OOMKilled \
+                             or externally killed. If this repeats for the same action, raise \
+                             `workers.specs[*].resources.limits.memory` or shrink the action's \
+                             concurrency."
+                        );
+                        self.metrics().child_process_failure_error_code.inc();
+                        EXIT_CODE_FOR_SIGNAL
+                    }, |exit_code| {
                         if exit_code == 0 {
                             self.metrics().child_process_success_error_code.inc();
                         } else {
@@ -1401,34 +1641,124 @@ impl RunningActionImpl {
                         .err_tip(|| format!("Uploading directory {}", full_path.display()))?,
                     ))
                 } else if metadata.is_symlink() {
-                    let output_symlink = upload_symlink(&full_path, work_directory)
-                        .await
-                        .map(|mut symlink_info| {
-                            symlink_info.name_or_path = NameOrPath::Path(entry);
-                            symlink_info
-                        })
-                        .err_tip(|| format!("Uploading symlink {}", full_path.display()))?;
-                    match fs::metadata(&full_path).await {
-                        Ok(metadata) => {
-                            if metadata.is_dir() {
-                                Ok(OutputType::DirectorySymlink(output_symlink))
-                            } else {
-                                // Note: If it's anything but directory we put it as a file symlink.
-                                Ok(OutputType::FileSymlink(output_symlink))
+                    // Resolve the symlink to determine what it points to.
+                    // Symlinks created by DirectoryCache (absolute paths into
+                    // the cache directory) must NOT be uploaded as symlinks —
+                    // the target path is worker-local and meaningless to the
+                    // client. Instead, follow the symlink and upload the
+                    // resolved content (file or directory).
+                    let target = fs::read_link(&full_path).await.err_tip(|| {
+                        format!("Reading symlink target for {}", full_path.display())
+                    })?;
+                    let is_absolute_symlink = Path::new(&target).is_absolute();
+
+                    if is_absolute_symlink {
+                        // Absolute symlink — resolve and upload contents.
+                        match fs::metadata(&full_path).await {
+                            Ok(resolved_meta) => {
+                                if resolved_meta.is_dir() {
+                                    // Upload as directory (Tree proto).
+                                    Ok(OutputType::Directory(
+                                        upload_directory(
+                                            cas_store.as_pin(),
+                                            &full_path,
+                                            work_directory,
+                                            hasher,
+                                            digest_uploaders,
+                                        )
+                                        .and_then(|(root_dir, children)| async move {
+                                            let tree = ProtoTree {
+                                                root: Some(root_dir),
+                                                children: children.into(),
+                                            };
+                                            let tree_digest = serialize_and_upload_message(
+                                                &tree,
+                                                cas_store.as_pin(),
+                                                &mut hasher.hasher(),
+                                            )
+                                            .await
+                                            .err_tip(|| format!("While processing {entry}"))?;
+                                            Ok(DirectoryInfo {
+                                                path: entry,
+                                                tree_digest,
+                                            })
+                                        })
+                                        .await
+                                        .err_tip(|| {
+                                            format!(
+                                                "Uploading symlinked directory {}",
+                                                full_path.display()
+                                            )
+                                        })?,
+                                    ))
+                                } else {
+                                    // Upload as file (follow symlink).
+                                    Ok(OutputType::File(
+                                        upload_file(
+                                            cas_store.as_pin(),
+                                            &full_path,
+                                            hasher,
+                                            resolved_meta,
+                                            digest_uploaders,
+                                        )
+                                        .await
+                                        .map(|mut file_info| {
+                                            file_info.name_or_path = NameOrPath::Path(entry);
+                                            file_info
+                                        })
+                                        .err_tip(|| {
+                                            format!(
+                                                "Uploading symlinked file {}",
+                                                full_path.display()
+                                            )
+                                        })?,
+                                    ))
+                                }
+                            }
+                            Err(e) => {
+                                if e.code != Code::NotFound {
+                                    return Err(e).err_tip(|| {
+                                        format!(
+                                            "While resolving absolute symlink {}",
+                                            full_path.display()
+                                        )
+                                    });
+                                }
+                                Ok(OutputType::None)
                             }
                         }
-                        Err(e) => {
-                            if e.code != Code::NotFound {
-                                return Err(e).err_tip(|| {
-                                    format!(
-                                        "While querying target symlink metadata for {}",
-                                        full_path.display()
-                                    )
-                                });
+                    } else {
+                        // Relative symlink — action intentionally created it.
+                        // Upload as a proper symlink.
+                        let output_symlink = upload_symlink(&full_path, work_directory)
+                            .await
+                            .map(|mut symlink_info| {
+                                symlink_info.name_or_path = NameOrPath::Path(entry);
+                                symlink_info
+                            })
+                            .err_tip(|| format!("Uploading symlink {}", full_path.display()))?;
+                        match fs::metadata(&full_path).await {
+                            Ok(metadata) => {
+                                if metadata.is_dir() {
+                                    Ok(OutputType::DirectorySymlink(output_symlink))
+                                } else {
+                                    // Note: If it's anything but directory we put it as a file symlink.
+                                    Ok(OutputType::FileSymlink(output_symlink))
+                                }
                             }
-                            // If the file doesn't exist, we consider it a file. Even though the
-                            // file doesn't exist we still need to populate an entry.
-                            Ok(OutputType::FileSymlink(output_symlink))
+                            Err(e) => {
+                                if e.code != Code::NotFound {
+                                    return Err(e).err_tip(|| {
+                                        format!(
+                                            "While querying target symlink metadata for {}",
+                                            full_path.display()
+                                        )
+                                    });
+                                }
+                                // If the file doesn't exist, we consider it a file. Even though the
+                                // file doesn't exist we still need to populate an entry.
+                                Ok(OutputType::FileSymlink(output_symlink))
+                            }
                         }
                     }
                 } else {
@@ -1456,6 +1786,7 @@ impl RunningActionImpl {
                 exit_code = ?execution_result.exit_code,
                 stdout = %stdout_preview,
                 stderr = %stderr_preview,
+                command = ?command_proto.arguments,
                 "Command returned non-zero exit code",
             );
         }
@@ -2149,6 +2480,7 @@ pub struct RunningActionsManagerImpl {
     /// Optional directory cache for improving performance by caching reconstructed
     /// input directories and using hardlinks.
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    persistent_worker_pool: PersistentWorkerPool,
 }
 
 impl RunningActionsManagerImpl {
@@ -2193,6 +2525,7 @@ impl RunningActionsManagerImpl {
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
+            persistent_worker_pool: PersistentWorkerPool::default(),
             #[cfg(target_os = "linux")]
             use_namespaces: args.use_namespaces,
         })

@@ -20,11 +20,12 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
 use nativelink_config::stores::{RedisMode, RedisSpec};
-use nativelink_error::{Code, Error, ResultExt, make_err};
+use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_redis_tester::{
-    ReadOnlyRedis, add_lua_script, add_to_response, fake_redis_sentinel_master_stream,
-    fake_redis_sentinel_stream, fake_redis_stream, make_fake_redis_with_responses,
+    ReadOnlyRedis, SubscriptionManagerNotify, add_lua_script, add_to_response,
+    fake_redis_sentinel_master_stream, fake_redis_sentinel_stream, fake_redis_stream,
+    make_fake_redis_with_responses,
 };
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;
 use nativelink_store::redis_store::{
@@ -36,11 +37,12 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::HealthStatus;
 use nativelink_util::store_trait::{
     FalseValue, SchedulerCurrentVersionProvider, SchedulerIndexProvider, SchedulerStore,
-    SchedulerStoreDataProvider, SchedulerStoreDecodeTo, SchedulerStoreKeyProvider, StoreKey,
-    StoreLike, TrueValue, UploadSizeInfo,
+    SchedulerStoreDataProvider, SchedulerStoreDecodeTo, SchedulerStoreKeyProvider,
+    SchedulerSubscription, SchedulerSubscriptionManager, StoreKey, StoreLike, TrueValue,
+    UploadSizeInfo,
 };
 use pretty_assertions::assert_eq;
-use redis::{PushInfo, RedisError, Value};
+use redis::{PushInfo, RedisError, Value, make_extension_error};
 use redis_test::{MockCmd, MockRedisConnection};
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, info, info_span};
@@ -106,6 +108,7 @@ async fn make_mock_store_with_prefix(
         DEFAULT_MAX_PERMITS,
         DEFAULT_MAX_COUNT_PER_CURSOR,
         0,
+        Duration::from_secs(4),
         rx,
         manager,
     )
@@ -643,7 +646,8 @@ fn test_connection_errors() {
             messages: vec![
                 "Io: timed out".into(),
                 format!("While connecting to redis with url: redis://nativelink.com:6379/")
-            ]
+            ],
+            context: ErrorContext::None,
         },
         err
     );
@@ -742,7 +746,8 @@ async fn test_sentinel_connect_with_bad_master() {
             messages: vec![
                 "MasterNameNotFoundBySentinel: Master with given name not found in sentinel - MasterNameNotFoundBySentinel".into(),
                 format!("While connecting to redis with url: redis+sentinel://127.0.0.1:{port}/")
-            ]
+            ],
+            context: ErrorContext::None,
         },
         RedisStore::new_standard(spec).await.unwrap_err()
     );
@@ -864,7 +869,8 @@ async fn test_redis_connect_timeout() {
             messages: vec![
                 "Io: timed out".into(),
                 format!("While connecting to redis with url: redis://127.0.0.1:{port}/")
-            ]
+            ],
+            context: ErrorContext::None,
         },
         RedisStore::new_standard(spec).await.unwrap_err()
     );
@@ -1129,6 +1135,170 @@ fn test_search_by_index_failure() -> Result<(), Error> {
     assert!(logs_contain(
         "Error calling ft.aggregate e=TEST - Client: unexpected command index=\"test:_content_prefix_sort_key_3e762c15\" query=\"*\" options=FtAggregateOptions { load: [\"data\", \"version\"], cursor: FtAggregateCursor { count: 1500, max_idle: 30000 }, sort_by: [\"@sort_key\"] } all_args=[\"FT.AGGREGATE\", \"test:_content_prefix_sort_key_3e762c15\", \"*\", \"LOAD\", \"2\", \"data\", \"version\", \"WITHCURSOR\", \"COUNT\", \"1500\", \"MAXIDLE\", \"30000\", \"SORTBY\", \"2\", \"@sort_key\", \"ASC\"]"
     ));
+
+    Ok(())
+}
+
+/// When `ft_create` races a parallel caller, `RediSearch` returns an
+/// Extension-kind error with code="Index" and detail="already exists".
+/// That outcome is benign — the index is in place, which is the only
+/// postcondition we care about. The race-loser's error must not pollute
+/// the merged error surfaced when the second `ft_aggregate` also fails.
+#[nativelink_test]
+fn test_search_by_index_swallows_already_exists_from_ft_create() -> Result<(), Error> {
+    fn make_ft_aggregate() -> MockCmd {
+        MockCmd::new(
+            redis::cmd("FT.AGGREGATE")
+                .arg("test:_content_prefix_sort_key_3e762c15")
+                .arg("@content_prefix:{ Searchable }")
+                .arg("LOAD")
+                .arg(2)
+                .arg("data")
+                .arg("version")
+                .arg("WITHCURSOR")
+                .arg("COUNT")
+                .arg(1500)
+                .arg("MAXIDLE")
+                .arg(30000)
+                .arg("SORTBY")
+                .arg(2usize)
+                .arg("@sort_key")
+                .arg("ASC"),
+            Err::<Value, _>(make_extension_error(
+                "BUSY".to_string(),
+                Some("Redis is busy running a script".to_string()),
+            )),
+        )
+    }
+    fn make_ft_create_already_exists() -> MockCmd {
+        MockCmd::new(
+            redis::cmd("FT.CREATE")
+                .arg("test:_content_prefix_sort_key_3e762c15")
+                .arg("ON")
+                .arg("HASH")
+                .arg("NOHL")
+                .arg("NOFIELDS")
+                .arg("NOFREQS")
+                .arg("NOOFFSETS")
+                .arg("TEMPORARY")
+                .arg(86400)
+                .arg("PREFIX")
+                .arg(1)
+                .arg("test:")
+                .arg("SCHEMA")
+                .arg("content_prefix")
+                .arg("TAG")
+                .arg("sort_key")
+                .arg("TAG")
+                .arg("SORTABLE"),
+            Err::<Value, _>(make_extension_error(
+                "Index".to_string(),
+                Some("already exists".to_string()),
+            )),
+        )
+    }
+
+    let commands = vec![
+        make_ft_aggregate(),
+        make_ft_create_already_exists(),
+        make_ft_aggregate(),
+    ];
+    let store = make_mock_store(commands).await;
+    let search_provider = SearchByContentPrefix {
+        prefix: "Searchable".to_string(),
+    };
+
+    let Err(error) = store.search_by_index_prefix(search_provider).await else {
+        panic!("Expected error from the second ft_aggregate");
+    };
+
+    let formatted = format!("{error}");
+    assert!(
+        !formatted.contains("already exists"),
+        "merged error must not carry the swallowed ft_create noise; got: {formatted}",
+    );
+    assert!(
+        formatted.contains("second ft_aggregate"),
+        "merged error must carry the second ft_aggregate failure context; got: {formatted}",
+    );
+
+    Ok(())
+}
+
+#[nativelink_test]
+fn test_search_by_index_preserves_other_ft_create_errors() -> Result<(), Error> {
+    fn make_ft_aggregate() -> MockCmd {
+        MockCmd::new(
+            redis::cmd("FT.AGGREGATE")
+                .arg("test:_content_prefix_sort_key_3e762c15")
+                .arg("@content_prefix:{ Searchable }")
+                .arg("LOAD")
+                .arg(2)
+                .arg("data")
+                .arg("version")
+                .arg("WITHCURSOR")
+                .arg("COUNT")
+                .arg(1500)
+                .arg("MAXIDLE")
+                .arg(30000)
+                .arg("SORTBY")
+                .arg(2usize)
+                .arg("@sort_key")
+                .arg("ASC"),
+            Err::<Value, _>(make_extension_error(
+                "BUSY".to_string(),
+                Some("Redis is busy running a script".to_string()),
+            )),
+        )
+    }
+    fn make_ft_create_other_error() -> MockCmd {
+        MockCmd::new(
+            redis::cmd("FT.CREATE")
+                .arg("test:_content_prefix_sort_key_3e762c15")
+                .arg("ON")
+                .arg("HASH")
+                .arg("NOHL")
+                .arg("NOFIELDS")
+                .arg("NOFREQS")
+                .arg("NOOFFSETS")
+                .arg("TEMPORARY")
+                .arg(86400)
+                .arg("PREFIX")
+                .arg(1)
+                .arg("test:")
+                .arg("SCHEMA")
+                .arg("content_prefix")
+                .arg("TAG")
+                .arg("sort_key")
+                .arg("TAG")
+                .arg("SORTABLE"),
+            // A genuinely surprising ft_create failure that must not be
+            // swallowed by the new typed match.
+            Err::<Value, _>(make_extension_error(
+                "PERM".to_string(),
+                Some("no permission".to_string()),
+            )),
+        )
+    }
+
+    let commands = vec![
+        make_ft_aggregate(),
+        make_ft_create_other_error(),
+        make_ft_aggregate(),
+    ];
+    let store = make_mock_store(commands).await;
+    let search_provider = SearchByContentPrefix {
+        prefix: "Searchable".to_string(),
+    };
+
+    let Err(error) = store.search_by_index_prefix(search_provider).await else {
+        panic!("Expected error");
+    };
+    let formatted = format!("{error}");
+    assert!(
+        formatted.contains("PERM") || formatted.contains("no permission"),
+        "merged error must include the real ft_create failure context; got: {formatted}",
+    );
 
     Ok(())
 }
@@ -1567,4 +1737,129 @@ async fn test_update_data_versioned_with_expiry() {
         .update_data(data, Some(Duration::from_secs(60)))
         .await
         .expect("working update");
+}
+
+/// Test key provider that just wraps a string. Reused across the
+/// subscription regression tests below.
+#[derive(Clone)]
+struct TestSubKey(String);
+
+impl SchedulerStoreKeyProvider for TestSubKey {
+    type Versioned = FalseValue;
+    fn get_key(&self) -> StoreKey<'static> {
+        StoreKey::Str(std::borrow::Cow::Owned(self.0.clone()))
+    }
+}
+
+/// Sanity: a single subscriber that drops cleanly produces no warning
+/// and no error.
+#[nativelink_test]
+async fn redis_subscription_single_drop_is_silent() -> Result<(), Error> {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let manager = RedisSubscriptionManager::new(rx);
+
+    let sub = manager.subscribe(TestSubKey("solo-key".to_string()))?;
+    drop(sub);
+    sleep(Duration::from_millis(10)).await;
+
+    assert!(
+        !logs_contain("key absent from subscribed_keys under write lock"),
+        "single-subscriber drop unexpectedly logged the absence warning",
+    );
+    assert!(!logs_contain("ERROR"));
+
+    drop(manager);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn redis_subscription_drop_one_of_two_keeps_publisher() -> Result<(), Error> {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let manager = RedisSubscriptionManager::new(rx);
+
+    let key = "shared-key";
+    let sub_a = manager.subscribe(TestSubKey(key.to_string()))?;
+    let mut sub_b = manager.subscribe(TestSubKey(key.to_string()))?;
+
+    // Drop the first; the second's subscription must still resolve
+    // when we notify on the same key.
+    drop(sub_a);
+
+    manager.notify_for_test(key.to_string());
+    timeout(Duration::from_secs(2), sub_b.changed())
+        .await
+        .expect("sub_b.changed() did not fire — publisher entry was dropped prematurely")?;
+
+    assert!(
+        !logs_contain("key absent from subscribed_keys under write lock"),
+        "absence warning fired during single drop with another receiver alive",
+    );
+    drop(sub_b);
+    drop(manager);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn redis_subscription_concurrent_drops_no_absence_warn() -> Result<(), Error> {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let manager = RedisSubscriptionManager::new(rx);
+
+    const ITERATIONS: usize = 200;
+    for i in 0..ITERATIONS {
+        let key = format!("race-key-{i}");
+        let sub_a = manager.subscribe(TestSubKey(key.clone()))?;
+        let sub_b = manager.subscribe(TestSubKey(key.clone()))?;
+
+        // `spawn_blocking` puts each Drop on its own thread; with the
+        // pre-fix code's "drop receiver, then take lock" sequence,
+        // both threads can race into the lock with already-decremented
+        // counts. With the post-fix "take lock, then evaluate, then
+        // drop receiver" sequence, the lock serialises the decision
+        // and the warning never fires.
+        let h_a = tokio::task::spawn_blocking(move || drop(sub_a));
+        let h_b = tokio::task::spawn_blocking(move || drop(sub_b));
+        h_a.await.unwrap();
+        h_b.await.unwrap();
+    }
+    sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        !logs_contain("key absent from subscribed_keys under write lock"),
+        "concurrent drops produced the absence warning at least once across {ITERATIONS} \
+         iterations — the Drop ordering regressed",
+    );
+    assert!(!logs_contain("ERROR"));
+
+    drop(manager);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn redis_subscription_resubscribe_after_drop_creates_fresh_publisher() -> Result<(), Error> {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let manager = RedisSubscriptionManager::new(rx);
+
+    let key = "cycle-key";
+    let sub_a = manager.subscribe(TestSubKey(key.to_string()))?;
+    let sub_b = manager.subscribe(TestSubKey(key.to_string()))?;
+    drop(sub_a);
+    drop(sub_b);
+
+    // Re-subscribe to the same key. If the previous drops left the
+    // map in an inconsistent state (stale publisher kept, or a
+    // partially-deconstructed entry), this either reuses a dead
+    // publisher (changed() never fires) or panics inside the
+    // patricia map.
+    let mut sub_c = manager.subscribe(TestSubKey(key.to_string()))?;
+    manager.notify_for_test(key.to_string());
+    timeout(Duration::from_secs(2), sub_c.changed())
+        .await
+        .expect("re-subscribe after drops produced a dead publisher")?;
+
+    assert!(!logs_contain(
+        "key absent from subscribed_keys under write lock"
+    ));
+    drop(sub_c);
+    drop(manager);
+    Ok(())
 }
