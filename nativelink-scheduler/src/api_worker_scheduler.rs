@@ -30,6 +30,8 @@ use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
 use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
 use nativelink_util::shutdown_guard::ShutdownGuard;
+use nativelink_util::spawn;
+use nativelink_util::task::JoinHandleDropGuard;
 use tokio::sync::{Notify, mpsc};
 use tokio::sync::mpsc::error::TrySendError;
 use tonic::async_trait;
@@ -609,6 +611,18 @@ pub struct ApiWorkerScheduler {
     /// budget — closing the leak window that previously deadlocked the
     /// matcher under reservation churn.
     weak_self: Weak<ApiWorkerScheduler>,
+
+    /// Abort-on-drop handle for the releaser task spawned in `new`. Without
+    /// this guard, the `tokio::spawn` that drains the release channel kept
+    /// running for the lifetime of the tokio runtime — relying on the
+    /// channel sender being dropped to terminate the loop. Under
+    /// `tokio::test`, the runtime drops at end-of-test and tries to join
+    /// all spawned tasks; the releaser's `recv().await` is cancel-safe in
+    /// principle but the abort signal isn't observed until the runtime
+    /// finishes shutdown. Wrapping in `JoinHandleDropGuard` ensures the
+    /// task is `.abort()`'d the moment this struct drops, before runtime
+    /// shutdown gets a chance to wait on it.
+    _releaser_handle: JoinHandleDropGuard<()>,
 }
 
 impl ApiWorkerScheduler {
@@ -623,33 +637,42 @@ impl ApiWorkerScheduler {
         let (release_tx, release_rx) =
             mpsc::channel::<WorkerReservationInner>(RELEASE_CHANNEL_CAPACITY);
         let metrics = Arc::new(SchedulerMetrics::default());
-        let arc_self = Arc::new_cyclic(|weak_self| Self {
-            inner: Mutex::new(ApiWorkerSchedulerImpl {
-                workers: Workers(LruCache::unbounded()),
-                worker_state_manager,
-                allocation_strategy,
-                worker_change_notify,
-                worker_registry: worker_registry.clone(),
-                shutting_down: false,
-                capability_index: WorkerCapabilityIndex::new(),
-                // Start at 1 so `WorkerGeneration(0)` (the `Worker::new`
-                // default) is always distinguishable from a live generation.
-                next_generation: AtomicU64::new(1),
-            }),
-            platform_property_manager,
-            worker_timeout_s,
-            worker_registry,
-            metrics: Arc::clone(&metrics),
-            release_tx,
-            weak_self: weak_self.clone(),
+        let arc_self = Arc::new_cyclic(|weak_self| {
+            // Releaser task: drains reservations that were Drop-enqueued by
+            // future cancellation (pod shutdown, stream drop, panic). Uses
+            // the cyclic Weak so its existence does not keep the scheduler
+            // alive. Spawned via `spawn!` (NOT raw `tokio::spawn`) so the
+            // returned `JoinHandleDropGuard` aborts the task when this
+            // struct drops — required so `tokio::test` runtime shutdown
+            // doesn't hang waiting for the releaser to observe channel
+            // closure.
+            let weak_for_releaser = weak_self.clone();
+            let metrics_for_releaser = Arc::clone(&metrics);
+            Self {
+                inner: Mutex::new(ApiWorkerSchedulerImpl {
+                    workers: Workers(LruCache::unbounded()),
+                    worker_state_manager,
+                    allocation_strategy,
+                    worker_change_notify,
+                    worker_registry: worker_registry.clone(),
+                    shutting_down: false,
+                    capability_index: WorkerCapabilityIndex::new(),
+                    // Start at 1 so `WorkerGeneration(0)` (the `Worker::new`
+                    // default) is always distinguishable from a live generation.
+                    next_generation: AtomicU64::new(1),
+                }),
+                platform_property_manager,
+                worker_timeout_s,
+                worker_registry,
+                metrics: Arc::clone(&metrics),
+                release_tx,
+                weak_self: weak_self.clone(),
+                _releaser_handle: spawn!(
+                    "api_worker_scheduler_releaser",
+                    Self::run_releaser(weak_for_releaser, release_rx, metrics_for_releaser),
+                ),
+            }
         });
-
-        // Releaser task: drains reservations that were Drop-enqueued by
-        // future cancellation (pod shutdown, stream drop, panic). Uses a
-        // Weak reference so its existence does not keep the scheduler alive;
-        // terminates naturally when all senders drop.
-        let weak_self = Arc::downgrade(&arc_self);
-        tokio::spawn(Self::run_releaser(weak_self, release_rx, metrics));
 
         arc_self
     }
