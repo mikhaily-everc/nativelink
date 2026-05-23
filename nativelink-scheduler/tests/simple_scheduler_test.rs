@@ -362,16 +362,6 @@ async fn find_executing_action() -> Result<(), Error> {
 }
 
 #[nativelink_test]
-// IGNORED: local commit 1b55c4f3 ("Propagate worker disconnect reason through
-// remove_worker") changed the contract so `remove_worker(_, reason)` propagates
-// the supplied Error to the action's stage (Completed-with-error) instead of
-// re-queueing it. This test asserts on `ActionStage::Executing` after a
-// remove + new-worker match cycle, which is the old "re-queue on remove"
-// behaviour. The new semantic ends the action immediately on the first
-// remove_worker, so the listener hangs waiting for an Executing transition
-// that no longer happens. Rewriting the test against the new contract is a
-// separate piece of work; ignore for now.
-#[ignore]
 async fn remove_worker_reschedules_multiple_running_job_test() -> Result<(), Error> {
     let worker_id1 = WorkerId("worker1".to_string());
     let worker_id2 = WorkerId("worker2".to_string());
@@ -867,8 +857,6 @@ async fn cacheable_items_join_same_action_queued_test() -> Result<(), Error> {
 }
 
 #[nativelink_test]
-// IGNORED: see comment on `remove_worker_reschedules_multiple_running_job_test`.
-#[ignore]
 async fn worker_disconnects_does_not_schedule_for_execution_test() -> Result<(), Error> {
     let task_change_notify = Arc::new(Notify::new());
     let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
@@ -1127,8 +1115,6 @@ async fn matching_engine_fails_sends_abort() -> Result<(), Error> {
 }
 
 #[nativelink_test]
-// IGNORED: see comment on `remove_worker_reschedules_multiple_running_job_test`.
-#[ignore]
 async fn worker_timesout_reschedules_running_job_test() -> Result<(), Error> {
     MockClock::set_time(Duration::from_secs(NOW_TIME));
 
@@ -1373,8 +1359,6 @@ async fn update_action_sends_completed_result_to_client_test() -> Result<(), Err
 }
 
 #[nativelink_test]
-// IGNORED: see comment on `remove_worker_reschedules_multiple_running_job_test`.
-#[ignore]
 async fn update_action_sends_completed_result_after_disconnect() -> Result<(), Error> {
     let worker_id = WorkerId("worker_id".to_string());
 
@@ -1997,8 +1981,6 @@ async fn run_jobs_in_the_order_they_were_queued() -> Result<(), Error> {
 }
 
 #[nativelink_test]
-// IGNORED: see comment on `remove_worker_reschedules_multiple_running_job_test`.
-#[ignore]
 async fn worker_retries_on_internal_error_and_fails_test() -> Result<(), Error> {
     let worker_id = WorkerId("worker_id".to_string());
 
@@ -2153,8 +2135,6 @@ async fn worker_retries_on_internal_error_and_fails_test() -> Result<(), Error> 
 /// hiding the cluster-side root cause behind a TIMEOUT/NO STATUS surface.
 /// After the fix, disconnects count as attempts and exceed the cap.
 #[nativelink_test]
-// IGNORED: see comment on `remove_worker_reschedules_multiple_running_job_test`.
-#[ignore]
 async fn worker_disconnect_loop_caps_at_max_job_retries_test() -> Result<(), Error> {
     let worker_id = WorkerId("worker_id".to_string());
 

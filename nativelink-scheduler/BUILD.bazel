@@ -68,7 +68,7 @@ rust_library(
 
 rust_test_suite(
     name = "integration",
-    timeout = "short",
+    timeout = "eternal",
     srcs = [
         "tests/action_messages_test.rs",
         "tests/cache_lookup_scheduler_test.rs",

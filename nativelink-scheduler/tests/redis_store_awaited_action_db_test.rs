@@ -216,15 +216,6 @@ async fn add_action_smoke_test() -> Result<(), Error> {
     Ok(())
 }
 
-// IGNORED: local commit 1b55c4f3 ("Propagate worker disconnect reason through
-// remove_worker") changed the contract — `remove_worker` now propagates the
-// supplied Error reason all the way to the action's stage transition, so the
-// first `remove_worker(..., Code::Unavailable)` marks the action `Completed`
-// with that error instead of re-queueing it. This test was authored against
-// upstream's old "re-queue on remove" semantic (then a 3-retry loop completes
-// with internal-error). Rewriting the test to exercise the new semantic is a
-// separate piece of work; ignore for now.
-#[ignore]
 #[nativelink_test]
 async fn test_multiple_clients_subscribe_to_same_action() -> Result<(), Error> {
     const CLIENT_OPERATION_ID_1: &str = "client_operation_id_1";
