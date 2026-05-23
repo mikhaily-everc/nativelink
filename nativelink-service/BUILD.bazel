@@ -7,6 +7,12 @@ load(
     "rust_test_suite",
 )
 
+# Default-public so cross-workspace mutation_test targets (in the outer ai-utils
+# workspace at //tools/cargo-mutants/nativelink/...) can reference the
+# rust_test_suite-generated rust_test sub-targets — those inherit the package
+# default visibility, which would otherwise be private.
+package(default_visibility = ["//visibility:public"])
+
 rust_library(
     name = "nativelink-service",
     srcs = [
@@ -33,7 +39,6 @@ rust_library(
         "//nativelink-store",
         "//nativelink-util",
         "@crates//:axum",
-        "@crates//:bincode",
         "@crates//:bytes",
         "@crates//:futures",
         "@crates//:http-body-util",
@@ -51,6 +56,7 @@ rust_library(
         "@crates//:tower",
         "@crates//:tracing",
         "@crates//:uuid",
+        "@crates//:wincode",
     ],
 )
 

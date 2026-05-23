@@ -34,6 +34,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 };
 use nativelink_proto::google::rpc::Status as GrpcStatus;
 use nativelink_store::ac_utils::get_and_decode_digest;
+use nativelink_store::compression_store::WincodeConfig;
 use nativelink_store::dedup_store::DedupIndex;
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::store_manager::StoreManager;
@@ -402,9 +403,11 @@ impl CasServer {
                 err
             })
             .err_tip(|| "Reading splice manifest")?;
-        let (manifest, _): (DedupIndex, _) =
-            bincode::serde::decode_from_slice(&index_bytes, bincode::config::legacy())
-                .map_err(|e| make_err!(Code::Internal, "Corrupt splice manifest: {e}"))?;
+        let manifest: DedupIndex = wincode::config::deserialize::<DedupIndex, WincodeConfig>(
+            &index_bytes,
+            WincodeConfig::new(),
+        )
+        .map_err(|e| make_err!(Code::Internal, "Corrupt splice manifest: {e}"))?;
 
         let chunk_keys: Vec<_> = manifest.entries.iter().map(|d| (*d).into()).collect();
         let presence = cas_store
@@ -568,7 +571,7 @@ impl CasServer {
         let manifest = DedupIndex {
             entries: chunk_digests,
         };
-        let encoded = bincode::serde::encode_to_vec(&manifest, bincode::config::legacy())
+        let encoded = wincode::config::serialize(&manifest, WincodeConfig::new())
             .map_err(|e| make_err!(Code::Internal, "Encoding splice manifest: {e}"))?;
         manifest_store
             .update_oneshot(expected_blob_digest, encoded.into())
