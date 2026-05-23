@@ -2247,19 +2247,37 @@ async fn worker_disconnect_loop_caps_at_max_job_retries_test() -> Result<(), Err
 /// Bazel client's `--remote_timeout` (gRPC deadline) or `--test_timeout`
 /// (client-side) fires; from the operator's perspective the cluster never
 /// surfaces the slow action.
-// IGNORED: hangs deterministically on RBE for the full 300s test_timeout when
-// run in isolation via `--test_filter`, producing zero stdout. Reading the
-// test body, the work is synchronous (MockClock + `should_timeout_operation`
-// calls), so the hang almost certainly lives in
-// `SimpleSchedulerStateManager::new` constructed here — which our local
-// commit 97738436 ("feat(scheduler): parallelize match loop with
-// reserve/commit/release + generation fencing") refactored to spawn
-// background tasks. tokio::test waits for runtime shutdown, so any
-// non-terminating background task pins the test forever. Root-causing
-// requires running the binary on Linux (the runfiles target linux-x86_64,
-// can't be exec'd on macOS) with a strace / tokio-console attached. Filed
-// as deferred follow-up; ignoring here so the rest of simple_scheduler_test
-// can run.
+// FIXME(scheduler-test-hang): hangs deterministically on RBE for the full
+// 300s test_timeout when run in isolation via `--test_filter`, producing
+// zero stdout. This is NOT isolated to this single test — at least
+// `basic_add_action_with_one_worker_test` exhibits the same fingerprint
+// (300s × 2 attempts, zero stdout). Common shape: every hanging test
+// constructs a full scheduler via `SimpleScheduler::new_with_callback`
+// (or `SimpleSchedulerStateManager::new` for this one), which transitively
+// spawns the parallelized matcher loop from local commit 97738436
+// ("feat(scheduler): parallelize match loop with reserve/commit/release +
+// generation fencing"). The `tokio::spawn` for `run_releaser` was already
+// guarded via JoinHandleDropGuard (commit 70c2610e), but that did NOT
+// resolve the hang — pointing the suspicion at the matcher loop's
+// `FuturesUnordered` polling or its Notify wakeup ordering under
+// tokio::test's multi-thread runtime, NOT a task-leak on shutdown.
+//
+// Candidate failure modes (each can be tested by reverting 97738436 piece-
+// by-piece on a Linux box with tokio-console attached):
+//   1. `task_change_notify.notify_one()` fires BEFORE the matcher loop has
+//      registered its `notified()` future — early-notify drops on the
+//      floor, matcher parks forever waiting for a notify that already
+//      happened.
+//   2. `match_one` futures pushed into `FuturesUnordered` need an explicit
+//      `tokio::yield_now().await` we removed, otherwise the runtime never
+//      schedules them.
+//   3. `weak_inner.upgrade()` in the matcher returns Some under
+//      MockInstantWrapped time semantics that diverge from real time.
+//
+// Until that's fixed, this test is `#[ignore]`d so the rest of
+// simple_scheduler_test_test can run. DO NOT remove the `#[ignore]`
+// without addressing the underlying scheduler regression — un-ignoring
+// just turns the whole suite back into a TIMEOUT.
 #[ignore]
 #[nativelink_test]
 async fn action_timeout_is_enforced_backend_side_test() -> Result<(), Error> {

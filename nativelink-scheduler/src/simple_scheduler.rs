@@ -277,6 +277,21 @@ impl SimpleScheduler {
         self.max_concurrent_matches
     }
 
+    // FIXME(scheduler-test-hang): this concurrent pipeline (the change
+    // landed in 97738436, "feat(scheduler): parallelize match loop with
+    // reserve/commit/release + generation fencing") is the prime suspect
+    // for the `simple_scheduler_test_test` 300s TIMEOUT with zero stdout
+    // documented on the `#[ignore]`'d
+    // `action_timeout_is_enforced_backend_side_test` and reproducing for
+    // at least `basic_add_action_with_one_worker_test`. Diagnose by
+    // running the linux-x86_64 test binary with `tokio-console` (or
+    // `RUST_LOG=trace nativelink_scheduler=trace`) attached to confirm
+    // whether `match_one` futures are stuck in `FuturesUnordered` polling
+    // or whether the outer `task_worker_matching` loop misses an early
+    // `task_change_notify.notify_one()` before its `notified()` is
+    // registered. See the FIXME block on
+    // `tests/simple_scheduler_test.rs::action_timeout_is_enforced_backend_side_test`
+    // for the full diagnostic context.
     async fn do_try_match(&self, full_worker_logging: bool) -> Result<DoTryMatchStats, Error> {
         let start = Instant::now();
 
