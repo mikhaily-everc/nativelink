@@ -982,6 +982,8 @@ mod tests {
                 },
                 error: None,
                 message: String::new(),
+                stdout_raw: Vec::new(),
+                stderr_raw: Vec::new(),
             }
         );
         Ok(())
@@ -1163,6 +1165,8 @@ mod tests {
                 },
                 error: None,
                 message: String::new(),
+                stdout_raw: Vec::new(),
+                stderr_raw: Vec::new(),
             }
         );
         Ok(())
@@ -1397,6 +1401,8 @@ mod tests {
                 },
                 error: None,
                 message: String::new(),
+                stdout_raw: Vec::new(),
+                stderr_raw: Vec::new(),
             }
         );
         Ok(())
@@ -1844,6 +1850,8 @@ mod tests {
                 },
                 error: None,
                 message: String::new(),
+                stdout_raw: Vec::new(),
+                stderr_raw: Vec::new(),
             }
         );
         let mut dir_stream = fs::read_dir(&root_action_directory).await?;
@@ -2493,7 +2501,7 @@ exit 1
             Code::DeadlineExceeded
         );
         assert!(logs_contain(
-            "Command returned non-zero exit code exit_code=1 stdout=\"\" stderr=\"\" command=[\"true\"]"
+            "Command returned non-zero exit code exit_code=1 stdout= stderr= command=[\"true\"]"
         ));
         Ok(())
     }
@@ -2558,6 +2566,8 @@ exit 1
             },
             error: None,
             message: String::new(),
+            stdout_raw: Vec::new(),
+            stderr_raw: Vec::new(),
         };
         running_actions_manager
             .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256)
@@ -2634,6 +2644,8 @@ exit 1
             },
             error: None,
             message: String::new(),
+            stdout_raw: Vec::new(),
+            stderr_raw: Vec::new(),
         };
         running_actions_manager
             .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256)
@@ -2717,6 +2729,8 @@ exit 1
             },
             error: None,
             message: String::new(),
+            stdout_raw: Vec::new(),
+            stderr_raw: Vec::new(),
         };
         running_actions_manager
             .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256)
@@ -4141,6 +4155,8 @@ done
                 },
                 error: None,
                 message: String::new(),
+                stdout_raw: Vec::new(),
+                stderr_raw: Vec::new(),
             }
         );
         Ok(())
@@ -4815,7 +4831,7 @@ done
             static CLOCK: AtomicU64 = AtomicU64::new(0);
             monotonic_clock(&CLOCK)
         }
-        let (_, _, cas_store, ac_store) = setup_stores().await?;
+        let (filesystem_store, _, cas_store, ac_store) = setup_stores().await?;
         let root_action_directory = make_temp_path("root_action_directory");
         fs::create_dir_all(&root_action_directory).await?;
 
@@ -4826,7 +4842,8 @@ done
                     max_size_bytes: 10 * 1024 * 1024,
                     cache_root,
                 },
-                Store::new(cas_store.clone()),
+                cas_store.clone(),
+                filesystem_store.clone(),
             )
             .await?,
         );

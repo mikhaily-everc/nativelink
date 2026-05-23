@@ -94,6 +94,8 @@ fn action_result_with_error(error: Option<Error>) -> ActionResult {
         server_logs: HashMap::new(),
         error,
         message: String::new(),
+        stdout_raw: Vec::new(),
+        stderr_raw: Vec::new(),
     }
 }
 

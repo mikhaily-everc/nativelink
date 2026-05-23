@@ -21,9 +21,11 @@ use nativelink_store::grpc_store::GrpcStore;
 use nativelink_util::background_spawn;
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
+use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::store_trait::{StoreLike, UploadSizeInfo};
 use nativelink_util::telemetry::ClientHeaders;
 use opentelemetry::Context;
+use opentelemetry::context::FutureExt;
 use regex::Regex;
 use tokio::time::timeout;
 use tonic::metadata::KeyAndValueRef;
@@ -52,6 +54,7 @@ fn test_spec<T: Into<String>>(endpoint: T, use_legacy_resource_names: bool) -> G
         max_concurrent_requests: 0,
         connections_per_endpoint: 0,
         rpc_timeout_s: 1,
+        pool_wait_timeout_s: 0,
         use_legacy_resource_names,
         headers: HashMap::new(),
         forward_headers: vec![],
@@ -204,14 +207,18 @@ async fn write_update_works_core(
         tx.send(RAW_INPUT.into()).await?;
         tx.send_eof()
     };
-    let (res1, res2) = futures::join!(
-        send_fut,
-        store.update(
+    // GrpcStore::update reads DigestHasherFunc from the OTel ctx to populate
+    // the resource_name's hasher segment (the local commit that hardened this
+    // path also refuses uploads when the hasher is missing).
+    let ctx = Context::current_with_value(DigestHasherFunc::Sha256);
+    let update_fut = store
+        .update(
             digest,
             rx,
-            UploadSizeInfo::ExactSize(RAW_INPUT.len().try_into().unwrap())
+            UploadSizeInfo::ExactSize(RAW_INPUT.len().try_into().unwrap()),
         )
-    );
+        .with_context(ctx);
+    let (res1, res2) = futures::join!(send_fut, update_fut);
     res1.merge(res2)?;
 
     let write_requests = server.write_requests.lock().await;

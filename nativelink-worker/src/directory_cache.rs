@@ -28,6 +28,8 @@ use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::{FileEntry, FilesystemStore};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::fs_util::{calculate_directory_size, hardlink_directory_tree};
+#[cfg(test)]
+use nativelink_util::store_trait::StoreKey;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
@@ -639,7 +641,7 @@ mod tests {
         .unwrap();
         cas_store
             .as_pin()
-            .update_oneshot(file_digest.into(), file_content.to_vec().into())
+            .update_oneshot(StoreKey::from(file_digest), file_content.to_vec().into())
             .await?;
 
         // Build + upload the Directory proto.
@@ -663,7 +665,7 @@ mod tests {
         .unwrap();
         cas_store
             .as_pin()
-            .update_oneshot(dir_digest.into(), dir_data.into())
+            .update_oneshot(StoreKey::from(dir_digest), dir_data.into())
             .await?;
 
         Ok((cas_store, filesystem_store, dir_digest))

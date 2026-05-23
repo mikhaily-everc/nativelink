@@ -821,12 +821,13 @@ mod tests {
         }
 
         // Files stay read-only — chmoding them would corrupt a shared CAS inode.
+        // Non-executable files become 0o444 (no execute bits preserved from source).
         let file_mode = fs::metadata(test_dir.join("subdir/file2.txt"))
             .await?
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(file_mode, 0o555, "files must remain read-only");
+        assert_eq!(file_mode, 0o444, "files must remain read-only");
 
         Ok(())
     }

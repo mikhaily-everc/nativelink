@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::cas_server::WorkerApiConfig;
 use nativelink_config::schedulers::WorkerAllocationStrategy;
-use nativelink_error::{Error, ResultExt, make_err};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -385,7 +385,7 @@ pub async fn going_away_removes_worker_test() -> Result<(), Box<dyn core::error:
 
     test_context
         .scheduler
-        .remove_worker(&test_context.worker_id)
+        .remove_worker(&test_context.worker_id, make_err!(Code::Unavailable, "test: worker removed"))
         .await
         .unwrap();
 

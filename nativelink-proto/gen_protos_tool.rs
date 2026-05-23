@@ -48,8 +48,24 @@ fn main() -> std::io::Result<()> {
 
     config.skip_debug(structs_with_data_to_ignore.keys());
 
+    // Derive include path from the first input: everything up to and
+    // including "nativelink-proto/". Works both when this crate is the
+    // workspace root (path "nativelink-proto/foo.proto" -> include
+    // "nativelink-proto") and when consumed as a non-root Bzlmod dep
+    // (path "external/nativelink+/nativelink-proto/foo.proto" ->
+    // include "external/nativelink+/nativelink-proto"), since import
+    // statements inside the .proto files reference paths relative to
+    // nativelink-proto/.
+    let include = paths
+        .first()
+        .and_then(|p| {
+            const MARKER: &str = "nativelink-proto/";
+            p.rfind(MARKER).map(|i| p[..i + MARKER.len() - 1].to_string())
+        })
+        .unwrap_or_else(|| "nativelink-proto".to_string());
+
     tonic_build::configure()
         .out_dir(output_dir)
-        .compile_protos_with_config(config, &paths, &["nativelink-proto"])?;
+        .compile_protos_with_config(config, &paths, &[include])?;
     Ok(())
 }

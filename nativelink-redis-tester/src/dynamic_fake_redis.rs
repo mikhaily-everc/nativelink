@@ -49,7 +49,7 @@ impl<S: SubscriptionManagerNotify> fmt::Debug for FakeRedisBackend<S> {
     }
 }
 
-const FAKE_SCRIPT_SHA: &str = "5148c724ce419ea27d1971dcb61c111dbbc6b63e";
+const FAKE_SCRIPT_SHA: &str = "647883d1b2bb082ba8905a38f36618ada9c25607";
 
 impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
     pub fn new() -> Self {

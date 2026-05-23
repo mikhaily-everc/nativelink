@@ -68,7 +68,7 @@ async fn make_mock_store(
     make_mock_store_with_prefix(commands, String::new()).await
 }
 
-const FAKE_SCRIPT_SHA: &str = "5148c724ce419ea27d1971dcb61c111dbbc6b63e";
+const FAKE_SCRIPT_SHA: &str = "647883d1b2bb082ba8905a38f36618ada9c25607";
 
 fn add_lua_version_script(mut responses: HashMap<String, String>) -> HashMap<String, String> {
     add_lua_script(&mut responses, LUA_VERSION_SET_SCRIPT, FAKE_SCRIPT_SHA);
@@ -107,7 +107,11 @@ async fn make_mock_store_with_prefix(
         DEFAULT_SCAN_COUNT,
         DEFAULT_MAX_PERMITS,
         DEFAULT_MAX_COUNT_PER_CURSOR,
-        0,
+        // experimental_index_ttl_s — set explicitly to the default (86400s / 24h)
+        // because new_from_builder_and_parts skips the `0 → DEFAULT_INDEX_TTL_S`
+        // normalisation that `set_spec_defaults` would otherwise apply via the
+        // spec-construction path, and the FT.CREATE mock expects TEMPORARY 86400.
+        86400,
         Duration::from_secs(4),
         rx,
         manager,

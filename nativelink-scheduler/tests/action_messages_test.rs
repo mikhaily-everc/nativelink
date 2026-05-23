@@ -86,6 +86,8 @@ async fn execute_response_status_message_is_some_on_success_test() -> Result<(),
         server_logs: HashMap::default(),
         error: None,
         message: String::new(),
+        stdout_raw: Vec::new(),
+        stderr_raw: Vec::new(),
     })
     .into();
 

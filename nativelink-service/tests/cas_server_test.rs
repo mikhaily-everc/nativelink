@@ -1009,6 +1009,7 @@ fn make_cas_server_with_stall_store(delay: Duration) -> Result<CasServer, Error>
             instance_name: INSTANCE_NAME.to_string(),
             config: nativelink_config::cas_server::CasStoreConfig {
                 cas_store: "main_cas".to_string(),
+                splice_manifest_store: None,
             },
         }],
         &store_manager,

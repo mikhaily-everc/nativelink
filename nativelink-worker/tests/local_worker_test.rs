@@ -372,6 +372,8 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
         server_logs: HashMap::new(),
         error: None,
         message: String::new(),
+        stdout_raw: Vec::new(),
+        stderr_raw: Vec::new(),
     };
     let running_action = Arc::new(MockRunningAction::new());
 
