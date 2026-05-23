@@ -380,10 +380,20 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                 })
                             };
 
+                            // Build the per-action OTel context up front so it can be cloned
+                            // into (1) start_action_fut, (2) make_publish_future itself, and
+                            // (3) the background cache_action_result task. Each call site
+                            // needs Context::current() to carry the DigestHasherFunc when it
+                            // reaches GrpcStore::update, otherwise the resource_name falls
+                            // back to sha256 and VerifyStore rejects the upload as a hash
+                            // mismatch (see grpc_store::update fallback path).
+                            let publish_ctx = Context::current_with_value(digest_hasher);
+
                             let make_publish_future = {
                                 let mut grpc_client = self.grpc_client.clone();
 
                                 let running_actions_manager = self.running_actions_manager.clone();
+                                let publish_ctx_inner = publish_ctx.clone();
                                 move |res: Result<ActionResult, Error>| async move {
                                     let instance_name = maybe_instance_name
                                         .err_tip(|| "`instance_name` could not be resolved; this is likely an internal error in local_worker.")?;
@@ -427,24 +437,28 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                 let action_digest_for_log = action_digest.clone();
                                                 let mut action_result = action_result;
                                                 const BACKGROUND_CACHE_TIMEOUT: Duration = Duration::from_secs(120);
-                                                background_spawn!("cache_action_result_background", async move {
-                                                    match tokio::time::timeout(
-                                                        BACKGROUND_CACHE_TIMEOUT,
-                                                        ram.cache_action_result(digest_info, &mut action_result, digest_hasher),
-                                                    ).await {
-                                                        Ok(Ok(())) => {}
-                                                        Ok(Err(err)) => error!(
-                                                            ?err,
-                                                            action_digest = ?action_digest_for_log,
-                                                            "Error saving action in store (background)",
-                                                        ),
-                                                        Err(_) => warn!(
-                                                            action_digest = ?action_digest_for_log,
-                                                            timeout_s = BACKGROUND_CACHE_TIMEOUT.as_secs(),
-                                                            "cache_action_result timed out in background",
-                                                        ),
+                                                background_spawn!(
+                                                    span: tracing::error_span!("cache_action_result_background"),
+                                                    ctx: Some(publish_ctx_inner.clone()),
+                                                    fut: async move {
+                                                        match tokio::time::timeout(
+                                                            BACKGROUND_CACHE_TIMEOUT,
+                                                            ram.cache_action_result(digest_info, &mut action_result, digest_hasher),
+                                                        ).await {
+                                                            Ok(Ok(())) => {}
+                                                            Ok(Err(err)) => error!(
+                                                                ?err,
+                                                                action_digest = ?action_digest_for_log,
+                                                                "Error saving action in store (background)",
+                                                            ),
+                                                            Err(_) => warn!(
+                                                                action_digest = ?action_digest_for_log,
+                                                                timeout_s = BACKGROUND_CACHE_TIMEOUT.as_secs(),
+                                                                "cache_action_result timed out in background",
+                                                            ),
+                                                        }
                                                     }
-                                                });
+                                                );
                                             }
                                         },
                                         Err(e) => {
@@ -499,17 +513,20 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             actions_in_flight.fetch_add(1, Ordering::Release);
 
                             // Carry the `digest_hasher` in OTel context THROUGH the spawned
-                            // task. Using a synchronous `.attach()` guard here would only
-                            // bind the context to this thread for the duration of the
-                            // `in_scope` block; the spawned future runs LATER on a
-                            // different tokio task, where Context::current() would not
-                            // find the DigestHasherFunc and downstream code (e.g.
-                            // GrpcStore::update encoding the digest_function into the
-                            // upload's resource_name) would fall back to the default
-                            // (sha256). That mismatch with `digest_hasher` produces the
-                            // VerifyStore "hash mismatch" cascade on CAS.
-                            let ctx = Context::current_with_value(digest_hasher);
-                            let action_fut_with_ctx = start_action_fut.instrument(span).with_context(ctx);
+                            // task AND through the make_publish_future continuation. Using a
+                            // synchronous `.attach()` guard here would only bind the context to
+                            // this thread for the duration of the `in_scope` block; the spawned
+                            // future runs LATER on a different tokio task, where
+                            // Context::current() would not find the DigestHasherFunc and
+                            // downstream code (e.g. GrpcStore::update encoding the
+                            // digest_function into the upload's resource_name) would fall back
+                            // to the default (sha256). That mismatch with `digest_hasher`
+                            // produces the VerifyStore "hash mismatch" cascade on CAS. The
+                            // publish-future path also needs the ctx because it issues AC +
+                            // historical_results uploads from the .map(...) continuation, which
+                            // runs on the outer poller without inheriting the spawned task's
+                            // ctx.
+                            let action_fut_with_ctx = start_action_fut.instrument(span).with_context(publish_ctx.clone());
 
                             futures.push(
                                 spawn!("worker_start_action", action_fut_with_ctx).map(move |res| {
@@ -530,7 +547,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         error!(?err, "Error executing action");
                                     }
                                     add_future_channel
-                                        .send(make_publish_future(res).then(move |res| {
+                                        .send(make_publish_future(res).with_context(publish_ctx.clone()).then(move |res| {
                                             actions_in_flight.fetch_sub(1, Ordering::Release);
                                             actions_notify.notify_one();
                                             core::future::ready(res)

@@ -858,9 +858,30 @@ impl StoreDriver for GrpcStore {
                 digest.size_bytes(),
             )
         } else {
-            let digest_function = Context::current()
-                .get::<DigestHasherFunc>()
-                .map_or_else(default_digest_hasher_func, |v| *v)
+            // GrpcStore::update is invoked from worker upload paths that MUST carry a
+            // DigestHasherFunc in OTel context — the resource_name's digest_function
+            // segment is derived from it. The previous silent fallback to
+            // `default_digest_hasher_func()` (sha256) caused VerifyStore hash mismatches
+            // whenever an action used a different hasher (e.g. blake3) but the spawned
+            // continuation lost the ctx along the way. Fail loudly so future ctx leaks
+            // surface immediately instead of corrupting CAS uploads.
+            let digest_function = match Context::current().get::<DigestHasherFunc>() {
+                Some(v) => *v,
+                None => {
+                    error!(
+                        instance = %self.instance_name,
+                        digest_hash = %digest.packed_hash(),
+                        digest_size = digest.size_bytes(),
+                        "GrpcStore::update missing DigestHasherFunc in OTel ctx — would emit \
+                         default hasher in resource_name and cause VerifyStore mismatch; \
+                         refusing upload",
+                    );
+                    return Err(make_err!(
+                        Code::Internal,
+                        "GrpcStore::update called without DigestHasherFunc in context"
+                    ));
+                }
+            }
                 .proto_digest_func()
                 .as_str_name()
                 .to_ascii_lowercase();

@@ -41,6 +41,7 @@ use nativelink_util::store_trait::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Take};
 use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReadDirStream;
 use tracing::{debug, error, info, trace, warn};
 
@@ -51,6 +52,17 @@ use crate::cas_utils::is_zero_digest;
 const DEFAULT_BUFF_SIZE: usize = 32 * 1024;
 // Default block size of all major filesystems is 4KB
 const DEFAULT_BLOCK_SIZE: u64 = 4 * 1024;
+
+// Hard ceiling on the write-pipeline back-pressure points. We hold the
+// write_semaphore permit across an fsync (`sync_all`) on the backing PVC; under
+// realistic build load (hundreds of concurrent uploads, 24 permits) fsync
+// latency on gp3 can stretch into tens of seconds, exhausting the client's
+// `--remote_timeout=120s` budget while every leg of the FastSlowStore `join!`
+// waits for this one slow path. An 8s ceiling fails the upload with a
+// classified DeadlineExceeded long before that, so the failure mode shows up as
+// a triagable error rather than a silent stall consuming the whole client
+// budget. Healthy fsync on the dev PVC is <100ms; 8s leaves ~80× headroom.
+const FS_WRITE_DEADLINE: Duration = Duration::from_secs(8);
 
 pub const STR_FOLDER: &str = "s";
 pub const DIGEST_FOLDER: &str = "d";
@@ -805,17 +817,37 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         }
 
         let permit = if let Some(sem) = &self.write_semaphore {
-            Some(sem.acquire().await.map_err(|err| {
-                Error::from_std_err(Code::Internal, &err).append("Write semaphore closed")
-            })?)
+            let available = sem.available_permits();
+            Some(
+                timeout(FS_WRITE_DEADLINE, sem.acquire())
+                    .await
+                    .map_err(|_| {
+                        make_err!(
+                            Code::DeadlineExceeded,
+                            "filesystem write_semaphore acquire exceeded {}s ({} permits available at entry, {:?})",
+                            FS_WRITE_DEADLINE.as_secs(),
+                            available,
+                            final_key,
+                        )
+                    })?
+                    .map_err(|err| {
+                        Error::from_std_err(Code::Internal, &err).append("Write semaphore closed")
+                    })?,
+            )
         } else {
             None
         };
 
-        temp_file
-            .as_ref()
-            .sync_all()
+        timeout(FS_WRITE_DEADLINE, temp_file.as_ref().sync_all())
             .await
+            .map_err(|_| {
+                make_err!(
+                    Code::DeadlineExceeded,
+                    "filesystem sync_all exceeded {}s ({:?})",
+                    FS_WRITE_DEADLINE.as_secs(),
+                    final_key,
+                )
+            })?
             .err_tip(|| "Failed to sync_data in filesystem store")?;
 
         drop(permit);
@@ -1018,17 +1050,37 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         }
 
         let _permit = if let Some(sem) = &self.write_semaphore {
-            Some(sem.acquire().await.map_err(|err| {
-                Error::from_std_err(Code::Internal, &err).append("Write semaphore closed")
-            })?)
+            let available = sem.available_permits();
+            Some(
+                timeout(FS_WRITE_DEADLINE, sem.acquire())
+                    .await
+                    .map_err(|_| {
+                        make_err!(
+                            Code::DeadlineExceeded,
+                            "filesystem update_oneshot write_semaphore acquire exceeded {}s ({} permits available at entry, {:?})",
+                            FS_WRITE_DEADLINE.as_secs(),
+                            available,
+                            key,
+                        )
+                    })?
+                    .map_err(|err| {
+                        Error::from_std_err(Code::Internal, &err).append("Write semaphore closed")
+                    })?,
+            )
         } else {
             None
         };
 
-        temp_file
-            .as_ref()
-            .sync_all()
+        timeout(FS_WRITE_DEADLINE, temp_file.as_ref().sync_all())
             .await
+            .map_err(|_| {
+                make_err!(
+                    Code::DeadlineExceeded,
+                    "filesystem update_oneshot sync_all exceeded {}s ({:?})",
+                    FS_WRITE_DEADLINE.as_secs(),
+                    key,
+                )
+            })?
             .err_tip(|| "Failed to sync_data in filesystem store update_oneshot")?;
 
         drop(_permit);

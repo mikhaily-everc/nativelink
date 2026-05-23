@@ -51,7 +51,7 @@ use nativelink_util::store_trait::{
 };
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{error, info};
 
 use crate::cas_utils::is_zero_digest;
@@ -76,6 +76,33 @@ const DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST: usize = 5 * 1024 * 1024; // 5MB.
 // Default limit for concurrent part uploads per multipart upload.
 // Note: If you change this, adjust the docs in the config.
 const DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS: usize = 10;
+
+// Wall-clock ceiling on a single S3Store::update single-shot upload path,
+// retrier inclusive. The default `retrier` does ~5 attempts with backoff and no
+// per-call time budget, so a single S3 5xx burst can burn the whole
+// `--remote_timeout=120s` client budget — and because the AC update path
+// (memory → ref(redis) → ref(s3)) `join!`s legs, even a tiny ActionResult write
+// stalls behind this. 30s is well above healthy single-PUT latency (<1s) while
+// leaving comfortable headroom under the client timeout, so a stuck backend
+// surfaces as a classified DeadlineExceeded fast.
+const S3_SINGLE_UPLOAD_DEADLINE: Duration = Duration::from_secs(30);
+
+// Per-attempt deadlines for the multipart upload path. These wrap the leaf
+// `s3_client.<op>().send()` future itself INSIDE the `unfold(...)` retry
+// loop — never around the whole `retrier.retry(...)` — to avoid composing an
+// additional `Timeout<F>` poll-frame on top of an already-deep
+// `FastSlowStore::update → ShardStore::update → S3Store::update → upload_parts
+// → select! → FuturesUnordered → Retrier::retry → Unfold::poll_next` chain.
+// Composing over the retrier crashed CAS with `tokio-rt-worker stack overflow`
+// (exit 139); the per-attempt shape mirrors `grpc_store.rs:448, 534` and adds
+// only +1 frame at the chain's leaf.
+//
+// On `Err(Elapsed)`, the unfold returns `RetryResult::Err` (strict fail-fast)
+// so total wall-clock per `retrier.retry(...)` invocation is bounded by 1×
+// per-attempt deadline regardless of `Retrier::max_retries`.
+const S3_MULTIPART_CREATE_ATTEMPT: Duration = Duration::from_secs(15);
+const S3_MULTIPART_PART_ATTEMPT: Duration = Duration::from_secs(60);
+const S3_MULTIPART_COMPLETE_ATTEMPT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, MetricsComponent)]
 pub struct S3Store<NowFn> {
@@ -307,7 +334,7 @@ where
                 u64::try_from(self.max_retry_buffer_per_request)
                     .err_tip(|| "Could not convert max_retry_buffer_per_request to u64")?,
             );
-            return self
+            let single_upload_fut = self
                 .retrier
                 .retry(unfold(reader, move |mut reader| async move {
                     // We need to make a new pair here because the aws sdk does not give us
@@ -361,21 +388,36 @@ where
                         RetryResult::Retry(err)
                     }, |()| RetryResult::Ok(()));
                     Some((retry_result, reader))
-                }))
-                .await;
+                }));
+            return match timeout(S3_SINGLE_UPLOAD_DEADLINE, single_upload_fut).await {
+                Ok(result) => result,
+                Err(_) => Err(make_err!(
+                    Code::DeadlineExceeded,
+                    "S3Store::update single-shot upload exceeded {}s for s3_path={s3_path}",
+                    S3_SINGLE_UPLOAD_DEADLINE.as_secs(),
+                )),
+            };
         }
 
         let upload_id = &self
             .retrier
             .retry(unfold((), move |()| async move {
-                let retry_result = self
+                // Per-attempt deadline at the leaf — see S3_MULTIPART_CREATE_ATTEMPT
+                // doc-comment for why this lives inside the unfold, not over the
+                // retrier.
+                let send_fut = self
                     .s3_client
                     .create_multipart_upload()
                     .bucket(&self.bucket)
                     .key(s3_path)
-                    .send()
-                    .await
-                    .map_or_else(
+                    .send();
+                let retry_result = match timeout(S3_MULTIPART_CREATE_ATTEMPT, send_fut).await {
+                    Err(_) => RetryResult::Err(make_err!(
+                        Code::DeadlineExceeded,
+                        "create_multipart_upload exceeded {}s for s3 key (per-attempt)",
+                        S3_MULTIPART_CREATE_ATTEMPT.as_secs(),
+                    )),
+                    Ok(send_res) => send_res.map_or_else(
                         |e| {
                             RetryResult::Retry(
                                 Error::from_std_err(Code::Aborted, &e)
@@ -393,7 +435,8 @@ where
                                 RetryResult::Ok,
                             )
                         },
-                    );
+                    ),
+                };
                 Some((retry_result, ()))
             }))
             .await?;
@@ -424,7 +467,12 @@ where
 
                     tx.send(retrier.retry(unfold(write_buf, move |write_buf| {
                         async move {
-                            let retry_result = self
+                            // Per-attempt deadline at the leaf — see
+                            // S3_MULTIPART_PART_ATTEMPT doc-comment for why this
+                            // lives inside the unfold, not over the retrier.
+                            // Wrapping the whole `retrier.retry(...)` here is what
+                            // crashed CAS with `tokio-rt-worker stack overflow`.
+                            let send_fut = self
                                 .s3_client
                                 .upload_part()
                                 .bucket(&self.bucket)
@@ -432,9 +480,14 @@ where
                                 .upload_id(upload_id)
                                 .body(ByteStream::new(SdkBody::from(write_buf.clone())))
                                 .part_number(part_number)
-                                .send()
-                                .await
-                                .map_or_else(
+                                .send();
+                            let retry_result = match timeout(S3_MULTIPART_PART_ATTEMPT, send_fut).await {
+                                Err(_) => RetryResult::Err(make_err!(
+                                    Code::DeadlineExceeded,
+                                    "upload_part {part_number} exceeded {}s (per-attempt)",
+                                    S3_MULTIPART_PART_ATTEMPT.as_secs(),
+                                )),
+                                Ok(send_res) => send_res.map_or_else(
                                     |e| {
                                         RetryResult::Retry(
                                             Error::from_std_err(Code::Aborted, &e).append(format!(
@@ -453,7 +506,8 @@ where
                                                 .build(),
                                         )
                                     },
-                                );
+                                ),
+                            };
                             Some((retry_result, write_buf))
                         }
                     })))
@@ -494,31 +548,38 @@ where
 
             self.retrier
                 .retry(unfold(completed_parts, move |completed_parts| async move {
-                    Some((
-                        self.s3_client
-                            .complete_multipart_upload()
-                            .bucket(&self.bucket)
-                            .key(s3_path)
-                            .multipart_upload(
-                                CompletedMultipartUploadBuilder::default()
-                                    .set_parts(Some(completed_parts.clone()))
-                                    .build(),
-                            )
-                            .upload_id(upload_id)
-                            .send()
-                            .await
-                            .map_or_else(
-                                |e| {
-                                    RetryResult::Retry(
-                                        Error::from_std_err(Code::Aborted, &e).append(
-                                            "Failed to complete multipart upload in S3 store",
-                                        ),
-                                    )
-                                },
-                                |_| RetryResult::Ok(()),
-                            ),
-                        completed_parts,
-                    ))
+                    // Per-attempt deadline at the leaf — see
+                    // S3_MULTIPART_COMPLETE_ATTEMPT doc-comment.
+                    let send_fut = self
+                        .s3_client
+                        .complete_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(s3_path)
+                        .multipart_upload(
+                            CompletedMultipartUploadBuilder::default()
+                                .set_parts(Some(completed_parts.clone()))
+                                .build(),
+                        )
+                        .upload_id(upload_id)
+                        .send();
+                    let retry_result = match timeout(S3_MULTIPART_COMPLETE_ATTEMPT, send_fut).await {
+                        Err(_) => RetryResult::Err(make_err!(
+                            Code::DeadlineExceeded,
+                            "complete_multipart_upload exceeded {}s (per-attempt)",
+                            S3_MULTIPART_COMPLETE_ATTEMPT.as_secs(),
+                        )),
+                        Ok(send_res) => send_res.map_or_else(
+                            |e| {
+                                RetryResult::Retry(
+                                    Error::from_std_err(Code::Aborted, &e).append(
+                                        "Failed to complete multipart upload in S3 store",
+                                    ),
+                                )
+                            },
+                            |_| RetryResult::Ok(()),
+                        ),
+                    };
+                    Some((retry_result, completed_parts))
                 }))
                 .await
         };

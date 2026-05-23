@@ -439,9 +439,31 @@ where
     }
 
     async fn get_client(&self) -> Result<ClientWithPermit<C>, Error> {
+        // The redis client_permits semaphore is a fixed pool (max_client_permits,
+        // default 200) that's acquired around every redis op including the small
+        // ActionResult writes hot path. When redis pipelines/cluster are degraded,
+        // the pool drains and `acquire_owned()` queues indefinitely — that stall
+        // bubbles up as a 120s client-side DEADLINE_EXCEEDED because the AC update
+        // path (memory → ref(redis) → ref(s3)) `join!`s legs. Bound the wait so
+        // the failure mode surfaces as a classified DeadlineExceeded long before
+        // the client budget is exhausted. Healthy acquire is sub-ms; 10s leaves
+        // ample headroom under realistic backpressure.
+        const REDIS_PERMIT_DEADLINE: Duration = Duration::from_secs(10);
         let local_client_permits = self.client_permits.clone();
         let remaining = local_client_permits.available_permits();
-        let semaphore_permit = local_client_permits.acquire_owned().await?;
+        let semaphore_permit = timeout(
+            REDIS_PERMIT_DEADLINE,
+            local_client_permits.acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            make_err!(
+                Code::DeadlineExceeded,
+                "redis client_permits acquire exceeded {}s ({} permits available at entry)",
+                REDIS_PERMIT_DEADLINE.as_secs(),
+                remaining,
+            )
+        })??;
         trace!(remaining, "Got a client permit");
         let (connection_manager, uuid) = self.connection_manager.get_connection().await?;
         Ok(ClientWithPermit {
@@ -1216,10 +1238,18 @@ for i=4, #ARGV do
     indexes[i-3] = ARGV[i]
 end
 
--- In testing we witnessed redis sometimes not update our FT indexes
--- resulting in stale data. It appears if we delete our keys then insert
--- them again it works and reduces risk significantly.
-redis.call('DEL', key)
+-- RediSearch 2.0+ detects HSET on an indexed hash via the keyspace
+-- notification path and updates the doc in-place at the existing internal
+-- doc_id, so a plain HSET is the right primitive here. We previously did
+-- DEL+HSET to work around a RediSearch <2.0 race (fixed in 2020) where
+-- HSET on an indexed key sometimes did not refresh the index. Our redis
+-- image bundles RediSearch >=8.2 (fix has been in place for 5+ years).
+--
+-- The DEL+HSET pattern allocated a fresh doc_id per update and tombstoned
+-- the prior entry across every indexed field, bloating the inverted index
+-- (in prod we saw num_docs=4 vs max_doc_id=4111 — 1029x tombstones) and
+-- pushing FT.AGGREGATE latency past 1.8s, which cascaded into bazel
+-- `findMissingBlobs DEADLINE_EXCEEDED` failures at the 120s client budget.
 redis.call('HSET', key, '{DATA_FIELD_NAME}', new_data, '{VERSION_FIELD_NAME}', new_version, unpack(indexes))
 
 if ttl ~= 0 then
