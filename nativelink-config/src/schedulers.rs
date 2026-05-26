@@ -116,18 +116,21 @@ pub struct SimpleSpec {
     /// a `WaitExecution` is called after the action has completed.
     /// Default: 60 (seconds)
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub retain_completed_for_s: u32,
 
     /// Mark operations as completed with error if no client has updated them
     /// within this duration.
     /// Default: 60 (seconds)
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub client_action_timeout_s: u64,
 
     /// Remove workers from pool once the worker has not responded in this
     /// amount of time in seconds.
     /// Default: 5 (seconds)
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub worker_timeout_s: u64,
 
     /// Maximum time (seconds) an action can stay in Executing state without
@@ -138,6 +141,7 @@ pub struct SimpleSpec {
     ///
     /// Default: 0 (disabled)
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub max_action_executing_timeout_s: u64,
 
     /// If a job returns an internal error or times out this many times when
@@ -148,6 +152,7 @@ pub struct SimpleSpec {
     /// into a bad state.
     /// Default: 0 (no retries — the value is used verbatim)
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_job_retries: usize,
 
     /// The strategy used to assign workers jobs.
@@ -165,6 +170,7 @@ pub struct SimpleSpec {
         default = "default_worker_match_logging_interval_s",
         deserialize_with = "convert_duration_with_shellexpand_and_negative"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub worker_match_logging_interval_s: i64,
 
     /// Maximum number of reserve→commit matches the matcher drives
@@ -230,11 +236,13 @@ pub struct GrpcSpec {
     /// value of zero is treated as unlimited.  If the limit is reached the
     /// request is queued.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_concurrent_requests: usize,
 
     /// The number of connections to make to each specified endpoint to balance
     /// the load over multiple TCP connections.  Default 1.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub connections_per_endpoint: usize,
 }
 

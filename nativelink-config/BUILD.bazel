@@ -1,5 +1,6 @@
 load(
     "@rules_rust//rust:defs.bzl",
+    "rust_binary",
     "rust_doc",
     "rust_doc_test",
     "rust_library",
@@ -71,6 +72,54 @@ rust_test(
         "@crates//:serde_json",
         "@crates//:tracing-test",
     ],
+)
+
+rust_library(
+    name = "nativelink-config-with-schema",
+    srcs = [
+        "src/backcompat.rs",
+        "src/cas_server.rs",
+        "src/lib.rs",
+        "src/schedulers.rs",
+        "src/serde_utils.rs",
+        "src/stores.rs",
+    ],
+    compile_data = [
+        "README.md",
+    ],
+    crate_features = ["dev-schema"],
+    crate_name = "nativelink_config",
+    deps = [
+        "//nativelink-error",
+        "@crates//:byte-unit",
+        "@crates//:humantime",
+        "@crates//:rand",
+        "@crates//:schemars",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:serde_json5",
+        "@crates//:shellexpand",
+        "@crates//:tracing",
+    ],
+)
+
+rust_binary(
+    name = "build-schema",
+    srcs = ["src/bin/build_schema.rs"],
+    crate_features = ["dev-schema"],
+    deps = [
+        ":nativelink-config-with-schema",
+        "@crates//:schemars",
+        "@crates//:serde_json",
+    ],
+)
+
+genrule(
+    name = "cas_config_schema",
+    outs = ["cas_config.schema.json"],
+    cmd = "$(location :build-schema) > $@",
+    tools = [":build-schema"],
+    visibility = ["//visibility:public"],
 )
 
 rust_doc(

@@ -479,3 +479,44 @@ where
 
     deserializer.deserialize_any(DurationVisitor::<T>(PhantomData))
 }
+
+#[cfg(feature = "dev-schema")]
+pub mod schema {
+    use schemars::{JsonSchema, Schema, SchemaGenerator};
+
+    pub fn data_size(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = String::json_schema(generator);
+        schema.insert("format".into(), "data-size".into());
+        schema
+    }
+
+    pub fn data_size_opt(generator: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "anyOf": [
+                data_size(generator),
+                { "type": "null" }
+            ]
+        })
+    }
+
+    pub fn duration(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = String::json_schema(generator);
+        schema.insert("format".into(), "duration".into());
+        schema
+    }
+
+    pub fn numeric(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = String::json_schema(generator);
+        schema.insert("format".into(), "numeric".into());
+        schema
+    }
+
+    pub fn numeric_opt(generator: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "anyOf": [
+                numeric(generator),
+                { "type": "null" }
+            ]
+        })
+    }
+}

@@ -225,6 +225,7 @@ pub struct ByteStreamConfig {
         deserialize_with = "convert_data_size_with_shellexpand",
         skip_serializing_if = "is_default"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub max_bytes_per_stream: usize,
 
     /// In the event a client disconnects while uploading a blob, we will hold
@@ -238,6 +239,7 @@ pub struct ByteStreamConfig {
         deserialize_with = "convert_duration_with_shellexpand",
         skip_serializing_if = "is_default"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub persist_stream_on_disconnect_timeout: usize,
 }
 
@@ -350,6 +352,7 @@ pub struct OriginEventsSpec {
     ///
     /// Default: 65536 (zero defaults to this)
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_event_queue_size: usize,
 }
 
@@ -474,24 +477,28 @@ pub struct HttpServerConfig {
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub http2_keep_alive_interval: Option<u32>,
 
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub experimental_http2_max_pending_accept_reset_streams: Option<u32>,
 
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub experimental_http2_initial_stream_window_size: Option<u32>,
 
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub experimental_http2_initial_connection_window_size: Option<u32>,
 
     #[serde(default)]
@@ -501,12 +508,14 @@ pub struct HttpServerConfig {
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub experimental_http2_max_frame_size: Option<u32>,
 
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub experimental_http2_max_concurrent_streams: Option<u32>,
 
     /// Note: This is in seconds.
@@ -514,12 +523,14 @@ pub struct HttpServerConfig {
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub experimental_http2_keep_alive_timeout: Option<u32>,
 
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub experimental_http2_max_send_buf_size: Option<u32>,
 
     #[serde(default)]
@@ -529,6 +540,7 @@ pub struct HttpServerConfig {
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub experimental_http2_max_header_list_size: Option<u32>,
 }
 
@@ -560,6 +572,7 @@ pub struct HttpListener {
     /// Maximum number of bytes to decode on each grpc stream chunk.
     /// Default: 4 MiB
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub max_decoding_message_size: usize,
 
     /// Tls Configuration for this server.
@@ -774,6 +787,7 @@ pub struct LocalWorkerConfig {
     ///
     /// Default: 1200 (seconds / 20 mins)
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub max_action_timeout: usize,
 
     /// Maximum time allowed for uploading action results to CAS after execution
@@ -782,12 +796,14 @@ pub struct LocalWorkerConfig {
     ///
     /// Default: 600 (seconds / 10 mins)
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub max_upload_timeout: usize,
 
     /// Maximum number of inflight tasks this worker can cope with.
     ///
     /// Default: 0 (infinite tasks)
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_inflight_tasks: u64,
 
     /// If timeout is handled in `entrypoint` or another wrapper script.
@@ -898,6 +914,7 @@ pub struct DirectoryCacheConfig {
         default = "default_directory_cache_max_size_bytes",
         deserialize_with = "convert_data_size_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub max_size_bytes: u64,
 
     /// Base directory for cache storage. This directory will be managed by
@@ -934,6 +951,7 @@ pub struct GlobalConfig {
     ///
     /// Default: 24576 (= 24 * 1024)
     #[serde(deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_open_files: usize,
 
     /// Default hash function to use while uploading blobs to the CAS when not set
@@ -949,6 +967,7 @@ pub struct GlobalConfig {
     ///
     /// Default: 1024*1024 (1MiB)
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub default_digest_size_health_check: usize,
 }
 
@@ -959,6 +978,10 @@ pub type SchedulerConfig = NamedConfig<SchedulerSpec>;
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct CasConfig {
+    #[serde(rename = "$schema", default, skip_serializing)]
+    #[cfg_attr(feature = "dev-schema", schemars(skip))]
+    schema: Option<String>,
+
     /// List of stores available to use in this config.
     /// The keys can be used in other configs when needing to reference a store.
     pub stores: Vec<StoreConfig>,

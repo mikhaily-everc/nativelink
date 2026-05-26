@@ -583,6 +583,7 @@ pub struct ShardConfig {
     ///
     /// Default: 1
     #[serde(deserialize_with = "convert_optional_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub weight: Option<u32>,
 }
 
@@ -600,6 +601,7 @@ pub struct ShardSpec {
 pub struct SizePartitioningSpec {
     /// Size to partition the data on.
     #[serde(deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub size: u64,
 
     /// Store to send data when object is < (less than) size.
@@ -642,6 +644,7 @@ pub struct FilesystemSpec {
     /// to the default value except for testing.
     /// Default: 32k.
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub read_buffer_size: u32,
 
     /// Policy used to evict items out of the store. Failure to set this
@@ -654,6 +657,7 @@ pub struct FilesystemSpec {
     /// For a 4KB block size filesystem, a 1B file actually consumes 4KB
     /// Default: 4096
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub block_size: u64,
 
     /// Maximum number of concurrent write operations allowed.
@@ -664,6 +668,7 @@ pub struct FilesystemSpec {
     /// A value of 0 means unlimited (no concurrency limit).
     /// Default: 0
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_concurrent_writes: usize,
 }
 
@@ -720,6 +725,7 @@ pub struct OntapS3ExistenceCacheSpec {
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub index_path: String,
     #[serde(deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub sync_interval_seconds: u32,
     pub backend: Box<ExperimentalOntapS3Spec>,
 }
@@ -797,6 +803,7 @@ pub struct DedupSpec {
     ///
     /// Default: 65536 (64k)
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub min_size: u32,
 
     /// A best-effort attempt will be made to keep the average size
@@ -811,12 +818,14 @@ pub struct DedupSpec {
     ///
     /// Default: 262144 (256k)
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub normal_size: u32,
 
     /// Maximum size a chunk is allowed to be.
     ///
     /// Default: 524288 (512k)
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub max_size: u32,
 
     /// Due to implementation detail, we want to prefer to download
@@ -831,6 +840,7 @@ pub struct DedupSpec {
     ///
     /// Default: 10
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_concurrent_fetch_per_get: u32,
 }
 
@@ -900,6 +910,7 @@ pub struct Lz4Config {
     ///
     /// Default: 65536 (64k).
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub block_size: u32,
 
     /// Maximum size allowed to attempt to deserialize data into.
@@ -911,6 +922,7 @@ pub struct Lz4Config {
     ///
     /// Default: value in `block_size`.
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub max_decode_block_size: u32,
 }
 
@@ -954,6 +966,7 @@ pub struct EvictionPolicy {
     /// Maximum number of bytes before eviction takes place.
     /// Default: 0. Zero means never evict based on size.
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub max_bytes: usize,
 
     /// When eviction starts based on hitting `max_bytes`, continue until
@@ -961,17 +974,20 @@ pub struct EvictionPolicy {
     /// operations from thrashing when the store is close to the limit.
     /// Default: 0
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub evict_bytes: usize,
 
     /// Maximum number of seconds for an entry to live since it was last
     /// accessed before it is evicted.
     /// Default: 0. Zero means never evict based on time.
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub max_seconds: u32,
 
     /// Maximum size of the store before an eviction takes place.
     /// Default: 0. Zero means never evict based on count.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_count: u64,
 }
 
@@ -1024,6 +1040,7 @@ pub struct ExperimentalGcsSpec {
         default,
         deserialize_with = "convert_optional_data_size_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size_opt"))]
     pub resumable_chunk_size: Option<usize>,
 
     /// Common retry and upload configuration
@@ -1037,11 +1054,13 @@ pub struct ExperimentalGcsSpec {
     /// Connection timeout in milliseconds.
     /// Default: 3000
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub connection_timeout_s: u64,
 
     /// Read timeout in milliseconds.
     /// Default: 3000
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub read_timeout_s: u64,
 }
 
@@ -1064,11 +1083,13 @@ pub struct ExperimentalAzureSpec {
     /// Connection timeout in milliseconds.
     /// Default: 3000
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub connection_timeout_s: u64,
 
     /// Read timeout in milliseconds.
     /// Default: 3000
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub read_timeout_s: u64,
 }
 
@@ -1095,6 +1116,7 @@ pub struct CommonObjectSpec {
     ///
     /// Default: 0. Zero means never consider an object expired.
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub consider_expired_after_s: u32,
 
     /// The maximum buffer size to retain in case of a retryable error
@@ -1107,6 +1129,7 @@ pub struct CommonObjectSpec {
         default,
         deserialize_with = "convert_optional_data_size_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size_opt"))]
     pub max_retry_buffer_per_request: Option<usize>,
 
     /// Maximum number of concurrent `UploadPart` requests per `MultipartUpload`.
@@ -1117,6 +1140,7 @@ pub struct CommonObjectSpec {
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub multipart_max_concurrent_uploads: Option<usize>,
 
     /// Allow unencrypted HTTP connections. Only use this for local testing.
@@ -1188,29 +1212,34 @@ pub struct GrpcEndpoint {
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub concurrency_limit: Option<usize>,
 
     /// Timeout for establishing a TCP connection to the endpoint (seconds).
     /// If not set or 0, defaults to 30 seconds.
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub connect_timeout_s: u64,
 
     /// TCP keepalive interval (seconds). Sends TCP keepalive probes at this
     /// interval to detect dead connections at the OS level.
     /// If not set or 0, defaults to 30 seconds.
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub tcp_keepalive_s: u64,
 
     /// HTTP/2 keepalive interval (seconds). Sends HTTP/2 PING frames at this
     /// interval to detect dead connections at the application level.
     /// If not set or 0, defaults to 30 seconds.
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub http2_keepalive_interval_s: u64,
 
     /// HTTP/2 keepalive timeout (seconds). If a PING response is not received
     /// within this duration, the connection is considered dead.
     /// If not set or 0, defaults to 20 seconds.
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub http2_keepalive_timeout_s: u64,
 }
 
@@ -1236,11 +1265,13 @@ pub struct GrpcSpec {
     /// value of zero is treated as unlimited.  If the limit is reached the
     /// request is queued.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_concurrent_requests: usize,
 
     /// The number of connections to make to each specified endpoint to balance
     /// the load over multiple TCP connections.  Default 1.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub connections_per_endpoint: usize,
 
     /// Maximum time (seconds) allowed for a single RPC request (e.g. a
@@ -1255,6 +1286,7 @@ pub struct GrpcSpec {
     ///
     /// Default: 0 (disabled)
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub rpc_timeout_s: u64,
 
     /// Maximum time (seconds) to wait for a connection from the connection
@@ -1269,6 +1301,7 @@ pub struct GrpcSpec {
     ///
     /// Default: 0 (disabled — pool-wait shares rpc_timeout_s)
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub pool_wait_timeout_s: u64,
 
     /// Use legacy `ByteStream` resource name format, omitting the digest
@@ -1386,6 +1419,7 @@ pub struct RedisSpec {
 
     /// Deprecated as redis-rs doesn't use it
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub broadcast_channel_capacity: usize,
 
     /// The amount of time in milliseconds until the redis store considers the
@@ -1394,6 +1428,7 @@ pub struct RedisSpec {
     ///
     /// Default: 10000 (10 seconds)
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub command_timeout_ms: u64,
 
     /// The amount of time in milliseconds until the redis store considers the
@@ -1402,12 +1437,14 @@ pub struct RedisSpec {
     ///
     /// Default: 3000 (3 seconds)
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub connection_timeout_ms: u64,
 
     /// Per-call ceiling for the `check_health` PING in milliseconds.
     ///
     /// Default: 4000 (4 seconds)
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub health_check_timeout_ms: u64,
 
     /// The amount of data to read from the redis server at a time.
@@ -1421,12 +1458,14 @@ pub struct RedisSpec {
     ///
     /// Default: 64KiB
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub read_chunk_size: usize,
 
     /// The number of connections to keep open to the redis server(s).
     ///
     /// Default: 3
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub connection_pool_size: usize,
 
     /// The maximum number of upload chunks to allow per update.
@@ -1438,6 +1477,7 @@ pub struct RedisSpec {
     ///
     /// Default: 10
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_chunk_uploads_per_update: usize,
 
     /// The COUNT value passed when scanning keys in Redis.
@@ -1445,6 +1485,7 @@ pub struct RedisSpec {
     ///
     /// Default: 10000
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub scan_count: usize,
 
     /// Retry configuration to use when a network request fails.
@@ -1465,12 +1506,14 @@ pub struct RedisSpec {
     /// This stops problems with timeouts due to many, many inflight actions
     /// Default: 500
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_client_permits: usize,
 
     /// Maximum number of items returned per cursor for the search indexes
     /// May reduce thundering herd issues with worker provisioner at higher node counts,
     /// Default: 1500
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_count_per_cursor: u64,
 
     /// TTL (seconds) passed to `FT.CREATE TEMPORARY` for scheduler RediSearch
@@ -1484,6 +1527,7 @@ pub struct RedisSpec {
     ///
     /// Default: 86400 (24 hours).
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub experimental_index_ttl_s: u64,
 }
 
@@ -1529,6 +1573,7 @@ pub struct Retry {
     /// Maximum number of retries until retrying stops.
     /// Setting this to zero will always attempt 1 time, but not retry.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_retries: usize,
 
     /// Delay in seconds for exponential back off.
@@ -1594,22 +1639,26 @@ pub struct ExperimentalMongoSpec {
     /// The maximum amount of data to read from `MongoDB` in a single chunk (in bytes).
     /// Default: 65536 (64KB)
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::data_size"))]
     pub read_chunk_size: usize,
 
     /// Deprecated, unused
     /// Maximum number of concurrent uploads allowed.
     /// Default: 10
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_concurrent_uploads: usize,
 
     /// Connection timeout in milliseconds.
     /// Default: 3000
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub connection_timeout_ms: u64,
 
     /// Command timeout in milliseconds.
     /// Default: 10000
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub command_timeout_ms: u64,
 
     /// Enable `MongoDB` change streams for real-time updates.
@@ -1635,6 +1684,7 @@ pub struct ExperimentalMongoSpec {
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub write_concern_timeout_ms: Option<u32>,
 
     /// Limits the number of requests at any one time
@@ -1643,6 +1693,7 @@ pub struct ExperimentalMongoSpec {
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric_opt"))]
     pub max_requests: Option<usize>,
 }
 

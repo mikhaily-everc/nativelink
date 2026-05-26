@@ -24,7 +24,7 @@ use clap::Parser;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Either, OptionFuture, TryFutureExt, try_join_all};
 use hyper::StatusCode;
-use hyper_util::rt::tokio::TokioIo;
+use hyper_util::rt::tokio::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
@@ -517,6 +517,7 @@ async fn inner_main(
             })?;
         let tcp_listener = TcpListener::bind(&socket_addr).await?;
         let mut http = auto::Builder::new(TaskExecutor::default());
+        http.http2().timer(TokioTimer::new());
 
         let http_config = &http_config.advanced_http;
         if let Some(value) = http_config.http2_keep_alive_interval {
