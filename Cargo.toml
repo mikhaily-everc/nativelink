@@ -78,7 +78,9 @@ tonic = { version = "0.13.0", features = [
   "tls-ring",
   "transport",
 ], default-features = false }
+tonic-web = { version = "0.13.0" }
 tower = { version = "0.5.2", default-features = false }
+tower-http = { version = "0.6.6", features = ["cors"], default-features = false }
 tracing = { version = "0.1.41", default-features = false }
 
 [workspace.cargo-features-manager.keep]

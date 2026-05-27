@@ -35,7 +35,9 @@ rust_binary(
         "@crates//:tokio",
         "@crates//:tokio-rustls",
         "@crates//:tonic",
+        "@crates//:tonic-web",
         "@crates//:tower",
+        "@crates//:tower-http-0.6.6",
         "@crates//:tracing",
     ],
 )

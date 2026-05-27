@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package com.github.trace_machina.nativelink.bep;
+
+import "google/protobuf/timestamp.proto";
+
+service BuildEventSubscription {
+  rpc ListBuilds(ListBuildsRequest) returns (ListBuildsResponse);
+  rpc WatchBuild(WatchBuildRequest) returns (stream WatchBuildResponse);
+}
+
+message ListBuildsRequest {}
+
+message BuildInfo {
+  string build_id = 1;
+  string invocation_id = 2;
+  string identity = 3;
+  google.protobuf.Timestamp start_time = 4;
+  bool finished = 5;
+  string command = 6;
+  int64 event_count = 7;
+}
+
+message ListBuildsResponse {
+  repeated BuildInfo builds = 1;
+}
+
+message WatchBuildRequest {
+  string build_id = 1;
+  string invocation_id = 2;
+  int64 start_sequence = 3;
+}
+
+message WatchBuildResponse {
+  int64 sequence_number = 1;
+  bytes bazel_event = 2;
+  google.protobuf.Timestamp event_time = 3;
+}

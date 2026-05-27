@@ -37,6 +37,8 @@ use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_scheduler::default_scheduler_factory::scheduler_factory;
 use nativelink_service::ac_server::AcServer;
 use nativelink_service::bep_server::BepServer;
+use nativelink_service::bep_subscription_server::BepSubscriptionService;
+use tower_http::cors::{AllowHeaders, AllowMethods, CorsLayer};
 use nativelink_service::bytestream_server::ByteStreamServer;
 use nativelink_service::capabilities_server::CapabilitiesServer;
 use nativelink_service::cas_server::CasServer;
@@ -273,6 +275,8 @@ async fn inner_main(
             .map(CasServer::chunking_instances)
             .unwrap_or_default();
 
+        let mut bep_subscription_svc = None;
+
         let tonic_services = Routes::builder()
             .routes()
             .add_optional_service(
@@ -344,21 +348,41 @@ async fn inner_main(
                     })
                     .err_tip(|| "Could not create WorkerApi service")?,
             )
-            .add_optional_service(
-                services
+            .add_optional_service({
+                let bep_server = services
                     .experimental_bep
-                    .map_or(Ok(None), |cfg| {
-                        BepServer::new(&cfg, &store_manager)
-                            .map(|v| Some(service_setup!(v.into_service(), http_config)))
-                    })
-                    .err_tip(|| "Could not create BEP service")?,
-            );
+                    .as_ref()
+                    .map(|cfg| BepServer::new(cfg, &store_manager))
+                    .transpose()
+                    .err_tip(|| "Could not create BEP service")?;
+                if let Some(ref bep) = bep_server {
+                    let sub = BepSubscriptionService::new(
+                        bep.sender(),
+                        bep.index(),
+                        bep.store(),
+                    );
+                    let sub_svc = service_setup!(sub.into_service(), http_config);
+                    let grpc_web_layer = tonic_web::GrpcWebLayer::new();
+                    bep_subscription_svc = Some(tower::ServiceBuilder::new().layer(grpc_web_layer).service(sub_svc));
+                }
+                bep_server.map(|v| service_setup!(v.into_service(), http_config))
+            })
+            .add_optional_service(bep_subscription_svc);
 
         let health_registry = health_registry_builder.lock().await.build();
 
+        let cors = CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(AllowMethods::any())
+            .allow_headers(AllowHeaders::any())
+            .expose_headers([
+                "grpc-status".parse().unwrap(),
+                "grpc-message".parse().unwrap(),
+            ]);
         let mut svc =
             tonic_services
                 .into_axum_router()
+                .layer(cors)
                 .layer(nativelink_util::telemetry::OtlpLayer::new(
                     server_cfg.experimental_identity_header.required,
                 ));

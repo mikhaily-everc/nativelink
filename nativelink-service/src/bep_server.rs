@@ -14,6 +14,8 @@
 
 use core::pin::Pin;
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::BytesMut;
 use futures::Stream;
@@ -32,6 +34,7 @@ use nativelink_util::store_trait::{Store, StoreDriver, StoreKey, StoreLike};
 use opentelemetry::baggage::BaggageExt;
 use opentelemetry::context::Context;
 use opentelemetry_semantic_conventions::attribute::ENDUSER_ID;
+use parking_lot::RwLock;
 use prost::Message;
 use tonic::{Request, Response, Result, Status, Streaming};
 use tracing::{Level, instrument};
@@ -39,6 +42,8 @@ use tracing::{Level, instrument};
 /// Current version of the BEP event. This might be used in the future if
 /// there is a breaking change in the BEP event format.
 const BEP_EVENT_VERSION: u32 = 0;
+
+const BROADCAST_CAPACITY: usize = 4096;
 
 #[allow(clippy::result_large_err, reason = "TODO Fix this. Breaks on nightly")]
 fn get_identity() -> Option<String> {
@@ -48,9 +53,38 @@ fn get_identity() -> Option<String> {
         .map(|value| value.as_str().to_string())
 }
 
+#[derive(Debug, Clone)]
+pub struct BepEventNotification {
+    pub build_id: String,
+    pub invocation_id: String,
+    pub sequence_number: i64,
+    pub bazel_event_bytes: bytes::Bytes,
+    pub identity: String,
+    pub timestamp: Option<::prost_types::Timestamp>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildMeta {
+    pub build_id: String,
+    pub invocation_id: String,
+    pub identity: String,
+    pub start_time: Option<::prost_types::Timestamp>,
+    pub finished: bool,
+    pub command: String,
+    pub event_count: i64,
+}
+
+pub type BepIndex = HashMap<String, BuildMeta>;
+
+fn index_key(build_id: &str, invocation_id: &str) -> String {
+    format!("{build_id}:{invocation_id}")
+}
+
 #[derive(Debug)]
 pub struct BepServer {
     store: Store,
+    event_tx: tokio::sync::broadcast::Sender<BepEventNotification>,
+    index: Arc<RwLock<BepIndex>>,
 }
 
 impl BepServer {
@@ -62,11 +96,111 @@ impl BepServer {
             .get_store(&config.store)
             .err_tip(|| format!("Expected store {} to exist in store manager", &config.store))?;
 
-        Ok(Self { store })
+        let (event_tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+
+        Ok(Self {
+            store,
+            event_tx,
+            index: Arc::new(RwLock::new(HashMap::new())),
+        })
     }
 
     pub fn into_service(self) -> PublishBuildEventServer<Self> {
         PublishBuildEventServer::new(self)
+    }
+
+    pub fn sender(&self) -> tokio::sync::broadcast::Sender<BepEventNotification> {
+        self.event_tx.clone()
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<BepEventNotification> {
+        self.event_tx.subscribe()
+    }
+
+    pub fn index(&self) -> Arc<RwLock<BepIndex>> {
+        Arc::clone(&self.index)
+    }
+
+    pub fn store(&self) -> Store {
+        self.store.clone()
+    }
+
+    fn notify_event(
+        &self,
+        build_id: &str,
+        invocation_id: &str,
+        sequence_number: i64,
+        identity: &str,
+        request: &PublishBuildToolEventStreamRequest,
+    ) {
+        let (bazel_event_bytes, timestamp) = extract_bazel_event_from_request(&request);
+
+        {
+            let mut idx = self.index.write();
+            let key = index_key(build_id, invocation_id);
+            let meta = idx.entry(key).or_insert_with(|| BuildMeta {
+                build_id: build_id.to_string(),
+                invocation_id: invocation_id.to_string(),
+                identity: identity.to_string(),
+                start_time: timestamp.clone(),
+                finished: false,
+                command: String::new(),
+                event_count: 0,
+            });
+            meta.event_count = sequence_number + 1;
+        }
+
+        let _ = self.event_tx.send(BepEventNotification {
+            build_id: build_id.to_string(),
+            invocation_id: invocation_id.to_string(),
+            sequence_number,
+            bazel_event_bytes,
+            identity: identity.to_string(),
+            timestamp,
+        });
+    }
+
+    fn notify_lifecycle(
+        &self,
+        build_id: &str,
+        invocation_id: &str,
+        request: &PublishLifecycleEventRequest,
+    ) {
+        let event_type = request
+            .build_event
+            .as_ref()
+            .and_then(|obe| obe.event.as_ref())
+            .and_then(|evt| {
+                use nativelink_proto::google::devtools::build::v1::build_event::Event;
+                match &evt.event {
+                    Some(Event::InvocationAttemptFinished(_))
+                    | Some(Event::BuildFinished(_)) => Some(true),
+                    Some(Event::InvocationAttemptStarted(_)) => {
+                        let mut idx = self.index.write();
+                        let key = index_key(build_id, invocation_id);
+                        let meta = idx.entry(key).or_insert_with(|| BuildMeta {
+                            build_id: build_id.to_string(),
+                            invocation_id: invocation_id.to_string(),
+                            identity: String::new(),
+                            start_time: evt.event_time.clone(),
+                            finished: false,
+                            command: String::new(),
+                            event_count: 0,
+                        });
+                        meta.start_time = evt.event_time.clone();
+                        None
+                    }
+                    _ => None,
+                }
+            });
+
+        if let Some(true) = event_type {
+            let mut idx = self.index.write();
+            let key = index_key(build_id, invocation_id);
+            if let Some(meta) = idx.get_mut(&key) {
+                meta.finished = true;
+            }
+        }
     }
 
     async fn inner_publish_lifecycle_event(
@@ -93,7 +227,7 @@ impl BepServer {
         let bep_event = BepEvent {
             version: BEP_EVENT_VERSION,
             identity: identity.unwrap_or_default(),
-            event: Some(bep_event::Event::LifecycleEvent(request)),
+            event: Some(bep_event::Event::LifecycleEvent(request.clone())),
         };
         let mut buf = BytesMut::new();
         bep_event
@@ -104,6 +238,12 @@ impl BepServer {
             .update_oneshot(store_key.clone(), buf.freeze())
             .await
             .err_tip(|| format!("Failed to store PublishLifecycleEventRequest for {store_key}",))?;
+
+        self.notify_lifecycle(
+            &stream_id.build_id,
+            &stream_id.invocation_id,
+            &request,
+        );
 
         Ok(Response::new(()))
     }
@@ -117,6 +257,8 @@ impl BepServer {
             store: Pin<&dyn StoreDriver>,
             request: PublishBuildToolEventStreamRequest,
             identity: String,
+            event_tx: &tokio::sync::broadcast::Sender<BepEventNotification>,
+            index: &Arc<RwLock<BepIndex>>,
         ) -> Result<PublishBuildToolEventStreamResponse, Status> {
             let ordered_build_event = request
                 .ordered_build_event
@@ -132,8 +274,8 @@ impl BepServer {
 
             let bep_event = BepEvent {
                 version: BEP_EVENT_VERSION,
-                identity,
-                event: Some(bep_event::Event::BuildToolEvent(request)),
+                identity: identity.clone(),
+                event: Some(bep_event::Event::BuildToolEvent(request.clone())),
             };
             let mut buf = BytesMut::new();
 
@@ -152,6 +294,32 @@ impl BepServer {
                 .await
                 .err_tip(|| "Failed to store PublishBuildToolEventStreamRequest")?;
 
+            let (bazel_event_bytes, timestamp) = extract_bazel_event_from_request(&request);
+
+            {
+                let mut idx = index.write();
+                let key = index_key(&stream_id.build_id, &stream_id.invocation_id);
+                let meta = idx.entry(key).or_insert_with(|| BuildMeta {
+                    build_id: stream_id.build_id.clone(),
+                    invocation_id: stream_id.invocation_id.clone(),
+                    identity: identity.clone(),
+                    start_time: timestamp.clone(),
+                    finished: false,
+                    command: String::new(),
+                    event_count: 0,
+                });
+                meta.event_count = sequence_number + 1;
+            }
+
+            let _ = event_tx.send(BepEventNotification {
+                build_id: stream_id.build_id.clone(),
+                invocation_id: stream_id.invocation_id.clone(),
+                sequence_number,
+                bazel_event_bytes,
+                identity,
+                timestamp,
+            });
+
             Ok(PublishBuildToolEventStreamResponse {
                 stream_id: Some(stream_id.clone()),
                 sequence_number,
@@ -162,6 +330,8 @@ impl BepServer {
             store: Store,
             stream: Streaming<PublishBuildToolEventStreamRequest>,
             identity: String,
+            event_tx: tokio::sync::broadcast::Sender<BepEventNotification>,
+            index: Arc<RwLock<BepIndex>>,
         }
 
         let response_stream =
@@ -170,6 +340,8 @@ impl BepServer {
                     store: self.store.clone(),
                     stream,
                     identity: identity.unwrap_or_default(),
+                    event_tx: self.event_tx.clone(),
+                    index: Arc::clone(&self.index),
                 }),
                 move |maybe_state| async move {
                     let mut state = maybe_state?;
@@ -185,6 +357,8 @@ impl BepServer {
                         state.store.as_store_driver_pin(),
                         request,
                         state.identity.clone(),
+                        &state.event_tx,
+                        &state.index,
                     )
                     .await
                     .map_or_else(
@@ -236,4 +410,25 @@ impl PublishBuildEvent for BepServer {
             .await
             .map_err(Error::into)
     }
+}
+
+pub fn extract_bazel_event_from_request(
+    request: &PublishBuildToolEventStreamRequest,
+) -> (bytes::Bytes, Option<::prost_types::Timestamp>) {
+    use nativelink_proto::google::devtools::build::v1::build_event::Event;
+
+    let obe = match request.ordered_build_event.as_ref() {
+        Some(obe) => obe,
+        None => return (bytes::Bytes::new(), None),
+    };
+    let evt = match obe.event.as_ref() {
+        Some(evt) => evt,
+        None => return (bytes::Bytes::new(), None),
+    };
+    let timestamp = evt.event_time.clone();
+    let bazel_bytes = match &evt.event {
+        Some(Event::BazelEvent(any)) => bytes::Bytes::from(any.value.clone()),
+        _ => bytes::Bytes::new(),
+    };
+    (bazel_bytes, timestamp)
 }

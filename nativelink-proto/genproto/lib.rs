@@ -61,6 +61,9 @@ pub mod com {
                 pub mod remote_execution {
                     include!("com.github.trace_machina.nativelink.remote_execution.pb.rs");
                 }
+                pub mod bep {
+                    include!("com.github.trace_machina.nativelink.bep.pb.rs");
+                }
                 pub mod events {
                     include!("com.github.trace_machina.nativelink.events.pb.rs");
                 }
