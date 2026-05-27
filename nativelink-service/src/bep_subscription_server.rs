@@ -102,41 +102,17 @@ impl BuildEventSubscription for BepSubscriptionService {
                 .map_or(false, |m| m.finished)
         };
 
-        let mut replay_events = Vec::new();
-        let mut seq = if start_sequence == 0 { 1 } else { start_sequence };
-        loop {
-            let store_key = StoreKey::Str(Cow::Owned(format!(
-                "BepEvent:be:{build_id}:{invocation_id}:{seq}",
-            )));
-            match self.store.has(store_key.clone()).await {
-                Ok(Some(_)) => {
-                    if let Ok(data) = self
-                        .store
-                        .get_part_unchunked(store_key, 0, None)
-                        .await
-                    {
-                        if let Ok(bep_event) = BepEvent::decode(data.as_ref()) {
-                            let (bazel_bytes, timestamp) = extract_bazel_event(&bep_event);
-                            replay_events.push(WatchBuildResponse {
-                                sequence_number: seq,
-                                bazel_event: bazel_bytes,
-                                event_time: timestamp,
-                            });
-                        }
-                    }
-                    seq += 1;
-                }
-                _ => break,
-            }
-        }
+        let start_seq = if start_sequence == 0 { 1 } else { start_sequence };
+        let store = self.store.clone();
 
         enum Phase {
-            Replay(std::vec::IntoIter<WatchBuildResponse>),
+            Replay { next_seq: i64 },
             Live,
         }
 
         struct State {
             rx: tokio::sync::broadcast::Receiver<BepEventNotification>,
+            store: Store,
             build_id: String,
             invocation_id: String,
             phase: Phase,
@@ -146,23 +122,54 @@ impl BuildEventSubscription for BepSubscriptionService {
         let stream = unfold(
             Some(State {
                 rx,
+                store,
                 build_id: build_id.clone(),
                 invocation_id: invocation_id.clone(),
-                phase: Phase::Replay(replay_events.into_iter()),
+                phase: Phase::Replay { next_seq: start_seq },
                 finished: build_finished,
             }),
             move |maybe_state| async move {
                 let mut state = maybe_state?;
                 loop {
                     match &mut state.phase {
-                        Phase::Replay(iter) => {
-                            if let Some(event) = iter.next() {
-                                return Some((Ok(event), Some(state)));
+                        Phase::Replay { next_seq } => {
+                            let seq = *next_seq;
+                            let store_key = StoreKey::Str(Cow::Owned(format!(
+                                "BepEvent:be:{}:{}:{seq}",
+                                state.build_id, state.invocation_id,
+                            )));
+                            match state.store.has(store_key.clone()).await {
+                                Ok(Some(_)) => {
+                                    if let Ok(data) = state
+                                        .store
+                                        .get_part_unchunked(store_key, 0, None)
+                                        .await
+                                    {
+                                        if let Ok(bep_event) =
+                                            BepEvent::decode(data.as_ref())
+                                        {
+                                            let (bazel_bytes, timestamp) =
+                                                extract_bazel_event(&bep_event);
+                                            *next_seq = seq + 1;
+                                            return Some((
+                                                Ok(WatchBuildResponse {
+                                                    sequence_number: seq,
+                                                    bazel_event: bazel_bytes,
+                                                    event_time: timestamp,
+                                                }),
+                                                Some(state),
+                                            ));
+                                        }
+                                    }
+                                    *next_seq = seq + 1;
+                                }
+                                _ => {
+                                    if state.finished {
+                                        return None;
+                                    }
+                                    state.phase = Phase::Live;
+                                }
                             }
-                            if state.finished {
-                                return None;
-                            }
-                            state.phase = Phase::Live;
                         }
                         Phase::Live => match state.rx.recv().await {
                             Ok(notification) => {
