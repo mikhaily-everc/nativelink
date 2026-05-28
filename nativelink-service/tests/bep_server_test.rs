@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::time::Duration;
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt;
 use hyper::body::Frame;
@@ -21,6 +23,7 @@ use nativelink_config::cas_server::BepConfig;
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
+use nativelink_proto::com::github::trace_machina::nativelink::bep::BuildInfo;
 use nativelink_proto::com::github::trace_machina::nativelink::events::{BepEvent, bep_event};
 use nativelink_proto::google::devtools::build::v1::build_event::console_output::Output;
 use nativelink_proto::google::devtools::build::v1::build_event::{
@@ -34,7 +37,10 @@ use nativelink_proto::google::devtools::build::v1::{
     BuildEvent, BuildStatus, ConsoleOutputStream, OrderedBuildEvent,
     PublishBuildToolEventStreamRequest, PublishLifecycleEventRequest, StreamId, build_status,
 };
-use nativelink_service::bep_server::BepServer;
+use nativelink_proto::com::github::trace_machina::nativelink::bep::WatchBuildRequest;
+use nativelink_proto::com::github::trace_machina::nativelink::bep::build_event_subscription_server::BuildEventSubscription;
+use nativelink_service::bep_server::{BepServer, BuildMeta, reap_idle, rebuild_index_from_store};
+use nativelink_service::bep_subscription_server::BepSubscriptionService;
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::buf_channel::make_buf_channel_pair;
@@ -64,11 +70,14 @@ async fn make_store_manager() -> Result<Arc<StoreManager>, Error> {
     Ok(store_manager)
 }
 
-/// Utility function to construct a [`BepServer`]
+/// Utility function to construct a [`BepServer`] (reaper disabled).
 fn make_bep_server(store_manager: &StoreManager) -> Result<BepServer, Error> {
     BepServer::new(
         &BepConfig {
             store: BEP_STORE_NAME.to_string(),
+            reap_idle_seconds: 0,
+            reap_interval_seconds: 60,
+            index_store: None,
         },
         store_manager,
     )
@@ -441,5 +450,224 @@ async fn build_tool_event_stream_termination_test() -> Result<(), Box<dyn core::
         Some(bep_event::Event::BuildToolEvent(initial_request.clone()))
     );
 
+    // Stream termination must mark the build finished: a killed/crashed bazel
+    // never sends a BuildFinished lifecycle event, so the stream ending is the
+    // only signal that the build is over.
+    let meta = bep_server
+        .index()
+        .read()
+        .get(&format!(
+            "{}:{}",
+            stream_id.build_id, stream_id.invocation_id
+        ))
+        .cloned()
+        .expect("build should be present in the index");
+    assert!(
+        meta.finished,
+        "build should be marked finished after its event stream terminates"
+    );
+
+    Ok(())
+}
+
+/// The reaper marks an idle, unfinished build as finished (backstop for streams
+/// that never cleanly terminate). Driven with a synthetic `now` so it is
+/// deterministic and does not sleep.
+#[nativelink_test]
+async fn reaper_marks_idle_build_finished_test() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let bep_server = make_bep_server(&store_manager)?;
+    let bep_store = get_bep_store(&store_manager)?;
+
+    let (request_tx, mut response_stream) = async {
+        let (tx, body) = ChannelBody::new();
+        let mut codec = ProstCodec::<PublishBuildToolEventStreamRequest, _>::default();
+        let stream = Streaming::new_request(codec.decoder(), body, None, None);
+        let stream = bep_server
+            .publish_build_tool_event_stream(Request::new(stream))
+            .await
+            .err_tip(|| "While invoking publish_build_tool_event_stream")?
+            .into_inner();
+        Ok::<_, Box<dyn core::error::Error>>((tx, stream))
+    }
+    .await?;
+
+    let stream_id = StreamId {
+        build_id: "reaper-build-id".to_string(),
+        invocation_id: "reaper-invocation-id".to_string(),
+        component: BuildComponent::Controller as i32,
+    };
+    let request = PublishBuildToolEventStreamRequest {
+        ordered_build_event: Some(OrderedBuildEvent {
+            stream_id: Some(stream_id.clone()),
+            sequence_number: 1,
+            event: Some(BuildEvent {
+                event_time: Some(Timestamp::date(2024, 1, 1)?),
+                event: Some(Event::BuildEnqueued(BuildEnqueued { details: None })),
+            }),
+        }),
+        notification_keywords: vec![],
+        project_id: "p".to_string(),
+        check_preceding_lifecycle_events_present: false,
+    };
+    request_tx
+        .send(Frame::data(encode_stream_proto(&request)?))
+        .await?;
+    let _ = response_stream
+        .next()
+        .await
+        .err_tip(|| "Response stream closed unexpectedly")??;
+
+    // Keep the request stream open so Fix 1 doesn't finish the build first.
+    let index = bep_server.index();
+    let key = format!("{}:{}", stream_id.build_id, stream_id.invocation_id);
+    assert!(
+        !index.read().get(&key).expect("registered").finished,
+        "build should start unfinished while its stream is open"
+    );
+
+    // Simulate enough idle time having elapsed since the last event.
+    let idle = Duration::from_secs(900);
+    let future = Instant::now()
+        .checked_add(idle + Duration::from_secs(1))
+        .expect("instant in range");
+    reap_idle(&index, &bep_store, idle, future);
+
+    assert!(
+        index.read().get(&key).expect("still present").finished,
+        "reaper should mark the idle build finished"
+    );
+
+    drop(request_tx);
+    Ok(())
+}
+
+/// On startup the index is rebuilt from persisted `BepIndex:meta:*` keys so the
+/// build list survives a process restart.
+#[nativelink_test]
+async fn rebuild_index_from_store_test() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let bep_server = make_bep_server(&store_manager)?;
+    let store = get_bep_store(&store_manager)?;
+
+    for (build_id, invocation_id, finished, event_count) in
+        [("b1", "i1", true, 5i64), ("b2", "i2", false, 2i64)]
+    {
+        let info = BuildInfo {
+            build_id: build_id.to_string(),
+            invocation_id: invocation_id.to_string(),
+            identity: String::new(),
+            start_time: None,
+            finished,
+            command: "build".to_string(),
+            event_count,
+        };
+        store
+            .update_oneshot(
+                StoreKey::Str(Cow::Owned(format!("BepIndex:meta:{build_id}:{invocation_id}"))),
+                info.encode_to_vec().into(),
+            )
+            .await?;
+    }
+
+    let index = bep_server.index();
+    let loaded = rebuild_index_from_store(&store, &index).await?;
+    assert_eq!(loaded, 2);
+
+    let m1 = index.read().get("b1:i1").cloned().expect("b1 loaded");
+    assert!(m1.finished);
+    assert_eq!(m1.event_count, 5);
+    assert!(
+        !index.read().get("b2:i2").expect("b2 loaded").finished,
+        "persisted finished flag should be preserved"
+    );
+
+    Ok(())
+}
+
+/// watch_build replays stored events in order across multiple concurrent
+/// prefetch windows (REPLAY_BATCH = 64), stopping cleanly at the end of the
+/// contiguous run for a finished build.
+#[nativelink_test]
+async fn watch_build_replays_events_in_order_test() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let bep_server = make_bep_server(&store_manager)?;
+    let store = get_bep_store(&store_manager)?;
+
+    let build_id = "wb-build";
+    let invocation_id = "wb-inv";
+    // More than two prefetch windows, to exercise refill + end detection.
+    let total: i64 = 150;
+
+    for seq in 1..=total {
+        let request = PublishBuildToolEventStreamRequest {
+            ordered_build_event: Some(OrderedBuildEvent {
+                stream_id: Some(StreamId {
+                    build_id: build_id.to_string(),
+                    invocation_id: invocation_id.to_string(),
+                    component: BuildComponent::Controller as i32,
+                }),
+                sequence_number: seq,
+                event: Some(BuildEvent {
+                    event_time: None,
+                    event: Some(Event::BazelEvent(prost_types::Any {
+                        type_url: "type.googleapis.com/test".to_string(),
+                        value: vec![1u8],
+                    })),
+                }),
+            }),
+            notification_keywords: vec![],
+            project_id: String::new(),
+            check_preceding_lifecycle_events_present: false,
+        };
+        let bep_event = BepEvent {
+            version: 0,
+            identity: String::new(),
+            event: Some(bep_event::Event::BuildToolEvent(request)),
+        };
+        store
+            .update_oneshot(
+                StoreKey::Str(Cow::Owned(format!(
+                    "BepEvent:be:{build_id}:{invocation_id}:{seq}"
+                ))),
+                bep_event.encode_to_vec().into(),
+            )
+            .await?;
+    }
+
+    // Mark the build finished so replay terminates instead of going live.
+    let index = bep_server.index();
+    index.write().insert(
+        format!("{build_id}:{invocation_id}"),
+        BuildMeta {
+            build_id: build_id.to_string(),
+            invocation_id: invocation_id.to_string(),
+            identity: String::new(),
+            start_time: None,
+            finished: true,
+            command: String::new(),
+            event_count: total,
+            last_event_at: Instant::now(),
+        },
+    );
+
+    let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+    let service = BepSubscriptionService::new(event_tx, index, store);
+
+    let response = service
+        .watch_build(Request::new(WatchBuildRequest {
+            build_id: build_id.to_string(),
+            invocation_id: invocation_id.to_string(),
+            start_sequence: 0,
+        }))
+        .await?;
+    let mut stream = response.into_inner();
+
+    let mut seqs = Vec::new();
+    while let Some(item) = stream.next().await {
+        seqs.push(item?.sequence_number);
+    }
+
+    assert_eq!(seqs, (1..=total).collect::<Vec<_>>());
     Ok(())
 }

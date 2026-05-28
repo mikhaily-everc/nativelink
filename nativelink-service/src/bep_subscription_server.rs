@@ -14,9 +14,11 @@
 
 use core::pin::Pin;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures::Stream;
+use futures::future::join_all;
 use futures::stream::unfold;
 use nativelink_proto::com::github::trace_machina::nativelink::bep::{
     BuildInfo, ListBuildsRequest, ListBuildsResponse, WatchBuildRequest, WatchBuildResponse,
@@ -105,6 +107,13 @@ impl BuildEventSubscription for BepSubscriptionService {
         let start_seq = if start_sequence == 0 { 1 } else { start_sequence };
         let store = self.store.clone();
 
+        // Replay fetches stored events in concurrent windows of REPLAY_BATCH
+        // rather than one event per (has + get) pair. A large build's replay was
+        // otherwise bottlenecked on per-event store round-trip latency — fatal
+        // when events have aged into the slow (S3) tier (~hundreds of ms each).
+        const REPLAY_BATCH: i64 = 64;
+
+        #[derive(Clone, Copy)]
         enum Phase {
             Replay { next_seq: i64 },
             Live,
@@ -117,6 +126,10 @@ impl BuildEventSubscription for BepSubscriptionService {
             invocation_id: String,
             phase: Phase,
             finished: bool,
+            // Prefetched replay events awaiting yield, and whether the
+            // contiguous run of stored events has ended.
+            buffer: VecDeque<WatchBuildResponse>,
+            replay_ended: bool,
         }
 
         let stream = unfold(
@@ -127,49 +140,74 @@ impl BuildEventSubscription for BepSubscriptionService {
                 invocation_id: invocation_id.clone(),
                 phase: Phase::Replay { next_seq: start_seq },
                 finished: build_finished,
+                buffer: VecDeque::new(),
+                replay_ended: false,
             }),
             move |maybe_state| async move {
                 let mut state = maybe_state?;
                 loop {
-                    match &mut state.phase {
-                        Phase::Replay { next_seq } => {
-                            let seq = *next_seq;
-                            let store_key = StoreKey::Str(Cow::Owned(format!(
-                                "BepEvent:be:{}:{}:{seq}",
-                                state.build_id, state.invocation_id,
-                            )));
-                            match state.store.has(store_key.clone()).await {
-                                Ok(Some(_)) => {
-                                    if let Ok(data) = state
-                                        .store
-                                        .get_part_unchunked(store_key, 0, None)
-                                        .await
-                                    {
-                                        if let Ok(bep_event) =
-                                            BepEvent::decode(data.as_ref())
-                                        {
+                    match state.phase {
+                        Phase::Replay { mut next_seq } => {
+                            // Drain any already-prefetched event first.
+                            if let Some(resp) = state.buffer.pop_front() {
+                                return Some((Ok(resp), Some(state)));
+                            }
+                            if state.replay_ended {
+                                if state.finished {
+                                    return None;
+                                }
+                                state.phase = Phase::Live;
+                                continue;
+                            }
+                            // Fetch the next window of events concurrently.
+                            let store = state.store.clone();
+                            let keys: Vec<(i64, StoreKey<'static>)> = (next_seq
+                                ..next_seq + REPLAY_BATCH)
+                                .map(|seq| {
+                                    (
+                                        seq,
+                                        StoreKey::Str(Cow::Owned(format!(
+                                            "BepEvent:be:{}:{}:{seq}",
+                                            state.build_id, state.invocation_id,
+                                        ))),
+                                    )
+                                })
+                                .collect();
+                            let results = join_all(
+                                keys.iter()
+                                    .map(|(_, key)| store.get_part_unchunked(key.clone(), 0, None)),
+                            )
+                            .await;
+                            let mut consumed = 0i64;
+                            for ((seq, _), res) in keys.iter().zip(results) {
+                                match res {
+                                    Ok(data) => {
+                                        consumed += 1;
+                                        if let Ok(bep_event) = BepEvent::decode(data.as_ref()) {
                                             let (bazel_bytes, timestamp) =
                                                 extract_bazel_event(&bep_event);
-                                            *next_seq = seq + 1;
-                                            return Some((
-                                                Ok(WatchBuildResponse {
-                                                    sequence_number: seq,
-                                                    bazel_event: bazel_bytes,
-                                                    event_time: timestamp,
-                                                }),
-                                                Some(state),
-                                            ));
+                                            state.buffer.push_back(WatchBuildResponse {
+                                                sequence_number: *seq,
+                                                bazel_event: bazel_bytes,
+                                                event_time: timestamp,
+                                            });
                                         }
                                     }
-                                    *next_seq = seq + 1;
-                                }
-                                _ => {
-                                    if state.finished {
-                                        return None;
+                                    // A missing/erroring key ends the contiguous
+                                    // stored run.
+                                    Err(_) => {
+                                        state.replay_ended = true;
+                                        break;
                                     }
-                                    state.phase = Phase::Live;
                                 }
                             }
+                            next_seq += consumed;
+                            state.phase = Phase::Replay { next_seq };
+                            if let Some(resp) = state.buffer.pop_front() {
+                                return Some((Ok(resp), Some(state)));
+                            }
+                            // Nothing decodable this window — loop to transition
+                            // (if ended) or fetch the next window.
                         }
                         Phase::Live => match state.rx.recv().await {
                             Ok(notification) => {

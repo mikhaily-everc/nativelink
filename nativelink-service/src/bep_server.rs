@@ -13,14 +13,17 @@
 // limitations under the License.
 
 use core::pin::Pin;
+use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::BytesMut;
 use futures::Stream;
 use futures::stream::unfold;
 use nativelink_error::{Error, ResultExt};
+use nativelink_proto::com::github::trace_machina::nativelink::bep::BuildInfo;
 use nativelink_proto::com::github::trace_machina::nativelink::events::{BepEvent, bep_event};
 use nativelink_proto::google::devtools::build::v1::publish_build_event_server::{
     PublishBuildEvent, PublishBuildEventServer,
@@ -30,7 +33,10 @@ use nativelink_proto::google::devtools::build::v1::{
     PublishLifecycleEventRequest,
 };
 use nativelink_store::store_manager::StoreManager;
+use nativelink_util::background_spawn;
+use nativelink_util::spawn;
 use nativelink_util::store_trait::{Store, StoreDriver, StoreKey, StoreLike};
+use nativelink_util::task::JoinHandleDropGuard;
 use opentelemetry::baggage::BaggageExt;
 use opentelemetry::context::Context;
 use opentelemetry_semantic_conventions::attribute::ENDUSER_ID;
@@ -72,6 +78,9 @@ pub struct BuildMeta {
     pub finished: bool,
     pub command: String,
     pub event_count: i64,
+    /// Wall-clock time the most recent event for this build was ingested.
+    /// Used by the reaper to detect abandoned builds. Not serialized.
+    pub last_event_at: Instant,
 }
 
 pub type BepIndex = HashMap<String, BuildMeta>;
@@ -80,11 +89,121 @@ fn index_key(build_id: &str, invocation_id: &str) -> String {
     format!("{build_id}:{invocation_id}")
 }
 
+/// Mark a build `finished` in the index. Called when a build's event stream
+/// terminates (clean close or disconnect) — the only signal a killed/crashed
+/// bazel emits, since it never sends a terminal lifecycle event.
+fn mark_finished(index: &Arc<RwLock<BepIndex>>, store: &Store, seen: Option<&(String, String)>) {
+    if let Some((build_id, invocation_id)) = seen {
+        let mut idx = index.write();
+        if let Some(meta) = idx.get_mut(&index_key(build_id, invocation_id)) {
+            meta.finished = true;
+            persist_meta(store, meta);
+        }
+    }
+}
+
+/// Mark every unfinished build with no events since `now - idle` as finished
+/// and persist it. Separated from the timer loop so it can be unit-tested
+/// deterministically with a synthetic `now`.
+pub fn reap_idle(index: &Arc<RwLock<BepIndex>>, store: &Store, idle: Duration, now: Instant) {
+    let mut idx = index.write();
+    for meta in idx.values_mut() {
+        if !meta.finished && now.saturating_duration_since(meta.last_event_at) >= idle {
+            meta.finished = true;
+            persist_meta(store, meta);
+        }
+    }
+}
+
+/// Persist a build's metadata under `BepIndex:meta:{build}:{invocation}` so the
+/// index can be rebuilt after a process restart. Fire-and-forget — the build
+/// list is best-effort and a failed write just means one fewer build after a
+/// restart.
+fn persist_meta(store: &Store, meta: &BuildMeta) {
+    let info = BuildInfo {
+        build_id: meta.build_id.clone(),
+        invocation_id: meta.invocation_id.clone(),
+        identity: meta.identity.clone(),
+        start_time: meta.start_time.clone(),
+        finished: meta.finished,
+        command: meta.command.clone(),
+        event_count: meta.event_count,
+    };
+    let mut buf = BytesMut::new();
+    if let Err(e) = info.encode(&mut buf) {
+        tracing::warn!("Could not encode BEP index meta: {e:?}");
+        return;
+    }
+    let key = StoreKey::Str(Cow::Owned(format!(
+        "BepIndex:meta:{}:{}",
+        meta.build_id, meta.invocation_id
+    )));
+    let store = store.clone();
+    let bytes = buf.freeze();
+    background_spawn!("bep_persist_meta", async move {
+        if let Err(e) = store.update_oneshot(key, bytes).await {
+            tracing::warn!("Failed to persist BEP index meta: {e:?}");
+        }
+    });
+}
+
+/// Repopulate `index` from `BepIndex:meta:*` keys in an enumerable store.
+/// Returns the number of builds loaded. Used on startup so the build list
+/// survives a restart. Existing in-memory entries are not overwritten.
+pub async fn rebuild_index_from_store(
+    store: &Store,
+    index: &Arc<RwLock<BepIndex>>,
+) -> Result<u64, Error> {
+    // Bounded range so an enumerable backend (e.g. redis SCAN) only walks the
+    // meta keys, not the far larger BepEvent:be:* set. ';' is the byte after ':'.
+    let start = StoreKey::Str(Cow::Borrowed("BepIndex:meta:"));
+    let end = StoreKey::Str(Cow::Borrowed("BepIndex:meta;"));
+    let mut keys: Vec<String> = Vec::new();
+    store
+        .list(start..end, |key| {
+            if let StoreKey::Str(s) = key {
+                keys.push(s.to_string());
+            }
+            true
+        })
+        .await
+        .err_tip(|| "While listing BepIndex:meta keys")?;
+
+    let mut loaded = 0u64;
+    for key in keys {
+        let Ok(bytes) = store
+            .get_part_unchunked(StoreKey::Str(Cow::Owned(key)), 0, None)
+            .await
+        else {
+            continue;
+        };
+        let Ok(info) = BuildInfo::decode(bytes.as_ref()) else {
+            continue;
+        };
+        let meta = BuildMeta {
+            build_id: info.build_id,
+            invocation_id: info.invocation_id,
+            identity: info.identity,
+            start_time: info.start_time,
+            finished: info.finished,
+            command: info.command,
+            event_count: info.event_count,
+            last_event_at: Instant::now(),
+        };
+        let key = index_key(&meta.build_id, &meta.invocation_id);
+        index.write().entry(key).or_insert(meta);
+        loaded += 1;
+    }
+    Ok(loaded)
+}
+
 #[derive(Debug)]
 pub struct BepServer {
     store: Store,
     event_tx: tokio::sync::broadcast::Sender<BepEventNotification>,
     index: Arc<RwLock<BepIndex>>,
+    /// Held so the periodic reaper task is aborted when the server is dropped.
+    _reaper: Option<JoinHandleDropGuard<()>>,
 }
 
 impl BepServer {
@@ -97,11 +216,49 @@ impl BepServer {
             .err_tip(|| format!("Expected store {} to exist in store manager", &config.store))?;
 
         let (event_tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+        let index = Arc::new(RwLock::new(HashMap::new()));
+
+        // Reaper: periodically mark abandoned (no-events-for-a-while, never
+        // finished) builds as finished so they don't spin in the UI forever.
+        // Backstops the stream-end detection in publish_build_tool_event_stream
+        // for cases where the transport never cleanly closes (half-open socket).
+        let reaper = if config.reap_idle_seconds > 0 {
+            let reaper_index = Arc::clone(&index);
+            let reaper_store = store.clone();
+            let idle = Duration::from_secs(u64::from(config.reap_idle_seconds));
+            let tick = Duration::from_secs(u64::from(config.reap_interval_seconds.max(1)));
+            Some(spawn!("bep_index_reaper", async move {
+                let mut ticker = tokio::time::interval(tick);
+                loop {
+                    ticker.tick().await;
+                    reap_idle(&reaper_index, &reaper_store, idle, Instant::now());
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Rebuild the index from a persisted store on startup so the build list
+        // survives a process restart. Runs in the background; until it
+        // finishes, ListBuilds simply returns the builds loaded so far.
+        if let Some(index_store_name) = config.index_store.as_ref() {
+            let rebuild_store = store_manager.get_store(index_store_name).err_tip(|| {
+                format!("Expected index_store {index_store_name} to exist in store manager")
+            })?;
+            let rebuild_index = Arc::clone(&index);
+            background_spawn!("bep_index_rebuild", async move {
+                match rebuild_index_from_store(&rebuild_store, &rebuild_index).await {
+                    Ok(n) => tracing::info!("Rebuilt BEP build index with {n} build(s)"),
+                    Err(e) => tracing::warn!("Failed to rebuild BEP build index: {e:?}"),
+                }
+            });
+        }
 
         Ok(Self {
             store,
             event_tx,
-            index: Arc::new(RwLock::new(HashMap::new())),
+            index,
+            _reaper: reaper,
         })
     }
 
@@ -146,8 +303,10 @@ impl BepServer {
                 finished: false,
                 command: String::new(),
                 event_count: 0,
+                last_event_at: Instant::now(),
             });
             meta.event_count = sequence_number + 1;
+            meta.last_event_at = Instant::now();
         }
 
         let _ = self.event_tx.send(BepEventNotification {
@@ -186,6 +345,7 @@ impl BepServer {
                             finished: false,
                             command: String::new(),
                             event_count: 0,
+                            last_event_at: Instant::now(),
                         });
                         meta.start_time = evt.event_time.clone();
                         None
@@ -199,6 +359,7 @@ impl BepServer {
             let key = index_key(build_id, invocation_id);
             if let Some(meta) = idx.get_mut(&key) {
                 meta.finished = true;
+                persist_meta(&self.store, meta);
             }
         }
     }
@@ -307,8 +468,10 @@ impl BepServer {
                     finished: false,
                     command: String::new(),
                     event_count: 0,
+                    last_event_at: Instant::now(),
                 });
                 meta.event_count = sequence_number + 1;
+                meta.last_event_at = Instant::now();
             }
 
             let _ = event_tx.send(BepEventNotification {
@@ -332,6 +495,9 @@ impl BepServer {
             identity: String,
             event_tx: tokio::sync::broadcast::Sender<BepEventNotification>,
             index: Arc<RwLock<BepIndex>>,
+            // (build_id, invocation_id) of this stream, captured from the first
+            // event so we can mark the build finished when the stream ends.
+            seen: Option<(String, String)>,
         }
 
         let response_stream =
@@ -342,6 +508,7 @@ impl BepServer {
                     identity: identity.unwrap_or_default(),
                     event_tx: self.event_tx.clone(),
                     index: Arc::clone(&self.index),
+                    seen: None,
                 }),
                 move |maybe_state| async move {
                     let mut state = maybe_state?;
@@ -350,9 +517,29 @@ impl BepServer {
                             || "While receiving message in publish_build_tool_event_stream",
                         ) {
                             Ok(Some(request)) => request,
-                            Ok(None) => return None,
-                            Err(e) => return Some((Err(e.into()), None)),
+                            // Stream closed cleanly or errored (client crash /
+                            // Ctrl-C). Either way the build is over — mark it
+                            // finished so it doesn't stay "active" forever.
+                            Ok(None) => {
+                                mark_finished(&state.index, &state.store, state.seen.as_ref());
+                                return None;
+                            }
+                            Err(e) => {
+                                mark_finished(&state.index, &state.store, state.seen.as_ref());
+                                return Some((Err(e.into()), None));
+                            }
                         };
+                    // Remember which build this stream belongs to.
+                    if let Some(stream_id) = request
+                        .ordered_build_event
+                        .as_ref()
+                        .and_then(|obe| obe.stream_id.as_ref())
+                    {
+                        state.seen = Some((
+                            stream_id.build_id.clone(),
+                            stream_id.invocation_id.clone(),
+                        ));
+                    }
                     process_request(
                         state.store.as_store_driver_pin(),
                         request,

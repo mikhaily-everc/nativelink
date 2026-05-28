@@ -316,6 +316,36 @@ pub struct BepConfig {
     /// The store name referenced in the `stores` map in the main config.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub store: StoreRefName,
+
+    /// Mark an in-progress build `finished` if no new events arrive for this
+    /// many seconds. This reaps builds whose bazel process was killed/crashed
+    /// and never sent a terminal lifecycle event (otherwise they stay "active"
+    /// forever). Set to 0 to disable the reaper.
+    ///
+    /// Default: 600
+    #[serde(default = "default_bep_reap_idle_seconds")]
+    pub reap_idle_seconds: u32,
+
+    /// How often, in seconds, the reaper scans the build index.
+    ///
+    /// Default: 60
+    #[serde(default = "default_bep_reap_interval_seconds")]
+    pub reap_interval_seconds: u32,
+
+    /// Optional name of an enumerable store (e.g. a `redis_store`) used to
+    /// rebuild the in-memory build index on startup, so the build list survives
+    /// a process restart. The store must implement key listing. If unset, the
+    /// index starts empty (the prior behavior).
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub index_store: Option<StoreRefName>,
+}
+
+const fn default_bep_reap_idle_seconds() -> u32 {
+    600
+}
+
+const fn default_bep_reap_interval_seconds() -> u32 {
+    60
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]

@@ -37,7 +37,7 @@ the three OCI push targets, so building, pushing to ECR, injecting fresh
 digests, and `kubectl apply` all happen in a single invocation:
 
 ```bash
-aspect rbe apply
+aspect rbe
 ```
 
 Do NOT run `aspect run //tools/rbe/oci:push_all` or `aspect build` on the
