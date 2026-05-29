@@ -15,7 +15,9 @@ Fork of [TraceMachina/nativelink](https://github.com/TraceMachina/nativelink) wi
 
 ## Branch
 
-`fix/bytestream-write-resume-v3` — based on upstream `main`, rebased periodically.
+`main` — our fork's `main` carries the patches above on top of upstream `main`. It
+fetch-tracks `origin/main` (TraceMachina upstream) so updates are a plain `git pull`, and
+pushes to `fork/main` (our mikhaily-everc mirror). See "Updating from Upstream" below.
 
 ## Building and Pushing Images
 
