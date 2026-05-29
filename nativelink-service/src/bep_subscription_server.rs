@@ -79,6 +79,8 @@ impl BuildEventSubscription for BepSubscriptionService {
                 finished: meta.finished,
                 command: meta.command.clone(),
                 event_count: meta.event_count,
+                task_id: meta.task_id.clone(),
+                task_name: meta.task_name.clone(),
             })
             .collect();
         Ok(Response::new(ListBuildsResponse { builds }))

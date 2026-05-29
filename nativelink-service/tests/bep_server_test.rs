@@ -561,6 +561,8 @@ async fn rebuild_index_from_store_test() -> Result<(), Box<dyn core::error::Erro
             finished,
             command: "build".to_string(),
             event_count,
+            task_id: String::new(),
+            task_name: String::new(),
         };
         store
             .update_oneshot(
@@ -647,6 +649,8 @@ async fn watch_build_replays_events_in_order_test() -> Result<(), Box<dyn core::
             finished: true,
             command: String::new(),
             event_count: total,
+            task_id: String::new(),
+            task_name: String::new(),
             last_event_at: Instant::now(),
         },
     );

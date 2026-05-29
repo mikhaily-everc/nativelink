@@ -19,6 +19,10 @@ message BuildInfo {
   bool finished = 5;
   string command = 6;
   int64 event_count = 7;
+  // Aspect task id/name from the BuildMetadata BEP event's `metadata` map
+  // (keys ASPECT_TASK_ID / ASPECT_TASK_NAME). Empty if the build emitted none.
+  string task_id = 8;
+  string task_name = 9;
 }
 
 message ListBuildsResponse {

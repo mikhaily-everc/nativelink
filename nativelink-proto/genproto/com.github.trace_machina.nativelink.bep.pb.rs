@@ -17,6 +17,10 @@ pub struct BuildInfo {
     pub command: ::prost::alloc::string::String,
     #[prost(int64, tag = "7")]
     pub event_count: i64,
+    #[prost(string, tag = "8")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub task_name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListBuildsResponse {

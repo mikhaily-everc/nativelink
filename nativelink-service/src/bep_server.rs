@@ -23,6 +23,7 @@ use bytes::BytesMut;
 use futures::Stream;
 use futures::stream::unfold;
 use nativelink_error::{Error, ResultExt};
+use nativelink_proto::build_event_stream::{self, build_event};
 use nativelink_proto::com::github::trace_machina::nativelink::bep::BuildInfo;
 use nativelink_proto::com::github::trace_machina::nativelink::events::{BepEvent, bep_event};
 use nativelink_proto::google::devtools::build::v1::publish_build_event_server::{
@@ -78,6 +79,10 @@ pub struct BuildMeta {
     pub finished: bool,
     pub command: String,
     pub event_count: i64,
+    /// Aspect task id/name from the BuildMetadata BEP event (keys
+    /// ASPECT_TASK_ID / ASPECT_TASK_NAME). Empty until that event arrives.
+    pub task_id: String,
+    pub task_name: String,
     /// Wall-clock time the most recent event for this build was ingested.
     /// Used by the reaper to detect abandoned builds. Not serialized.
     pub last_event_at: Instant,
@@ -128,6 +133,8 @@ fn persist_meta(store: &Store, meta: &BuildMeta) {
         finished: meta.finished,
         command: meta.command.clone(),
         event_count: meta.event_count,
+        task_id: meta.task_id.clone(),
+        task_name: meta.task_name.clone(),
     };
     let mut buf = BytesMut::new();
     if let Err(e) = info.encode(&mut buf) {
@@ -188,6 +195,8 @@ pub async fn rebuild_index_from_store(
             finished: info.finished,
             command: info.command,
             event_count: info.event_count,
+            task_id: info.task_id,
+            task_name: info.task_name,
             last_event_at: Instant::now(),
         };
         let key = index_key(&meta.build_id, &meta.invocation_id);
@@ -303,6 +312,8 @@ impl BepServer {
                 finished: false,
                 command: String::new(),
                 event_count: 0,
+                task_id: String::new(),
+                task_name: String::new(),
                 last_event_at: Instant::now(),
             });
             meta.event_count = sequence_number + 1;
@@ -345,6 +356,8 @@ impl BepServer {
                             finished: false,
                             command: String::new(),
                             event_count: 0,
+                            task_id: String::new(),
+                            task_name: String::new(),
                             last_event_at: Instant::now(),
                         });
                         meta.start_time = evt.event_time.clone();
@@ -457,6 +470,17 @@ impl BepServer {
 
             let (bazel_event_bytes, timestamp) = extract_bazel_event_from_request(&request);
 
+            // The BuildMetadata BEP event carries Aspect's task id/name; capture
+            // them so the build list can show a friendly label instead of the
+            // invocation hash. Only that payload has them; others decode to None.
+            let aspect_metadata =
+                build_event_stream::BuildEvent::decode(bazel_event_bytes.as_ref())
+                    .ok()
+                    .and_then(|event| match event.payload {
+                        Some(build_event::Payload::BuildMetadata(m)) => Some(m.metadata),
+                        _ => None,
+                    });
+
             {
                 let mut idx = index.write();
                 let key = index_key(&stream_id.build_id, &stream_id.invocation_id);
@@ -468,10 +492,20 @@ impl BepServer {
                     finished: false,
                     command: String::new(),
                     event_count: 0,
+                    task_id: String::new(),
+                    task_name: String::new(),
                     last_event_at: Instant::now(),
                 });
                 meta.event_count = sequence_number + 1;
                 meta.last_event_at = Instant::now();
+                if let Some(metadata) = aspect_metadata {
+                    if let Some(id) = metadata.get("ASPECT_TASK_ID") {
+                        meta.task_id = id.clone();
+                    }
+                    if let Some(name) = metadata.get("ASPECT_TASK_NAME") {
+                        meta.task_name = name.clone();
+                    }
+                }
             }
 
             let _ = event_tx.send(BepEventNotification {
