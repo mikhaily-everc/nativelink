@@ -505,6 +505,15 @@ impl BepServer {
                     if let Some(name) = metadata.get("ASPECT_TASK_NAME") {
                         meta.task_name = name.clone();
                     }
+                    // A Claude Code session tags its builds with
+                    // `--build_metadata=CLAUDE_CODE_SESSION_ID=...` so the
+                    // claude-statusline can filter ListBuilds to its own builds.
+                    // Surface it through the existing `identity` field (no proto
+                    // change). The OTel-baggage identity isn't populated for BES
+                    // streams, so this is the authoritative source when present.
+                    if let Some(session) = metadata.get("CLAUDE_CODE_SESSION_ID") {
+                        meta.identity = session.clone();
+                    }
                 }
             }
 

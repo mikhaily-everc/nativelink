@@ -20,7 +20,7 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use bytes::BytesMut;
 use futures::future::pending;
@@ -361,17 +361,6 @@ pub struct ByteStreamServer {
 }
 
 impl ByteStreamServer {
-    /// Generate a unique UUID key by `XOR`ing the base key with a nanosecond timestamp.
-    /// This ensures virtually zero collision probability while being O(1).
-    fn generate_unique_uuid_key(base_key: UuidKey) -> UuidKey {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        // XOR with timestamp to create unique key
-        base_key ^ timestamp
-    }
-
     pub fn new(
         configs: &[WithInstanceName<ByteStreamConfig>],
         store_manager: &StoreManager,
@@ -477,83 +466,93 @@ impl ByteStreamServer {
     /// Creates or joins an upload stream for the given UUID.
     ///
     /// This function handles three scenarios:
-    /// 1. UUID doesn't exist - creates a new upload stream
-    /// 2. UUID exists but is idle - resumes the existing stream
-    /// 3. UUID exists and is active - generates a unique UUID by appending a nanosecond
-    ///    timestamp to avoid collision, then creates a new stream with that UUID
-    ///
-    /// The nanosecond timestamp ensures virtually zero probability of collision since
-    /// two concurrent uploads would need to both collide on the original UUID AND
-    /// generate the unique UUID in the exact same nanosecond.
+    /// 1. UUID doesn't exist - creates a new upload stream.
+    /// 2. UUID exists but is idle - resumes the existing stream, continuing the
+    ///    SAME in-progress `store.update` at its current `committed_size`. This is
+    ///    the legitimate resume path: a client (e.g. Bazel) that was interrupted
+    ///    calls `QueryWriteStatus` and resumes `Write` at `write_offset ==
+    ///    committed_size` (NOT at 0), which exactly matches `tx.get_bytes_written()`.
+    /// 3. UUID exists and is still active - a second connection collided with an
+    ///    in-flight stream (typically a retry routed back to this pod before the
+    ///    dead connection was reclaimed). We cannot adopt the live stream's
+    ///    `store_update_fut`, and a non-zero resume cannot be served by a fresh
+    ///    `store.update` (the head bytes `[0..committed_size)` would be missing).
+    ///    So we reject with a RETRIABLE error: the client retries, and once the
+    ///    stale stream is reclaimed (drops to idle within
+    ///    `persist_stream_on_disconnect_timeout`, default 1 min) the retry lands on
+    ///    Case 2 and resumes correctly at `committed_size`.
     fn create_or_join_upload_stream(
         &self,
         uuid_str: &str,
         instance: &InstanceInfo,
         digest: DigestInfo,
-    ) -> ActiveStreamGuard {
+    ) -> Result<ActiveStreamGuard, Error> {
         // Parse UUID string to u128 key for efficient HashMap operations
         let uuid_key = parse_uuid_to_key(uuid_str);
 
-        let (uuid, bytes_received, is_collision) =
-            match instance.active_uploads.lock().entry(uuid_key) {
-                Entry::Occupied(mut entry) => {
-                    let original_key = *entry.key();
-                    if entry.get().1.is_some() {
-                        // Case 2: Stream exists but is idle, we can resume it
-                        let val = entry.get_mut();
-                        let idle_stream = val.1.take().unwrap();
-                        let bytes_received = val.0.clone();
-                        info!(
-                            msg = "Joining existing stream",
-                            uuid = format!("{:032x}", original_key)
-                        );
-                        // Track resumed upload
-                        instance
-                            .metrics
-                            .resumed_uploads
-                            .fetch_add(1, Ordering::Relaxed);
-                        return idle_stream.into_active_stream(bytes_received, instance);
-                    }
-                    // Case 3: Stream is active - likely a resume after connection reset.
-                    // The original stream's connection died but hasn't been cleaned up yet.
-                    // Replace the entry so the new stream takes over the UUID slot.
-                    // The old stream's Arc becomes orphaned and is freed when its task exits.
-                    // The orphaned `store_update_fut` keeps writing to `digest`, so this
-                    // path can produce two concurrent CAS writes for the same key —
-                    // keep `digest` queryable in logs to correlate with downstream
-                    // SpliceBlob `Code::DataLoss` events on chunk content corruption.
-                    let current_bytes = entry.get().0.load(Ordering::Acquire);
-                    let bytes_received = Arc::new(AtomicU64::new(current_bytes));
-                    entry.insert((bytes_received.clone(), None));
+        // Hold a single lock guard for the whole decision. We must NOT re-lock
+        // `active_uploads` inside this scope: it is a non-reentrant mutex, and
+        // re-locking deadlocks when an NLB routes an upload retry back to the
+        // same pod — that was the original UUID-collision deadlock.
+        let mut active_uploads = instance.active_uploads.lock();
+        let (uuid, bytes_received) = match active_uploads.entry(uuid_key) {
+            Entry::Occupied(mut entry) => {
+                let original_key = *entry.key();
+                if entry.get().1.is_none() {
+                    // Case 3: Stream is active on another connection. Reject with a
+                    // retriable status instead of corrupting the blob with a fresh,
+                    // misaligned store write. `Code::Aborted` signals a concurrency
+                    // conflict and is in every client's gRPC retry set, so the client
+                    // re-attempts and resumes via Case 2 once the stale stream drops
+                    // to idle. We mutate nothing here — the live stream owns its slot
+                    // and cleans it up itself.
                     warn!(
-                        msg = "UUID collision detected, replacing existing stream",
-                        original_uuid = format!("{:032x}", original_key),
-                        bytes_received = current_bytes,
+                        msg = "UUID collision with an active stream; rejecting as retriable",
+                        uuid = format!("{:032x}", original_key),
                         digest = %digest,
                     );
-                    (original_key, bytes_received, true)
+                    instance
+                        .metrics
+                        .uuid_collisions
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(make_err!(
+                        Code::Aborted,
+                        "An upload for this resource is already in progress; retry to resume",
+                    ));
                 }
-                Entry::Vacant(entry) => {
-                    // Case 1: UUID doesn't exist, create new stream
-                    let bytes_received = Arc::new(AtomicU64::new(0));
-                    let uuid = *entry.key();
-                    // Our stream is "in use" if the key is in the map, but the value is None.
-                    entry.insert((bytes_received.clone(), None));
-                    (uuid, bytes_received, false)
-                }
-            };
+                // Case 2: Stream exists but is idle, we can resume it. Continue the
+                // existing `store_update_fut` from its current `committed_size`.
+                let val = entry.get_mut();
+                let idle_stream = val.1.take().unwrap();
+                let bytes_received = val.0.clone();
+                info!(
+                    msg = "Joining existing stream",
+                    uuid = format!("{:032x}", original_key)
+                );
+                // Track resumed upload. `into_active_stream` does not touch the
+                // map, so holding the guard across this return is fine.
+                instance
+                    .metrics
+                    .resumed_uploads
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(idle_stream.into_active_stream(bytes_received, instance));
+            }
+            Entry::Vacant(entry) => {
+                // Case 1: UUID doesn't exist, create new stream.
+                let bytes_received = Arc::new(AtomicU64::new(0));
+                let uuid = *entry.key();
+                // Our stream is "in use" if the key is in the map, but the value is None.
+                entry.insert((bytes_received.clone(), None));
+                (uuid, bytes_received)
+            }
+        };
+        drop(active_uploads);
 
         // Track metrics for new upload
         instance
             .metrics
             .active_uploads
             .fetch_add(1, Ordering::Relaxed);
-        if is_collision {
-            instance
-                .metrics
-                .uuid_collisions
-                .fetch_add(1, Ordering::Relaxed);
-        }
 
         // Important: Do not return an error from this point onwards without
         // removing the entry from the map, otherwise that UUID becomes
@@ -569,7 +568,7 @@ impl ByteStreamServer {
                 .update(digest, rx, UploadSizeInfo::ExactSize(digest.size_bytes()))
                 .await
         });
-        ActiveStreamGuard {
+        Ok(ActiveStreamGuard {
             stream_state: Some(StreamState {
                 uuid,
                 tx,
@@ -578,7 +577,7 @@ impl ByteStreamServer {
             bytes_received,
             active_uploads: instance.active_uploads.clone(),
             metrics: instance.metrics.clone(),
-        }
+        })
     }
 
     async fn inner_read(
@@ -765,26 +764,20 @@ impl ByteStreamServer {
                             .unwrap_or(usize::MAX)..,
                     )
                 } else {
-                    if write_offset > tx.get_bytes_written() {
-                        // Client is ahead of server — either a resume after UUID
-                        // collision or chunks arrived out of order through NLB/h2.
-                        // Accept the data to avoid failing the upload; the blob
-                        // will fail hash verification if bytes are truly missing.
-                        warn!(
-                            msg = "Write offset ahead of bytes_written, accepting data",
-                            write_offset = write_offset,
-                            bytes_written = tx.get_bytes_written()
-                        );
-                        write_request.data
-                    } else if write_offset < tx.get_bytes_written() {
+                    // write_offset >= bytes_written here. Only an exact match is
+                    // valid: a gap (write_offset > bytes_written) cannot be safely
+                    // absorbed because the missing head bytes would never reach the
+                    // store, producing a short/misaligned blob that only fails later
+                    // at hash verification (after wasting the whole upload). Reject
+                    // it so the client restarts from a known offset.
+                    if write_offset != tx.get_bytes_written() {
                         return Err(make_input_err!(
                             "Received out of order data. Got {}, expected {}",
                             write_offset,
                             tx.get_bytes_written()
                         ));
-                    } else {
-                        write_request.data
                     }
+                    write_request.data
                 };
 
                 // Do not process EOF or weird stuff will happen.
@@ -817,7 +810,7 @@ impl ByteStreamServer {
             .as_ref()
             .ok_or_else(|| make_input_err!("UUID must be set if writing data"))?;
         let mut active_stream_guard =
-            self.create_or_join_upload_stream(uuid, instance_info, digest);
+            self.create_or_join_upload_stream(uuid, instance_info, digest)?;
         let expected_size = stream.resource_info.expected_size as u64;
 
         let active_stream = active_stream_guard.stream_state.as_mut().unwrap();

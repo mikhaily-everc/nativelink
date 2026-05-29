@@ -1070,10 +1070,131 @@ async fn write_too_many_bytes_fails() -> Result<(), Box<dyn core::error::Error>>
     Ok(())
 }
 
-// NOTE: UUID collision fix has been verified manually.
-// When two uploads use the same UUID and one is active, the server generates
-// a unique UUID using nanosecond timestamp for the second upload.
-// This prevents the "Cannot upload same UUID simultaneously" error that occurred
-// in production with large C++ builds using Bazel.
-// Manual testing shows the warning: "UUID collision detected, generating unique UUID"
-// and both uploads complete successfully.
+/// A write that skips ahead of the bytes already received (a gap) must be
+/// rejected, not silently absorbed. Absorbing it would write the tail bytes at
+/// the wrong store offset, leaving the head missing and only failing later at
+/// hash verification after the whole upload was wasted.
+#[nativelink_test]
+pub async fn write_offset_gap_after_partial_is_rejected()
+-> Result<(), Box<dyn core::error::Error>> {
+    const WRITE_DATA: &str = "12456789abcdefghijk";
+
+    let store_manager = make_store_manager().await?;
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("Failed to make server"),
+    );
+
+    let (tx, join_handle) =
+        make_stream_and_writer_spawn(bs_server, Some(CompressionEncoding::Gzip));
+
+    let resource_name = make_resource_name(WRITE_DATA.len());
+    let mut write_request = WriteRequest {
+        resource_name,
+        write_offset: 0,
+        finish_write: false,
+        data: WRITE_DATA[..4].into(),
+    };
+    // First chunk lands [0..4).
+    tx.send(Frame::data(encode_stream_proto(&write_request)?))
+        .await?;
+    // Second chunk jumps to offset 6 — a 2-byte gap over the 4 bytes written.
+    write_request.write_offset = 6;
+    write_request.data = WRITE_DATA[6..].into();
+    tx.send(Frame::data(encode_stream_proto(&write_request)?))
+        .await?;
+    drop(tx);
+
+    let err = join_handle
+        .await
+        .expect("Failed to join")
+        .expect_err("Expected gap write to be rejected");
+    assert!(
+        err.to_string().contains("Received out of order data"),
+        "Got wrong error: {err:?}"
+    );
+    Ok(())
+}
+
+/// When a second upload collides with a UUID whose stream is still *active* (e.g.
+/// an NLB retry routed to the same pod before the dead connection was reclaimed),
+/// the server must reject it with a RETRIABLE status rather than start a fresh,
+/// misaligned store write. The real resume happens later via the idle path (Case
+/// 2) once the stale stream is reclaimed — see `resume_write_success`. The blob
+/// must not be committed from the rejected collision.
+#[nativelink_test]
+pub async fn active_uuid_collision_is_rejected_as_retriable()
+-> Result<(), Box<dyn core::error::Error>> {
+    const WRITE_DATA: &str = "12456789abcdefghijk";
+
+    let store_manager = make_store_manager().await?;
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("Failed to make server"),
+    );
+    let store = store_manager.get_store("main_cas").unwrap();
+    let digest = DigestInfo::try_new(HASH1, WRITE_DATA.len())?;
+
+    // Stream 1: send a partial chunk and keep the stream open (tx1 not dropped),
+    // so the UUID stays registered as an *active* upload (map value == None).
+    let (tx1, join_handle1) =
+        make_stream_and_writer_spawn(bs_server.clone(), Some(CompressionEncoding::Gzip));
+    let resource_name = make_resource_name(WRITE_DATA.len());
+    tx1.send(Frame::data(encode_stream_proto(&WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: 0,
+        finish_write: false,
+        data: WRITE_DATA[..4].into(),
+    })?))
+    .await?;
+
+    // Wait until stream 1's bytes are registered (committed_size > 0), which
+    // confirms its entry is active in the map before stream 2 collides.
+    let query_request = QueryWriteStatusRequest {
+        resource_name: resource_name.clone(),
+    };
+    let mut registered = false;
+    for _ in 0..1000 {
+        let status = bs_server
+            .query_write_status(Request::new(query_request.clone()))
+            .await?
+            .into_inner();
+        if status.committed_size > 0 && !status.complete {
+            registered = true;
+            break;
+        }
+        yield_now().await;
+    }
+    assert!(registered, "Stream 1 never became an active upload");
+
+    // Stream 2: same UUID, resuming at the committed offset (as Bazel would, NOT
+    // at 0). Because stream 1 is still active, this must be rejected as retriable.
+    let (tx2, join_handle2) =
+        make_stream_and_writer_spawn(bs_server.clone(), Some(CompressionEncoding::Gzip));
+    tx2.send(Frame::data(encode_stream_proto(&WriteRequest {
+        resource_name,
+        write_offset: 4,
+        finish_write: true,
+        data: WRITE_DATA[4..].into(),
+    })?))
+    .await?;
+    drop(tx2);
+    let status = join_handle2
+        .await
+        .expect("Failed to join stream 2")
+        .expect_err("Active-UUID collision should be rejected");
+    assert_eq!(
+        status.code(),
+        tonic::Code::Aborted,
+        "Collision must be retriable (Aborted), got: {status:?}"
+    );
+
+    // Nothing was committed from the rejected collision.
+    assert_eq!(
+        store.has(digest).await?,
+        None,
+        "Rejected collision must not commit a (corrupt) blob",
+    );
+
+    drop(tx1);
+    drop(join_handle1);
+    Ok(())
+}
