@@ -587,9 +587,9 @@ async fn rebuild_index_from_store_test() -> Result<(), Box<dyn core::error::Erro
     Ok(())
 }
 
-/// watch_build replays stored events in order across multiple concurrent
-/// prefetch windows (REPLAY_BATCH = 64), stopping cleanly at the end of the
-/// contiguous run for a finished build.
+/// watch_build replays stored events in order through the pipelined prefetch
+/// (bounded by event_count), stopping cleanly at the end of the contiguous run
+/// for a finished build.
 #[nativelink_test]
 async fn watch_build_replays_events_in_order_test() -> Result<(), Box<dyn core::error::Error>> {
     let store_manager = make_store_manager().await?;
@@ -648,7 +648,9 @@ async fn watch_build_replays_events_in_order_test() -> Result<(), Box<dyn core::
             start_time: None,
             finished: true,
             command: String::new(),
-            event_count: total,
+            // Production sets event_count = highest_seq + 1 (bep_server.rs); the
+            // pipelined replay is bounded by [start_seq, event_count).
+            event_count: total + 1,
             task_id: String::new(),
             task_name: String::new(),
             last_event_at: Instant::now(),

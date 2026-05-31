@@ -14,11 +14,11 @@
 
 use core::pin::Pin;
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures::Stream;
-use futures::future::join_all;
+use futures::StreamExt;
+use futures::future::ready;
 use futures::stream::unfold;
 use nativelink_proto::com::github::trace_machina::nativelink::bep::{
     BuildInfo, ListBuildsRequest, ListBuildsResponse, WatchBuildRequest, WatchBuildResponse,
@@ -100,143 +100,100 @@ impl BuildEventSubscription for BepSubscriptionService {
 
         let rx = self.event_rx_factory.subscribe();
 
-        let build_finished = {
+        // Read both the finished flag and the authoritative event_count under a
+        // single lock. event_count is `highest_seq + 1` (see bep_server.rs), so
+        // the contiguous stored run to replay is exactly [start_seq, event_count).
+        let (build_finished, event_count) = {
             let idx = self.index.read();
             idx.get(&format!("{build_id}:{invocation_id}"))
-                .map_or(false, |m| m.finished)
+                .map_or((false, 0), |m| (m.finished, m.event_count))
         };
 
         let start_seq = if start_sequence == 0 { 1 } else { start_sequence };
-        let store = self.store.clone();
 
-        // Replay fetches stored events in concurrent windows of REPLAY_BATCH
-        // rather than one event per (has + get) pair. A large build's replay was
-        // otherwise bottlenecked on per-event store round-trip latency — fatal
-        // when events have aged into the slow (S3) tier (~hundreds of ms each).
-        const REPLAY_BATCH: i64 = 64;
+        // Replay keeps REPLAY_CONCURRENCY store fetches continuously in flight
+        // (ordered), so per-event round-trip latency overlaps streaming instead
+        // of serializing behind fixed prefetch windows. Otherwise fatal for a
+        // large build whose events have aged into the slow (S3) tier (~hundreds
+        // of ms each): 20k events would walk hundreds of sequential windows.
+        const REPLAY_CONCURRENCY: usize = 256;
 
-        #[derive(Clone, Copy)]
-        enum Phase {
-            Replay { next_seq: i64 },
-            Live,
-        }
+        let replay = {
+            let store = self.store.clone();
+            let build_id = build_id.clone();
+            let invocation_id = invocation_id.clone();
+            futures::stream::iter(start_seq..event_count)
+                .map(move |seq| {
+                    let store = store.clone();
+                    let key = StoreKey::Str(Cow::Owned(format!(
+                        "BepEvent:be:{build_id}:{invocation_id}:{seq}",
+                    )));
+                    async move { (seq, store.get_part_unchunked(key, 0, None).await) }
+                })
+                .buffered(REPLAY_CONCURRENCY)
+                // Stop the contiguous run at the first missing/erroring key, as a
+                // safety net against a hole in the stored sequence.
+                .take_while(|(_, res)| ready(res.is_ok()))
+                // Skip undecodable events but keep streaming the rest.
+                .filter_map(|(seq, res)| {
+                    ready(res.ok().and_then(|data| {
+                        BepEvent::decode(data.as_ref()).ok().map(|bep_event| {
+                            let (bazel_event, event_time) = extract_bazel_event(&bep_event);
+                            Ok(WatchBuildResponse {
+                                sequence_number: seq,
+                                bazel_event,
+                                event_time,
+                            })
+                        })
+                    }))
+                })
+        };
 
-        struct State {
+        struct LiveState {
             rx: tokio::sync::broadcast::Receiver<BepEventNotification>,
-            store: Store,
             build_id: String,
             invocation_id: String,
-            phase: Phase,
-            finished: bool,
-            // Prefetched replay events awaiting yield, and whether the
-            // contiguous run of stored events has ended.
-            buffer: VecDeque<WatchBuildResponse>,
-            replay_ended: bool,
+            // Replay covered [start_seq, replay_end); only forward strictly-newer
+            // live events so replay and live never overlap (no duplicates).
+            replay_end: i64,
+            active: bool,
         }
 
-        let stream = unfold(
-            Some(State {
+        let live = unfold(
+            LiveState {
                 rx,
-                store,
                 build_id: build_id.clone(),
                 invocation_id: invocation_id.clone(),
-                phase: Phase::Replay { next_seq: start_seq },
-                finished: build_finished,
-                buffer: VecDeque::new(),
-                replay_ended: false,
-            }),
-            move |maybe_state| async move {
-                let mut state = maybe_state?;
+                replay_end: event_count,
+                active: !build_finished,
+            },
+            move |mut state| async move {
+                if !state.active {
+                    return None;
+                }
                 loop {
-                    match state.phase {
-                        Phase::Replay { mut next_seq } => {
-                            // Drain any already-prefetched event first.
-                            if let Some(resp) = state.buffer.pop_front() {
-                                return Some((Ok(resp), Some(state)));
+                    match state.rx.recv().await {
+                        Ok(notification) => {
+                            if notification.build_id == state.build_id
+                                && notification.invocation_id == state.invocation_id
+                                && notification.sequence_number >= state.replay_end
+                            {
+                                let resp = WatchBuildResponse {
+                                    sequence_number: notification.sequence_number,
+                                    bazel_event: notification.bazel_event_bytes,
+                                    event_time: notification.timestamp,
+                                };
+                                return Some((Ok(resp), state));
                             }
-                            if state.replay_ended {
-                                if state.finished {
-                                    return None;
-                                }
-                                state.phase = Phase::Live;
-                                continue;
-                            }
-                            // Fetch the next window of events concurrently.
-                            let store = state.store.clone();
-                            let keys: Vec<(i64, StoreKey<'static>)> = (next_seq
-                                ..next_seq + REPLAY_BATCH)
-                                .map(|seq| {
-                                    (
-                                        seq,
-                                        StoreKey::Str(Cow::Owned(format!(
-                                            "BepEvent:be:{}:{}:{seq}",
-                                            state.build_id, state.invocation_id,
-                                        ))),
-                                    )
-                                })
-                                .collect();
-                            let results = join_all(
-                                keys.iter()
-                                    .map(|(_, key)| store.get_part_unchunked(key.clone(), 0, None)),
-                            )
-                            .await;
-                            let mut consumed = 0i64;
-                            for ((seq, _), res) in keys.iter().zip(results) {
-                                match res {
-                                    Ok(data) => {
-                                        consumed += 1;
-                                        if let Ok(bep_event) = BepEvent::decode(data.as_ref()) {
-                                            let (bazel_bytes, timestamp) =
-                                                extract_bazel_event(&bep_event);
-                                            state.buffer.push_back(WatchBuildResponse {
-                                                sequence_number: *seq,
-                                                bazel_event: bazel_bytes,
-                                                event_time: timestamp,
-                                            });
-                                        }
-                                    }
-                                    // A missing/erroring key ends the contiguous
-                                    // stored run.
-                                    Err(_) => {
-                                        state.replay_ended = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            next_seq += consumed;
-                            state.phase = Phase::Replay { next_seq };
-                            if let Some(resp) = state.buffer.pop_front() {
-                                return Some((Ok(resp), Some(state)));
-                            }
-                            // Nothing decodable this window — loop to transition
-                            // (if ended) or fetch the next window.
                         }
-                        Phase::Live => match state.rx.recv().await {
-                            Ok(notification) => {
-                                if notification.build_id == state.build_id
-                                    && notification.invocation_id == state.invocation_id
-                                {
-                                    let resp = WatchBuildResponse {
-                                        sequence_number: notification.sequence_number,
-                                        bazel_event: notification.bazel_event_bytes,
-                                        event_time: notification.timestamp,
-                                    };
-                                    return Some((Ok(resp), Some(state)));
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                continue;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                return None;
-                            }
-                        },
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
             },
         );
 
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(Box::pin(replay.chain(live))))
     }
 }
 
