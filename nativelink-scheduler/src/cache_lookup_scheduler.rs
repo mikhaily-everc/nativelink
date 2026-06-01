@@ -271,16 +271,21 @@ impl CacheLookupScheduler {
 
                     let ctx = Context::current();
                     let baggage = ctx.baggage();
+                    let identity = baggage
+                        .get(ENDUSER_ID)
+                        .map(|v| v.as_str().to_string())
+                        .unwrap_or_default();
+                    // Carry the Bazel RequestMetadata from the original Execute
+                    // request so cache-hit (CompletedFromCache) operations can
+                    // still be correlated to their build/invocation/target.
+                    let bazel_metadata = action_info.maybe_bazel_request_metadata.clone();
 
-                    let maybe_origin_metadata = if baggage.is_empty() {
+                    let maybe_origin_metadata = if identity.is_empty() && bazel_metadata.is_none() {
                         None
                     } else {
                         Some(OriginMetadata {
-                            identity: baggage
-                                .get(ENDUSER_ID)
-                                .map(|v| v.as_str().to_string())
-                                .unwrap_or_default(),
-                            bazel_metadata: None, // TODO(palfrey): Implement conversion.
+                            identity,
+                            bazel_metadata,
                         })
                     };
 

@@ -46,6 +46,7 @@ use nativelink_service::execution_server::ExecutionServer;
 use nativelink_service::fetch_server::FetchServer;
 use nativelink_service::health_server::HealthServer;
 use nativelink_service::push_server::PushServer;
+use nativelink_service::scheduler_event_bridge::SchedulerEventBridge;
 use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
@@ -248,6 +249,10 @@ async fn inner_main(
 
     let server_cfgs: Vec<ServerConfig> = cfg.servers.into_iter().collect();
 
+    // Holds the scheduler-event bridge guard(s) for the process lifetime; dropped
+    // when inner_main returns (i.e. servers stopped), which aborts the supervisor.
+    let mut scheduler_event_bridges: Vec<SchedulerEventBridge> = Vec::new();
+
     for server_cfg in server_cfgs {
         let services = server_cfg
             .services
@@ -364,6 +369,16 @@ async fn inner_main(
                     let sub_svc = service_setup!(sub.into_service(), http_config);
                     let grpc_web_layer = tonic_web::GrpcWebLayer::new();
                     bep_subscription_svc = Some(tower::ServiceBuilder::new().layer(grpc_web_layer).service(sub_svc));
+
+                    // Bridge scheduler operation state into this BEP pipeline so
+                    // WatchBuild can overlay remote-execution data per build.
+                    scheduler_event_bridges.push(SchedulerEventBridge::new(
+                        action_schedulers.values().cloned().collect(),
+                        bep.store(),
+                        bep.index(),
+                        bep.sender(),
+                        Duration::from_secs(3),
+                    ));
                 }
                 bep_server.map(|v| service_setup!(v.into_service(), http_config))
             })

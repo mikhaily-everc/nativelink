@@ -95,7 +95,7 @@ pub fn get_node_id(event: Option<&Event>) -> [u8; 6] {
     node_id
 }
 
-fn serialize_request_metadata<S>(
+pub(crate) fn serialize_request_metadata<S>(
     value: &Option<RequestMetadata>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
@@ -108,7 +108,7 @@ where
     }
 }
 
-fn deserialize_request_metadata<'de, D>(
+pub(crate) fn deserialize_request_metadata<'de, D>(
     deserializer: D,
 ) -> Result<Option<RequestMetadata>, D::Error>
 where

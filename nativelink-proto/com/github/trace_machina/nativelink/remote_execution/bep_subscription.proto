@@ -23,6 +23,10 @@ message BuildInfo {
   // (keys ASPECT_TASK_ID / ASPECT_TASK_NAME). Empty if the build emitted none.
   string task_id = 8;
   string task_name = 9;
+  // Count of scheduler events (`se:` namespace) seen for this build. This is
+  // `highest_sched_seq + 1`, the resume bound for the scheduler sub-stream,
+  // independent of event_count (the bazel `be:` namespace).
+  int64 scheduler_event_count = 10;
 }
 
 message ListBuildsResponse {
@@ -33,10 +37,58 @@ message WatchBuildRequest {
   string build_id = 1;
   string invocation_id = 2;
   int64 start_sequence = 3;
+  // Resume cursor for the scheduler-event (`se:`) namespace, independent of
+  // start_sequence (the bazel-event `be:` cursor). The two namespaces carry
+  // separate monotonic counters; each replays [start, count) of its own kind.
+  int64 start_scheduler_sequence = 4;
 }
 
 message WatchBuildResponse {
   int64 sequence_number = 1;
   bytes bazel_event = 2;
   google.protobuf.Timestamp event_time = 3;
+  // Set iff this frame is a scheduler event (mutually exclusive with
+  // bazel_event). When set, sequence_number carries the scheduler `se:`
+  // cursor for this frame rather than the bazel `be:` cursor.
+  SchedulerEvent scheduler_event = 4;
+}
+
+// Execution stage of a remote-execution operation, mirroring the scheduler's
+// ActionStage.
+enum ExecutionStage {
+  EXECUTION_STAGE_UNKNOWN = 0;
+  CACHE_CHECK = 1;
+  QUEUED = 2;
+  EXECUTING = 3;
+  COMPLETED = 4;
+  COMPLETED_FROM_CACHE = 5;
+}
+
+// A single scheduler operation state transition, correlated to a build via the
+// REv2 RequestMetadata captured on the Execute call. `target_id` is the Bazel
+// target label, which equals the label on the BES TargetComplete event — the
+// join key bes-ui uses to overlay these onto the per-target view.
+message SchedulerEvent {
+  // Stable id across transitions of the same operation (dedupe key).
+  string client_operation_id = 1;
+  // REv2 action digest as "{hash}/{size_bytes}".
+  string action_digest = 2;
+  // RequestMetadata.target_id (the Bazel target label).
+  string target_id = 3;
+  // RequestMetadata.action_mnemonic (e.g. CppCompile).
+  string action_mnemonic = 4;
+  // RequestMetadata.action_id.
+  string action_id = 5;
+  ExecutionStage stage = 6;
+  // ActionState.last_transition_timestamp.
+  google.protobuf.Timestamp transition_time = 7;
+  // ExecutionMetadata.worker (populated on Completed).
+  string worker_id = 8;
+  google.protobuf.Timestamp queued_timestamp = 9;
+  google.protobuf.Timestamp worker_start_timestamp = 10;
+  google.protobuf.Timestamp worker_completed_timestamp = 11;
+  // ActionResult.exit_code (Completed / CompletedFromCache).
+  int32 exit_code = 12;
+  // True iff the result came from cache (CompletedFromCache).
+  bool cached = 13;
 }

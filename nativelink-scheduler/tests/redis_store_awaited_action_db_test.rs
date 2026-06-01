@@ -110,6 +110,7 @@ fn make_awaited_action(operation_id: &str) -> AwaitedAction {
                 digest_function: DigestHasherFunc::Sha256,
                 digest: DigestInfo::zero_digest(),
             }),
+            maybe_bazel_request_metadata: None,
         }),
         MockSystemTime::now().into(),
     )
@@ -238,6 +239,7 @@ async fn test_multiple_clients_subscribe_to_same_action() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Sha256,
             digest: DigestInfo::zero_digest(),
         }),
+        maybe_bazel_request_metadata: None,
     });
 
     // Use FakeRedisBackend which handles all Redis commands dynamically

@@ -112,16 +112,22 @@ impl AwaitedAction {
 
         let ctx = Context::current();
         let baggage = ctx.baggage();
+        let identity = baggage
+            .get(ENDUSER_ID)
+            .map(|v| v.as_str().to_string())
+            .unwrap_or_default();
+        // Bazel RequestMetadata is threaded through ActionInfo from the Execute
+        // gRPC header (see ActionInfo::maybe_bazel_request_metadata) rather than
+        // via OTel baggage, which does not reliably propagate into the scheduler
+        // task where AwaitedAction::new runs.
+        let bazel_metadata = action_info.maybe_bazel_request_metadata.clone();
 
-        let maybe_origin_metadata = if baggage.is_empty() {
+        let maybe_origin_metadata = if identity.is_empty() && bazel_metadata.is_none() {
             None
         } else {
             Some(OriginMetadata {
-                identity: baggage
-                    .get(ENDUSER_ID)
-                    .map(|v| v.as_str().to_string())
-                    .unwrap_or_default(),
-                bazel_metadata: None, // TODO(palfrey): Implement conversion.
+                identity,
+                bazel_metadata,
             })
         };
 
@@ -314,3 +320,59 @@ const_assert!(
 
 // Ensure the insert timestamp is used as the sort key second.
 const_assert!(AwaitedActionSortKey::new(0, u32::MIN).0 > AwaitedActionSortKey::new(0, u32::MAX).0);
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+    use std::collections::HashMap;
+    use std::time::UNIX_EPOCH;
+
+    use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+    use nativelink_util::action_messages::{ActionUniqueKey, ActionUniqueQualifier};
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+
+    use super::{ActionInfo, Arc, AwaitedAction, OperationId, SystemTime};
+
+    /// The Bazel `RequestMetadata` threaded onto `ActionInfo` (from the Execute
+    /// gRPC header) must surface on the constructed `AwaitedAction`'s
+    /// `OriginMetadata.bazel_metadata` — this is the join data Phase 2/3 rely on.
+    #[test]
+    fn bazel_request_metadata_flows_into_origin_metadata() {
+        let request_metadata = RequestMetadata {
+            tool_invocation_id: "inv-123".to_string(),
+            correlated_invocations_id: "build-456".to_string(),
+            target_id: "//foo:bar".to_string(),
+            action_mnemonic: "CppCompile".to_string(),
+            ..Default::default()
+        };
+        let action_info = Arc::new(ActionInfo {
+            command_digest: DigestInfo::new([0u8; 32], 0),
+            input_root_digest: DigestInfo::new([0u8; 32], 0),
+            timeout: Duration::MAX,
+            platform_properties: HashMap::new(),
+            priority: 0,
+            load_timestamp: UNIX_EPOCH,
+            insert_timestamp: UNIX_EPOCH,
+            unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+                instance_name: "main".to_string(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest: DigestInfo::new([1u8; 32], 1),
+            }),
+            maybe_bazel_request_metadata: Some(request_metadata),
+        });
+
+        let awaited = AwaitedAction::new(OperationId::default(), action_info, SystemTime::now());
+
+        let origin = awaited
+            .maybe_origin_metadata()
+            .expect("origin metadata should be populated when request metadata is present");
+        let bazel = origin
+            .bazel_metadata
+            .as_ref()
+            .expect("bazel_metadata should carry the threaded RequestMetadata");
+        assert_eq!(bazel.tool_invocation_id, "inv-123");
+        assert_eq!(bazel.correlated_invocations_id, "build-456");
+        assert_eq!(bazel.target_id, "//foo:bar");
+    }
+}

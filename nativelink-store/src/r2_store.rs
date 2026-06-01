@@ -92,6 +92,8 @@ impl R2Store {
             region: "auto".to_string(),
             bucket: spec.bucket.clone(),
             common: spec.common.clone(),
+            // 0 → use the built-in single-shot upload deadline default.
+            ..ExperimentalAwsSpec::default()
         }
     }
 }

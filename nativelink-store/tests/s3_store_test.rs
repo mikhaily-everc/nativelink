@@ -301,6 +301,63 @@ async fn simple_update_ac() -> Result<(), Error> {
     Ok(())
 }
 
+// A single-shot (<5MB) upload whose PUT never makes progress must fail fast
+// with `DeadlineExceeded` once the configured per-attempt
+// `single_upload_timeout_s` elapses, and must NOT retry (the fail-fast branch
+// returns `RetryResult::Err`, so total wall-clock is bounded by 1× the
+// deadline). Verifies both the per-attempt restructure and that the config
+// value overrides the built-in default.
+#[nativelink_test]
+async fn single_shot_upload_honors_configured_deadline() -> Result<(), Error> {
+    const AC_ENTRY_SIZE: u64 = 199;
+    const CONTENT_LENGTH: u64 = 50; // < MIN_MULTIPART_SIZE → single-shot path.
+
+    // capture_request never completes the PUT (the body is never fully sent),
+    // so the upload future stays pending until the deadline fires.
+    let (mock_client, _request_receiver) =
+        aws_smithy_runtime::client::http::test_util::capture_request(None);
+    let test_config = Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::from_static(REGION))
+        .http_client(mock_client)
+        .build();
+    let s3_client = aws_sdk_s3::Client::from_conf(test_config);
+    let store = S3Store::new_with_client_and_jitter(
+        &ExperimentalAwsSpec {
+            bucket: BUCKET_NAME.to_string(),
+            // 1s overrides the built-in 90s default so the test resolves fast.
+            single_upload_timeout_s: 1,
+            ..Default::default()
+        },
+        s3_client,
+        Arc::new(move |_delay| Duration::from_secs(0)),
+        MockInstantWrapped::default,
+    )?;
+
+    // Hold the writer (`_tx`) and send nothing: the store's body stream never
+    // receives data or EOF, so the PUT cannot make progress.
+    let (_tx, rx) = make_buf_channel_pair();
+    let result = store
+        .update(
+            DigestInfo::try_new(VALID_HASH1, AC_ENTRY_SIZE)?,
+            rx,
+            UploadSizeInfo::ExactSize(CONTENT_LENGTH),
+        )
+        .await;
+
+    let err = result.err().expect("expected the stalled upload to fail");
+    assert_eq!(
+        err.code,
+        Code::DeadlineExceeded,
+        "expected DeadlineExceeded, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("single-shot upload exceeded 1s"),
+        "expected the configured 1s deadline in the message, got: {err:?}"
+    );
+    Ok(())
+}
+
 #[nativelink_test]
 async fn simple_get_ac() -> Result<(), Error> {
     const VALUE: &str = "23";

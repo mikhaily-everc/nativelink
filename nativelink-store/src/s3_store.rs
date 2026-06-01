@@ -77,15 +77,28 @@ const DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST: usize = 5 * 1024 * 1024; // 5MB.
 // Note: If you change this, adjust the docs in the config.
 const DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS: usize = 10;
 
-// Wall-clock ceiling on a single S3Store::update single-shot upload path,
-// retrier inclusive. The default `retrier` does ~5 attempts with backoff and no
-// per-call time budget, so a single S3 5xx burst can burn the whole
-// `--remote_timeout=120s` client budget — and because the AC update path
-// (memory → ref(redis) → ref(s3)) `join!`s legs, even a tiny ActionResult write
-// stalls behind this. 30s is well above healthy single-PUT latency (<1s) while
-// leaving comfortable headroom under the client timeout, so a stuck backend
-// surfaces as a classified DeadlineExceeded fast.
-const S3_SINGLE_UPLOAD_DEADLINE: Duration = Duration::from_secs(30);
+// Per-attempt deadline for the single-shot (`max_size < MIN_MULTIPART_SIZE`)
+// upload path. Like the multipart per-attempt deadlines below, this wraps the
+// leaf `put_object().send()` future INSIDE the `unfold(...)` retry loop — never
+// around the whole `retrier.retry(...)` — to avoid composing an extra
+// `Timeout<F>` poll-frame over an already-deep store chain (the
+// timeout-over-retrier shape crashed CAS with a tokio-rt-worker stack overflow,
+// exit 139; see the multipart note below).
+//
+// Crucially, this single-shot future also streams the body from the upstream
+// (the client feeds `put_object`'s body through the `fast_slow` tee), so its
+// wall-clock includes legitimate slow-client streaming. A total ceiling over
+// the retrier therefore false-positives on slow-but-progressing uploads (e.g. a
+// multi-MB BEP-referenced blob over a throttled/VPN link); the per-attempt
+// shape bounds a stuck attempt without penalizing the whole retry budget.
+//
+// On `Err(Elapsed)` the unfold returns `RetryResult::Err` (strict fail-fast) so
+// total wall-clock per `retrier.retry(...)` invocation is bounded by 1× this
+// deadline regardless of `Retrier::max_retries`. A genuine S3 5xx returns
+// immediately (not a timeout) and is bounded separately by `retry.max_retries`
+// × backoff. Configurable via `ExperimentalAwsSpec::single_upload_timeout_s`;
+// `0` selects this default.
+const DEFAULT_S3_SINGLE_UPLOAD_DEADLINE: Duration = Duration::from_secs(90);
 
 // Per-attempt deadlines for the multipart upload path. These wrap the leaf
 // `s3_client.<op>().send()` future itself INSIDE the `unfold(...)` retry
@@ -119,6 +132,9 @@ pub struct S3Store<NowFn> {
     max_retry_buffer_per_request: usize,
     #[metric(help = "The number of concurrent uploads allowed for multipart uploads")]
     multipart_max_concurrent_uploads: usize,
+    // Per-attempt deadline for the single-shot upload path; resolved from
+    // `ExperimentalAwsSpec::single_upload_timeout_s` (0 → default).
+    single_upload_deadline: Duration,
 
     remove_callbacks: Mutex<Vec<Arc<dyn RemoveItemCallback>>>,
 }
@@ -206,6 +222,11 @@ where
                 .common
                 .multipart_max_concurrent_uploads
                 .map_or(DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS, |v| v),
+            single_upload_deadline: if spec.single_upload_timeout_s == 0 {
+                DEFAULT_S3_SINGLE_UPLOAD_DEADLINE
+            } else {
+                Duration::from_secs(spec.single_upload_timeout_s)
+            },
             remove_callbacks: Mutex::new(Vec::new()),
         }))
     }
@@ -334,15 +355,19 @@ where
                 u64::try_from(self.max_retry_buffer_per_request)
                     .err_tip(|| "Could not convert max_retry_buffer_per_request to u64")?,
             );
-            let single_upload_fut = self
+            return self
                 .retrier
                 .retry(unfold(reader, move |mut reader| async move {
                     // We need to make a new pair here because the aws sdk does not give us
                     // back the body after we send it in order to retry.
                     let (mut tx, rx) = make_buf_channel_pair();
 
-                    // Upload the data to the S3 backend.
-                    let result = {
+                    // Upload the data to the S3 backend. The leaf future (PUT +
+                    // upstream body streaming) is wrapped in a per-attempt
+                    // deadline — see DEFAULT_S3_SINGLE_UPLOAD_DEADLINE — so a
+                    // stuck attempt fails fast without composing a Timeout over
+                    // the whole retrier.
+                    let upload_fut = async {
                         let reader_ref = &mut reader;
                         let (upload_res, bind_res) = tokio::join!(
                             self.s3_client
@@ -362,6 +387,21 @@ where
                         upload_res
                             .merge(bind_res)
                             .err_tip(|| "Failed to upload file to s3 in single chunk")
+                    };
+                    let result = match timeout(self.single_upload_deadline, upload_fut).await {
+                        Ok(result) => result,
+                        // Fail-fast on a stuck attempt: do NOT retry, so total
+                        // wall-clock is bounded by 1× the per-attempt deadline.
+                        Err(_) => {
+                            return Some((
+                                RetryResult::Err(make_err!(
+                                    Code::DeadlineExceeded,
+                                    "S3Store::update single-shot upload exceeded {}s for s3_path={s3_path} (per-attempt)",
+                                    self.single_upload_deadline.as_secs(),
+                                )),
+                                reader,
+                            ));
+                        }
                     };
 
                     // If we failed to upload the file, check to see if we can retry.
@@ -388,15 +428,8 @@ where
                         RetryResult::Retry(err)
                     }, |()| RetryResult::Ok(()));
                     Some((retry_result, reader))
-                }));
-            return match timeout(S3_SINGLE_UPLOAD_DEADLINE, single_upload_fut).await {
-                Ok(result) => result,
-                Err(_) => Err(make_err!(
-                    Code::DeadlineExceeded,
-                    "S3Store::update single-shot upload exceeded {}s for s3_path={s3_path}",
-                    S3_SINGLE_UPLOAD_DEADLINE.as_secs(),
-                )),
-            };
+                }))
+                .await;
         }
 
         let upload_id = &self

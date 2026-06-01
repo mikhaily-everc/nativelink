@@ -28,6 +28,7 @@ rust_library(
         "src/lib.rs",
         "src/push_server.rs",
         "src/remote_asset_proto.rs",
+        "src/scheduler_event_bridge.rs",
         "src/worker_api_server.rs",
     ],
     visibility = ["//visibility:public"],

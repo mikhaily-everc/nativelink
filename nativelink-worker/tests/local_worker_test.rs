@@ -239,6 +239,7 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Blake3,
             digest: action_digest,
         }),
+        maybe_bazel_request_metadata: None,
     };
 
     {
@@ -329,6 +330,7 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Sha256,
             digest: action_digest,
         }),
+        maybe_bazel_request_metadata: None,
     };
 
     {
@@ -606,6 +608,7 @@ async fn experimental_precondition_script_fails() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Sha256,
             digest: action_digest,
         }),
+        maybe_bazel_request_metadata: None,
     };
 
     {
@@ -692,6 +695,7 @@ async fn kill_action_request_kills_action() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Blake3,
             digest: action_digest,
         }),
+        maybe_bazel_request_metadata: None,
     };
 
     let operation_id = OperationId::default();
@@ -788,6 +792,7 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Sha256,
             digest: action_digest,
         }),
+        maybe_bazel_request_metadata: None,
     };
 
     {
@@ -898,6 +903,7 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Sha256,
             digest: action_digest,
         }),
+        maybe_bazel_request_metadata: None,
     };
 
     {

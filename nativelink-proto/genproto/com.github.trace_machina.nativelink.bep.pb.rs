@@ -21,6 +21,8 @@ pub struct BuildInfo {
     pub task_id: ::prost::alloc::string::String,
     #[prost(string, tag = "9")]
     pub task_name: ::prost::alloc::string::String,
+    #[prost(int64, tag = "10")]
+    pub scheduler_event_count: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListBuildsResponse {
@@ -35,6 +37,8 @@ pub struct WatchBuildRequest {
     pub invocation_id: ::prost::alloc::string::String,
     #[prost(int64, tag = "3")]
     pub start_sequence: i64,
+    #[prost(int64, tag = "4")]
+    pub start_scheduler_sequence: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WatchBuildResponse {
@@ -44,6 +48,85 @@ pub struct WatchBuildResponse {
     pub bazel_event: ::prost::bytes::Bytes,
     #[prost(message, optional, tag = "3")]
     pub event_time: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "4")]
+    pub scheduler_event: ::core::option::Option<SchedulerEvent>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SchedulerEvent {
+    #[prost(string, tag = "1")]
+    pub client_operation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub action_digest: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub target_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub action_mnemonic: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub action_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "ExecutionStage", tag = "6")]
+    pub stage: i32,
+    #[prost(message, optional, tag = "7")]
+    pub transition_time: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, tag = "8")]
+    pub worker_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "9")]
+    pub queued_timestamp: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "10")]
+    pub worker_start_timestamp: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "11")]
+    pub worker_completed_timestamp: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(int32, tag = "12")]
+    pub exit_code: i32,
+    #[prost(bool, tag = "13")]
+    pub cached: bool,
+}
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    ::prost::Enumeration
+)]
+#[repr(i32)]
+pub enum ExecutionStage {
+    Unknown = 0,
+    CacheCheck = 1,
+    Queued = 2,
+    Executing = 3,
+    Completed = 4,
+    CompletedFromCache = 5,
+}
+impl ExecutionStage {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "EXECUTION_STAGE_UNKNOWN",
+            Self::CacheCheck => "CACHE_CHECK",
+            Self::Queued => "QUEUED",
+            Self::Executing => "EXECUTING",
+            Self::Completed => "COMPLETED",
+            Self::CompletedFromCache => "COMPLETED_FROM_CACHE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "EXECUTION_STAGE_UNKNOWN" => Some(Self::Unknown),
+            "CACHE_CHECK" => Some(Self::CacheCheck),
+            "QUEUED" => Some(Self::Queued),
+            "EXECUTING" => Some(Self::Executing),
+            "COMPLETED" => Some(Self::Completed),
+            "COMPLETED_FROM_CACHE" => Some(Self::CompletedFromCache),
+            _ => None,
+        }
+    }
 }
 /// Generated server implementations.
 pub mod build_event_subscription_server {

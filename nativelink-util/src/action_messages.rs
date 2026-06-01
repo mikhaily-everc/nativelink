@@ -28,7 +28,7 @@ use nativelink_metric::{
 use nativelink_proto::build::bazel::remote::execution::v2::{
     Action, ActionResult as ProtoActionResult, ExecuteOperationMetadata, ExecuteRequest,
     ExecuteResponse, ExecutedActionMetadata, FileNode, LogFile, OutputDirectory, OutputFile,
-    OutputSymlink, SymlinkNode, execution_stage,
+    OutputSymlink, RequestMetadata, SymlinkNode, execution_stage,
 };
 use nativelink_proto::google::longrunning::Operation;
 use nativelink_proto::google::longrunning::operation::Result as LongRunningResult;
@@ -275,8 +275,12 @@ impl Display for ActionUniqueKey {
 /// for simplicity and offers a `salt`, which is useful to ensure during hashing (for dicts)
 /// to ensure we never match against another `ActionInfo` (when a task should never be cached).
 /// This struct must be 100% compatible with `ExecuteRequest` struct in `remote_execution.proto`
-/// except for the salt field.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, MetricsComponent)]
+/// except for the salt field and the internal-only `maybe_bazel_request_metadata` field below.
+///
+/// Note: does not derive `Eq` because `maybe_bazel_request_metadata` (a prost
+/// `RequestMetadata`) is only `PartialEq`. Action identity/dedup is keyed off
+/// `unique_qualifier`, not full-struct equality, so this is sound.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, MetricsComponent)]
 pub struct ActionInfo {
     /// Digest of the underlying `Command`.
     #[metric(help = "Digest of the underlying Command.")]
@@ -303,6 +307,18 @@ pub struct ActionInfo {
     /// This is primarily used to join actions/operations together using this key.
     #[metric(help = "Info used to uniquely identify this ActionInfo and if it is cacheable.")]
     pub unique_qualifier: ActionUniqueQualifier,
+    /// Bazel `RequestMetadata` captured from the `Execute` gRPC header (the
+    /// `build.bazel.remote.execution.v2.requestmetadata-bin` metadata), used to
+    /// correlate this operation back to its build / invocation / target. This is
+    /// internal-only: it is NOT part of `ExecuteRequest` and is dropped when
+    /// forwarding to workers (see `From<&ActionInfo> for ExecuteRequest`). No
+    /// `#[metric]` attribute so the `MetricsComponent` derive skips it.
+    #[serde(
+        default,
+        serialize_with = "crate::origin_event::serialize_request_metadata",
+        deserialize_with = "crate::origin_event::deserialize_request_metadata"
+    )]
+    pub maybe_bazel_request_metadata: Option<RequestMetadata>,
 }
 
 impl ActionInfo {
@@ -369,6 +385,8 @@ impl ActionInfo {
             load_timestamp,
             insert_timestamp: queued_timestamp,
             unique_qualifier,
+            // No client gRPC header on this path (worker/forwarding reconstruction).
+            maybe_bazel_request_metadata: None,
         })
     }
 }

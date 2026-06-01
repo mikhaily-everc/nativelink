@@ -1057,6 +1057,18 @@ pub struct ExperimentalAwsSpec {
     /// Common retry and upload configuration
     #[serde(flatten)]
     pub common: CommonObjectSpec,
+
+    /// Per-attempt wall-clock deadline for a single-shot (<5MB) S3 PUT, applied
+    /// at the leaf inside the retrier (mirrors the multipart per-attempt
+    /// deadlines). On expiry the attempt fails fast (no retry), so total upload
+    /// time is bounded by 1× this value. Sized to tolerate slow client
+    /// streaming through the `fast_slow` tee while still surfacing a genuinely
+    /// stuck backend.
+    ///
+    /// Default: 0. Zero means use the built-in default (90s).
+    #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
+    pub single_upload_timeout_s: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]

@@ -29,7 +29,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::execution_server::{
     Execution, ExecutionServer as Server,
 };
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    Action, Command, ExecuteRequest, WaitExecutionRequest,
+    Action, Command, ExecuteRequest, RequestMetadata, WaitExecutionRequest,
 };
 use nativelink_proto::google::longrunning::operations_server::{Operations, OperationsServer};
 use nativelink_proto::google::longrunning::{
@@ -55,6 +55,10 @@ use opentelemetry::context::FutureExt;
 use prost::Message as _;
 use tonic::{Code, Request, Response, Status};
 use tracing::{Instrument, Level, debug, error, error_span, instrument, warn};
+
+/// The gRPC metadata header Bazel uses to send REv2 `RequestMetadata`
+/// (canonical proto serialization, base64 per the `-bin` convention).
+const BAZEL_REQUESTMETADATA_HEADER: &str = "build.bazel.remote.execution.v2.requestmetadata-bin";
 
 /// Result of a synchronous `Execute` decision before the async
 /// scheduling stream begins. Stream is the happy path; Reject is a
@@ -181,6 +185,7 @@ impl InstanceInfo {
         priority: i32,
         skip_cache_lookup: bool,
         digest_function: DigestHasherFunc,
+        maybe_bazel_request_metadata: Option<RequestMetadata>,
     ) -> Result<ActionInfo, Error> {
         let command_digest = DigestInfo::try_from(
             action
@@ -238,6 +243,7 @@ impl InstanceInfo {
             load_timestamp: UNIX_EPOCH,
             insert_timestamp: SystemTime::now(),
             unique_qualifier,
+            maybe_bazel_request_metadata,
         })
     }
 }
@@ -318,6 +324,7 @@ impl ExecutionServer {
     async fn inner_execute(
         &self,
         request: ExecuteRequest,
+        maybe_bazel_request_metadata: Option<RequestMetadata>,
     ) -> Result<ExecuteOutcome<impl Stream<Item = Result<Operation, Status>> + Send + use<>>, Error>
     {
         let instance_name = request.instance_name;
@@ -423,6 +430,7 @@ impl ExecutionServer {
                     .digest_function
                     .try_into()
                     .err_tip(|| "Could not convert digest function in inner_execute()")?,
+                maybe_bazel_request_metadata,
             )
             .await?;
 
@@ -491,11 +499,21 @@ impl Execution for ExecutionServer {
         &self,
         grpc_request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteStream>, Status> {
+        // Capture the REv2 RequestMetadata gRPC header before consuming the
+        // request. tonic base64-decodes `-bin` metadata for us via `get_bin`.
+        // This carries `tool_invocation_id` / `correlated_invocations_id` /
+        // `target_id` used to correlate this operation to its BES build.
+        let maybe_bazel_request_metadata = grpc_request
+            .metadata()
+            .get_bin(BAZEL_REQUESTMETADATA_HEADER)
+            .and_then(|value| value.to_bytes().ok())
+            .and_then(|bytes| RequestMetadata::decode(bytes).ok());
+
         let request = grpc_request.into_inner();
 
         let digest_function = request.digest_function;
         let result = self
-            .inner_execute(request)
+            .inner_execute(request, maybe_bazel_request_metadata)
             .instrument(error_span!("execution_server_execute"))
             .with_context(
                 make_ctx_for_hash_func(digest_function)

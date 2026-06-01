@@ -24,7 +24,7 @@ use futures::Stream;
 use futures::stream::unfold;
 use nativelink_error::{Error, ResultExt};
 use nativelink_proto::build_event_stream::{self, build_event};
-use nativelink_proto::com::github::trace_machina::nativelink::bep::BuildInfo;
+use nativelink_proto::com::github::trace_machina::nativelink::bep::{BuildInfo, SchedulerEvent};
 use nativelink_proto::com::github::trace_machina::nativelink::events::{BepEvent, bep_event};
 use nativelink_proto::google::devtools::build::v1::publish_build_event_server::{
     PublishBuildEvent, PublishBuildEventServer,
@@ -60,14 +60,29 @@ fn get_identity() -> Option<String> {
         .map(|value| value.as_str().to_string())
 }
 
+/// Live notification broadcast to WatchBuild subscribers. A notification is
+/// either a Bazel BES event (`be:` namespace, sequence assigned by the client)
+/// or a scheduler operation event (`se:` namespace, sequence assigned by this
+/// server). The two namespaces have independent monotonic counters; subscribers
+/// filter on the variant and resume each from its own cursor.
+#[derive(Debug, Clone)]
+pub enum BepPayload {
+    Bazel {
+        sequence_number: i64,
+        bazel_event_bytes: bytes::Bytes,
+        timestamp: Option<::prost_types::Timestamp>,
+    },
+    Scheduler {
+        sched_seq: i64,
+        event: SchedulerEvent,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct BepEventNotification {
     pub build_id: String,
     pub invocation_id: String,
-    pub sequence_number: i64,
-    pub bazel_event_bytes: bytes::Bytes,
-    pub identity: String,
-    pub timestamp: Option<::prost_types::Timestamp>,
+    pub payload: BepPayload,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +98,9 @@ pub struct BuildMeta {
     /// ASPECT_TASK_ID / ASPECT_TASK_NAME). Empty until that event arrives.
     pub task_id: String,
     pub task_name: String,
+    /// Count of scheduler events in the `se:` namespace for this build
+    /// (`highest_sched_seq + 1`). Server-assigned, independent of `event_count`.
+    pub scheduler_event_count: i64,
     /// Wall-clock time the most recent event for this build was ingested.
     /// Used by the reaper to detect abandoned builds. Not serialized.
     pub last_event_at: Instant,
@@ -135,6 +153,7 @@ fn persist_meta(store: &Store, meta: &BuildMeta) {
         event_count: meta.event_count,
         task_id: meta.task_id.clone(),
         task_name: meta.task_name.clone(),
+        scheduler_event_count: meta.scheduler_event_count,
     };
     let mut buf = BytesMut::new();
     if let Err(e) = info.encode(&mut buf) {
@@ -197,6 +216,7 @@ pub async fn rebuild_index_from_store(
             event_count: info.event_count,
             task_id: info.task_id,
             task_name: info.task_name,
+            scheduler_event_count: info.scheduler_event_count,
             last_event_at: Instant::now(),
         };
         let key = index_key(&meta.build_id, &meta.invocation_id);
@@ -314,6 +334,7 @@ impl BepServer {
                 event_count: 0,
                 task_id: String::new(),
                 task_name: String::new(),
+                scheduler_event_count: 0,
                 last_event_at: Instant::now(),
             });
             meta.event_count = sequence_number + 1;
@@ -323,10 +344,11 @@ impl BepServer {
         let _ = self.event_tx.send(BepEventNotification {
             build_id: build_id.to_string(),
             invocation_id: invocation_id.to_string(),
-            sequence_number,
-            bazel_event_bytes,
-            identity: identity.to_string(),
-            timestamp,
+            payload: BepPayload::Bazel {
+                sequence_number,
+                bazel_event_bytes,
+                timestamp,
+            },
         });
     }
 
@@ -358,6 +380,7 @@ impl BepServer {
                             event_count: 0,
                             task_id: String::new(),
                             task_name: String::new(),
+                            scheduler_event_count: 0,
                             last_event_at: Instant::now(),
                         });
                         meta.start_time = evt.event_time.clone();
@@ -494,6 +517,7 @@ impl BepServer {
                     event_count: 0,
                     task_id: String::new(),
                     task_name: String::new(),
+                    scheduler_event_count: 0,
                     last_event_at: Instant::now(),
                 });
                 meta.event_count = sequence_number + 1;
@@ -520,10 +544,11 @@ impl BepServer {
             let _ = event_tx.send(BepEventNotification {
                 build_id: stream_id.build_id.clone(),
                 invocation_id: stream_id.invocation_id.clone(),
-                sequence_number,
-                bazel_event_bytes,
-                identity,
-                timestamp,
+                payload: BepPayload::Bazel {
+                    sequence_number,
+                    bazel_event_bytes,
+                    timestamp,
+                },
             });
 
             Ok(PublishBuildToolEventStreamResponse {
@@ -640,6 +665,67 @@ impl PublishBuildEvent for BepServer {
             .await
             .map_err(Error::into)
     }
+}
+
+/// Publish a scheduler operation event into the BEP pipeline under the `se:`
+/// namespace, given the same three handles the `BepServer` exposes via
+/// `index()` / `store()` / `sender()`. Assigns the next per-build scheduler
+/// sequence, persists the encoded `SchedulerEvent` so it replays for finished
+/// builds, and broadcasts it live. Used by the scheduler-event bridge — a free
+/// function (not a `BepServer` method) because `BepServer` is consumed by
+/// `into_service()` before the bridge is spawned. Mirrors the BES ingest path
+/// but with a server-assigned counter independent of Bazel's `be:` sequence.
+pub async fn publish_scheduler_event(
+    store: &Store,
+    index: &Arc<RwLock<BepIndex>>,
+    event_tx: &tokio::sync::broadcast::Sender<BepEventNotification>,
+    build_id: &str,
+    invocation_id: &str,
+    event: SchedulerEvent,
+) {
+    // Assign the next se: sequence under the index write lock. `or_insert_with`
+    // creates the BuildMeta if a scheduler event arrives before the first BES
+    // event (the build then shows in ListBuilds with event_count 0).
+    let sched_seq = {
+        let mut idx = index.write();
+        let key = index_key(build_id, invocation_id);
+        let meta = idx.entry(key).or_insert_with(|| BuildMeta {
+            build_id: build_id.to_string(),
+            invocation_id: invocation_id.to_string(),
+            identity: String::new(),
+            start_time: None,
+            finished: false,
+            command: String::new(),
+            event_count: 0,
+            task_id: String::new(),
+            task_name: String::new(),
+            scheduler_event_count: 0,
+            last_event_at: Instant::now(),
+        });
+        let seq = meta.scheduler_event_count;
+        meta.scheduler_event_count = seq + 1;
+        meta.last_event_at = Instant::now();
+        seq
+    };
+
+    let mut buf = BytesMut::new();
+    if let Err(e) = event.encode(&mut buf) {
+        tracing::warn!("Could not encode SchedulerEvent: {e:?}");
+        return;
+    }
+    let key = StoreKey::Str(Cow::Owned(format!(
+        "BepEvent:se:{build_id}:{invocation_id}:{sched_seq}",
+    )));
+    if let Err(e) = store.update_oneshot(key, buf.freeze()).await {
+        tracing::warn!("Failed to store SchedulerEvent: {e:?}");
+        return;
+    }
+
+    let _ = event_tx.send(BepEventNotification {
+        build_id: build_id.to_string(),
+        invocation_id: invocation_id.to_string(),
+        payload: BepPayload::Scheduler { sched_seq, event },
+    });
 }
 
 pub fn extract_bazel_event_from_request(
