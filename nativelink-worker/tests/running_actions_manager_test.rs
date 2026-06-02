@@ -118,6 +118,7 @@ mod tests {
                 slow: StoreSpec::Memory(slow_config),
                 fast_direction: StoreDirection::default(),
                 slow_direction: StoreDirection::default(),
+                presence_requires_slow_store: false,
             },
             Store::new(fast_store.clone()),
             Store::new(slow_store.clone()),

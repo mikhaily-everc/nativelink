@@ -71,6 +71,12 @@ pub struct FastSlowStore {
     // is still visible to a concurrent existence check, preventing redundant
     // duplicate uploads of the same blob.
     in_flight_slow_writes: Mutex<HashMap<StoreKey<'static>, u64>>,
+    // When true, `has_with_results` does NOT count the evictable fast tier as
+    // presence. A blob is reported present only if it is in the authoritative
+    // slow store or an in-flight slow write. Set on CAS stores whose fast tiers
+    // are size-capped caches over a durable backend, so that presence reported
+    // by has/FindMissingBlobs is always durably fetchable.
+    presence_requires_slow_store: bool,
 }
 
 // This guard ensures that the populating_digests is cleared even if the future
@@ -154,6 +160,7 @@ impl FastSlowStore {
             metrics: FastSlowStoreMetrics::default(),
             populating_digests: Mutex::new(HashMap::new()),
             in_flight_slow_writes: Mutex::new(HashMap::new()),
+            presence_requires_slow_store: spec.presence_requires_slow_store,
         })
     }
 
@@ -453,11 +460,21 @@ impl StoreDriver for FastSlowStore {
         // Fall back to the fast store for anything still missing. This
         // covers fast-only writes and the brief window between fast-store
         // insertion and slow-store write start.
-        let missing_indices: Vec<usize> = results
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| if r.is_none() { Some(i) } else { None })
-            .collect();
+        //
+        // Skipped entirely when `presence_requires_slow_store` is set: such
+        // stores treat the fast tier as an evictable cache over a durable
+        // backend, so a fast-only blob must NOT be advertised as present —
+        // otherwise FindMissingBlobs/upload-skip would suppress the durable
+        // re-write and a later fetch after fast-tier eviction would fail.
+        let missing_indices: Vec<usize> = if self.presence_requires_slow_store {
+            Vec::new()
+        } else {
+            results
+                .iter()
+                .enumerate()
+                .filter_map(|(i, r)| if r.is_none() { Some(i) } else { None })
+                .collect()
+        };
         if !missing_indices.is_empty() {
             let missing_keys: Vec<StoreKey<'_>> =
                 missing_indices.iter().map(|&i| key[i].borrow()).collect();

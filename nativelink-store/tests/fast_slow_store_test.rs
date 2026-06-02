@@ -53,6 +53,7 @@ fn make_stores_direction(
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction,
             slow_direction,
+            presence_requires_slow_store: false,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -356,6 +357,7 @@ async fn drop_on_eof_completes_store_futures() -> Result<(), Error> {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         fast_store,
         slow_store,
@@ -405,6 +407,7 @@ async fn fast_store_only_value_is_reported_by_has() -> Result<(), Error> {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         fast_store.clone(),
         slow_store,
@@ -421,6 +424,67 @@ async fn fast_store_only_value_is_reported_by_has() -> Result<(), Error> {
     Ok(())
 }
 
+// When `presence_requires_slow_store` is set, a blob that lives only in the
+// evictable fast tier must NOT be advertised as present. This is the invariant
+// that keeps `find_missing_blobs`/upload-skip from suppressing a durable
+// re-write of a blob that S3/redis never received.
+#[nativelink_test]
+async fn presence_requires_slow_store_hides_fast_only_blob() -> Result<(), Error> {
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = Arc::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: true,
+        },
+        fast_store.clone(),
+        slow_store,
+    ));
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+    fast_store
+        .update_oneshot(digest, make_random_data(100).into())
+        .await?;
+    assert_eq!(
+        fast_slow_store.has(digest).await?,
+        None,
+        "Expected fast-only blob to be reported absent when presence requires the slow store",
+    );
+    Ok(())
+}
+
+// With `presence_requires_slow_store` set, a blob that IS in the authoritative
+// slow store must still be reported present (the slow lookup is the primary
+// path; only the fast-tier fallback is dropped).
+#[nativelink_test]
+async fn presence_requires_slow_store_reports_slow_blob() -> Result<(), Error> {
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = Arc::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: true,
+        },
+        fast_store,
+        slow_store.clone(),
+    ));
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+    slow_store
+        .update_oneshot(digest, make_random_data(100).into())
+        .await?;
+    assert_eq!(
+        fast_slow_store.has(digest).await?,
+        Some(100),
+        "Expected slow-store blob to be reported present even when presence requires the slow store",
+    );
+    Ok(())
+}
+
 // Regression test for https://github.com/TraceMachina/nativelink/issues/665
 #[nativelink_test]
 async fn has_checks_fast_store_when_noop() -> Result<(), Error> {
@@ -431,6 +495,7 @@ async fn has_checks_fast_store_when_noop() -> Result<(), Error> {
         slow: StoreSpec::Noop(NoopSpec::default()),
         fast_direction: StoreDirection::default(),
         slow_direction: StoreDirection::default(),
+        presence_requires_slow_store: false,
     };
     let fast_slow_store = Arc::new(FastSlowStore::new(
         &fast_slow_store_config,
@@ -667,6 +732,7 @@ fn make_stores_with_lazy_slow() -> (Store, Store, Store) {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -812,6 +878,7 @@ fn make_fast_slow_with_instrumented_slow(
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         fast,
         Store::new(slow.clone()),
@@ -1010,6 +1077,7 @@ async fn has_sees_in_flight_slow_writes() -> Result<(), Error> {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         fast,
         Store::new(slow.clone()),
@@ -1152,6 +1220,7 @@ async fn has_does_not_consult_fast_store_when_slow_store_hits() -> Result<(), Er
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         fast,
         slow.clone(),
@@ -1269,6 +1338,7 @@ async fn dropping_update_future_cleans_up_in_flight_entry() -> Result<(), Error>
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::ReadOnly,
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         fast,
         Store::new(slow.clone()),
@@ -1420,6 +1490,7 @@ async fn has_with_results_handles_mixed_key_sources() -> Result<(), Error> {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::ReadOnly,
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         fast.clone(),
         Store::new(slow.clone()),

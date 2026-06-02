@@ -806,6 +806,14 @@ pub struct FastSlowSpec {
     /// and you wish to have an upstream read only store.
     #[serde(default)]
     pub slow_direction: StoreDirection,
+
+    /// When true, `has`/`FindMissingBlobs` reports a blob present only if it is
+    /// retrievable from the authoritative `slow` store (or an in-flight slow
+    /// write). The evictable `fast` tier is NOT counted as presence. Set on
+    /// `CAS` stores whose fast tiers are size-capped caches over a durable
+    /// backend. Default false (legacy: fast tier counts as present).
+    #[serde(default)]
+    pub presence_requires_slow_store: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]

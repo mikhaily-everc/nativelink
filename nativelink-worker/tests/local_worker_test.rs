@@ -427,6 +427,7 @@ async fn new_local_worker_creates_work_directory_test() -> Result<(), Error> {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         Store::new(
             <FilesystemStore>::new(&FilesystemSpec {
@@ -468,6 +469,7 @@ async fn new_local_worker_removes_work_directory_before_start_test() -> Result<(
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            presence_requires_slow_store: false,
         },
         Store::new(
             <FilesystemStore>::new(&FilesystemSpec {
