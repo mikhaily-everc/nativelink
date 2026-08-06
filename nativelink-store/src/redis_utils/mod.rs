@@ -16,5 +16,5 @@ mod aggregate_types;
 mod ft_aggregate;
 mod ft_create;
 mod ft_cursor_read;
-pub(crate) use ft_aggregate::{FtAggregateCursor, FtAggregateOptions, ft_aggregate};
+pub(crate) use ft_aggregate::{FtAggregateOptions, FtAggregatePaging, FtLoad, ft_aggregate};
 pub(crate) use ft_create::{FtCreateOptions, SearchSchema, ft_create};

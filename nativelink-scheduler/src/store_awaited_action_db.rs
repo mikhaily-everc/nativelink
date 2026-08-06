@@ -70,6 +70,10 @@ pub struct OperationSubscriber<S: SchedulerStore, I: InstantWrapper, NowFn: Fn()
     // as well as listening for the publishing.
     maybe_last_stage: Option<Discriminant<ActionStage>>,
     retain_completed_for: Duration,
+    /// `None` when expiry is disabled. Never `Some(Duration::ZERO)`: Redis
+    /// treats `EXPIRE key 0` as an immediate delete, so a zero TTL would
+    /// destroy the mapping it is meant to retain.
+    retain_client_mapping_for: Option<Duration>,
 }
 
 impl<S: SchedulerStore, I: InstantWrapper, NowFn: Fn() -> I + core::fmt::Debug> core::fmt::Debug
@@ -102,6 +106,7 @@ where
         weak_store: Weak<S>,
         now_fn: NowFn,
         retain_completed_for: Duration,
+        retain_client_mapping_for: Option<Duration>,
     ) -> Self {
         Self {
             maybe_client_operation_id,
@@ -112,6 +117,7 @@ where
             now_fn,
             maybe_last_stage: None,
             retain_completed_for,
+            retain_client_mapping_for,
         }
     }
 
@@ -243,7 +249,13 @@ where
                                 operation_id,
                                 timestamp: now_ts,
                             },
-                            None,
+                            // `ck_*` used to be written with no expiry and
+                            // collected only by the scheduler Redis being a
+                            // pod that got wiped nightly. On a managed store
+                            // with `noeviction` that is an unbounded leak, so
+                            // it now carries a TTL. Refreshed on every poll,
+                            // so a live client keeps it alive.
+                            self.retain_client_mapping_for,
                         )
                         .await;
 
@@ -642,6 +654,8 @@ where
     operation_id_creator: F,
     _pull_task_change_subscriber_spawn: JoinHandleDropGuard<()>,
     retain_completed_for: Duration,
+    /// See [`OperationSubscriber::retain_client_mapping_for`].
+    retain_client_mapping_for: Option<Duration>,
 }
 
 impl<S, F, I, NowFn> StoreAwaitedActionDb<S, F, I, NowFn>
@@ -657,6 +671,7 @@ where
         now_fn: NowFn,
         operation_id_creator: F,
         retain_completed_for_s: u32,
+        retain_client_mapping_for_s: u32,
     ) -> Result<Self, Error> {
         let mut subscription = store
             .subscription_manager()
@@ -693,6 +708,11 @@ where
             operation_id_creator,
             _pull_task_change_subscriber_spawn: pull_task_change_subscriber,
             retain_completed_for: Duration::from_secs(retain_completed_for_s.into()),
+            // 0 means "no expiry", per `retain_client_mapping_for_s`. It must
+            // become `None` rather than a zero Duration — `EXPIRE key 0`
+            // deletes the key on the spot.
+            retain_client_mapping_for: (retain_client_mapping_for_s != 0)
+                .then(|| Duration::from_secs(retain_client_mapping_for_s.into())),
         })
     }
 
@@ -859,6 +879,7 @@ where
             Arc::downgrade(&self.store),
             self.now_fn.clone(),
             self.retain_completed_for,
+            self.retain_client_mapping_for,
         )))
     }
 }
@@ -890,6 +911,7 @@ where
             Arc::downgrade(&self.store),
             self.now_fn.clone(),
             self.retain_completed_for,
+            self.retain_client_mapping_for,
         )))
     }
 
@@ -973,7 +995,12 @@ where
                         client_operation_id: client_operation_id.clone(),
                         operation_id: operation_id.clone(),
                     },
-                    None,
+                    // Same leak as `ck_*`: written once per action and never
+                    // cleaned up except lazily when a client polls a dead
+                    // mapping. The TTL must comfortably exceed the longest
+                    // action, since an expiry mid-build breaks that client's
+                    // lookup — see `retain_client_mapping_for_s`.
+                    self.retain_client_mapping_for,
                 )
                 .await
                 .err_tip(|| "In RedisAwaitedActionDb::add_action while adding client mapping")?;
@@ -984,6 +1011,7 @@ where
                 Arc::downgrade(&self.store),
                 self.now_fn.clone(),
                 self.retain_completed_for,
+                self.retain_client_mapping_for,
             ));
         }
     }
@@ -1027,6 +1055,7 @@ where
                     Arc::downgrade(&self.store),
                     self.now_fn.clone(),
                     self.retain_completed_for,
+                    self.retain_client_mapping_for,
                 )
             }))
     }
@@ -1046,6 +1075,7 @@ where
                     Arc::downgrade(&self.store),
                     self.now_fn.clone(),
                     self.retain_completed_for,
+                    self.retain_client_mapping_for,
                 )
             }))
     }

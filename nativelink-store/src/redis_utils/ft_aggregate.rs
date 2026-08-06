@@ -24,17 +24,122 @@ use tracing::{error, warn};
 use crate::redis_utils::aggregate_types::RedisCursorData;
 use crate::redis_utils::ft_cursor_read::ft_cursor_read;
 
+/// How to walk a result set larger than one reply.
+///
+/// The two arms are not interchangeable tuning choices — they are dictated by
+/// the server. `RediSearch` has server-side cursors; valkey-search has no
+/// `FT.CURSOR` at all, so there it is `LIMIT` or nothing.
 #[derive(Debug)]
-pub(crate) struct FtAggregateCursor {
-    pub count: u64,
-    pub max_idle: u64,
+pub(crate) enum FtAggregatePaging {
+    /// `WITHCURSOR COUNT <count> MAXIDLE <max_idle>`, walked with
+    /// `FT.CURSOR READ`. `RediSearch` only.
+    Cursor { count: u64, max_idle: u64 },
+
+    /// `LIMIT <offset> <page_size>`, walked by re-issuing the whole query with
+    /// an advancing offset.
+    ///
+    /// Unlike a cursor this is not a snapshot: a document written between two
+    /// pages can shift across the boundary and be seen twice or missed. Both
+    /// callers re-run on a timer and treat a missed row as "next tick", so the
+    /// exposure is one poll interval. `SORTBY` on a near-monotonic key keeps
+    /// the ordering stable enough that this is rare in practice.
+    Limit { page_size: u64 },
+}
+
+/// Which fields to pull back with each row.
+#[derive(Debug)]
+pub(crate) enum FtLoad {
+    /// `LOAD <n> <field>…` — only valid for fields that are in the index
+    /// schema on valkey-search, which is why the payload cannot be named there.
+    Named(Vec<String>),
+
+    /// `LOAD *` — every field on the hash.
+    ///
+    /// Required on valkey-search: it rejects a named non-indexed field with
+    /// ``Index field `data` does not exist``, and `data`/`version` are
+    /// deliberately not indexed. `LOAD *` returns them fine. The cost is that
+    /// the indexed fields ride along too, so the row decoder must ignore
+    /// anything that is not the payload.
+    All,
 }
 
 #[derive(Debug)]
 pub(crate) struct FtAggregateOptions {
-    pub load: Vec<String>,
-    pub cursor: FtAggregateCursor,
+    pub load: FtLoad,
+    pub paging: FtAggregatePaging,
     pub sort_by: Vec<String>,
+}
+
+/// Backstop on `Limit` paging so a server that always returns a full page
+/// cannot spin forever. At the default page size of 1500 this is ~96k rows,
+/// far beyond any real scheduler queue.
+const MAX_LIMIT_PAGES: u64 = 64;
+
+/// Build one `FT.AGGREGATE` invocation.
+///
+/// Argument order differs per paging mode on purpose. The cursor form keeps
+/// the historical `LOAD … WITHCURSOR … SORTBY` order that `RediSearch` has always
+/// accepted here; the limit form uses the canonical `LOAD … SORTBY … LIMIT`
+/// order that valkey-search's parser expects.
+fn build_aggregate_cmd(
+    index: &str,
+    query: &str,
+    load: &FtLoad,
+    sort_by: &[String],
+    paging: &FtAggregatePaging,
+    offset: u64,
+) -> redis::Cmd {
+    let mut cmd = redis::cmd("FT.AGGREGATE");
+    cmd.arg(index).arg(query).arg("LOAD");
+    match load {
+        FtLoad::All => {
+            cmd.arg("*");
+        }
+        FtLoad::Named(fields) => {
+            cmd.arg(fields.len());
+            for field in fields {
+                cmd.arg(field);
+            }
+        }
+    }
+
+    let sort_by_args = |cmd: &mut redis::Cmd| {
+        if sort_by.is_empty() {
+            return;
+        }
+        cmd.arg("SORTBY").arg(sort_by.len() * 2);
+        for key in sort_by {
+            cmd.arg(key).arg("ASC");
+        }
+    };
+
+    match paging {
+        FtAggregatePaging::Cursor { count, max_idle } => {
+            cmd.arg("WITHCURSOR")
+                .arg("COUNT")
+                .arg(*count)
+                .arg("MAXIDLE")
+                .arg(*max_idle);
+            sort_by_args(&mut cmd);
+        }
+        FtAggregatePaging::Limit { page_size } => {
+            sort_by_args(&mut cmd);
+            cmd.arg("LIMIT").arg(offset).arg(*page_size);
+        }
+    }
+    cmd
+}
+
+fn describe_args(cmd: &redis::Cmd) -> Vec<String> {
+    cmd.args_iter()
+        .map(|a| match a {
+            Arg::Simple(bytes) => match str::from_utf8(bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => format!("{bytes:?}"),
+            },
+            other => format!("{other:?}"),
+        })
+        .collect()
 }
 
 /// Calls `FT.AGGREGATE` in redis. redis-rs does not properly support this command
@@ -51,68 +156,70 @@ where
     struct State<C: ConnectionLike> {
         connection_manager: C,
         index: String,
+        query: String,
+        options: FtAggregateOptions,
         data: RedisCursorData,
         aggregate_start: Instant,
         first_batch_ms: u128,
-        cursor_rounds: u64,
+        rounds: u64,
+        /// Rows already yielded; also the `LIMIT` offset of the next page.
+        offset: u64,
+        /// Set once a page comes back short, or the cursor reaches 0.
+        exhausted: bool,
     }
 
-    let mut cmd = redis::cmd("FT.AGGREGATE");
-    let mut ft_aggregate_cmd = cmd
-        .arg(&index)
-        .arg(&query)
-        .arg("LOAD")
-        .arg(options.load.len())
-        .arg(&options.load)
-        .arg("WITHCURSOR")
-        .arg("COUNT")
-        .arg(options.cursor.count)
-        .arg("MAXIDLE")
-        .arg(options.cursor.max_idle)
-        .arg("SORTBY")
-        .arg(options.sort_by.len() * 2);
-    for key in &options.sort_by {
-        ft_aggregate_cmd = ft_aggregate_cmd.arg(key).arg("ASC");
-    }
+    let first_cmd = build_aggregate_cmd(
+        &index,
+        &query,
+        &options.load,
+        &options.sort_by,
+        &options.paging,
+        0,
+    );
     let aggregate_start = Instant::now();
-    let res = ft_aggregate_cmd
+    let res = first_cmd
+        .clone()
         .query_async::<Value>(&mut connection_manager)
         .await;
     let first_batch_ms = aggregate_start.elapsed().as_millis();
     let data = match res {
         Ok(d) => d,
         Err(e) => {
-            let all_args: Vec<_> = ft_aggregate_cmd
-                .args_iter()
-                .map(|a| match a {
-                    Arg::Simple(bytes) => match str::from_utf8(bytes) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => format!("{bytes:?}"),
-                    },
-                    other => {
-                        format!("{other:?}")
-                    }
-                })
-                .collect();
             error!(
                 ?e,
                 index,
                 ?query,
-                ?options,
-                ?all_args,
+                options = ?options,
+                all_args = ?describe_args(&first_cmd),
                 "Error calling ft.aggregate"
             );
             return Err(e);
         }
     };
 
+    let data = parse_aggregate_reply(data, &options.paging)?;
+    let page_size = match options.paging {
+        FtAggregatePaging::Cursor { .. } => 0,
+        FtAggregatePaging::Limit { page_size } => page_size,
+    };
+    let first_len = data.data.len() as u64;
+    let exhausted = match options.paging {
+        // The cursor arm decides via `data.cursor` in the loop below.
+        FtAggregatePaging::Cursor { .. } => false,
+        FtAggregatePaging::Limit { .. } => first_len < page_size,
+    };
+
     let state = State {
         connection_manager,
         index,
-        data: data.try_into()?,
+        query,
+        options,
+        data,
         aggregate_start,
         first_batch_ms,
-        cursor_rounds: 0,
+        rounds: 0,
+        offset: first_len,
+        exhausted,
     };
 
     Ok(futures::stream::unfold(
@@ -123,26 +230,73 @@ where
                 if let Some(map) = state.data.data.pop_front() {
                     return Some((Ok(map), Some(state)));
                 }
-                if state.data.cursor == 0 {
+
+                let done = match state.options.paging {
+                    FtAggregatePaging::Cursor { .. } => state.data.cursor == 0,
+                    FtAggregatePaging::Limit { .. } => {
+                        state.exhausted || state.rounds >= MAX_LIMIT_PAGES
+                    }
+                };
+                if done {
+                    if state.rounds >= MAX_LIMIT_PAGES {
+                        warn!(
+                            index = %state.index,
+                            rows_returned = state.offset,
+                            total_results = state.data.total,
+                            "ft_aggregate LIMIT paging hit MAX_LIMIT_PAGES; result set truncated"
+                        );
+                    }
                     let total_elapsed = state.aggregate_start.elapsed();
                     if total_elapsed > Duration::from_millis(500) {
                         warn!(
                             index = %state.index,
                             ft_aggregate_first_batch_ms = state.first_batch_ms as u64,
-                            ft_aggregate_cursor_rounds = state.cursor_rounds,
+                            ft_aggregate_rounds = state.rounds,
                             ft_aggregate_total_ms = total_elapsed.as_millis() as u64,
                             "Slow ft_aggregate"
                         );
                     }
                     return None;
                 }
-                let data_res = ft_cursor_read(
-                    &mut state.connection_manager,
-                    state.index.clone(),
-                    state.data.cursor,
-                )
-                .await;
-                state.cursor_rounds += 1;
+
+                let data_res = match state.options.paging {
+                    FtAggregatePaging::Cursor { .. } => ft_cursor_read(
+                        &mut state.connection_manager,
+                        state.index.clone(),
+                        state.data.cursor,
+                    )
+                    .await,
+                    FtAggregatePaging::Limit { page_size } => {
+                        let cmd = build_aggregate_cmd(
+                            &state.index,
+                            &state.query,
+                            &state.options.load,
+                            &state.options.sort_by,
+                            &state.options.paging,
+                            state.offset,
+                        );
+                        match cmd.query_async::<Value>(&mut state.connection_manager).await {
+                            Ok(v) => parse_aggregate_reply(v, &state.options.paging).inspect(
+                                |parsed| {
+                                    let got = parsed.data.len() as u64;
+                                    state.offset += got;
+                                    state.exhausted = got < page_size;
+                                },
+                            ),
+                            Err(e) => {
+                                error!(
+                                    ?e,
+                                    index = %state.index,
+                                    offset = state.offset,
+                                    all_args = ?describe_args(&cmd),
+                                    "Error paging ft.aggregate with LIMIT"
+                                );
+                                Err(e)
+                            }
+                        }
+                    }
+                };
+                state.rounds += 1;
                 state.data = match data_res {
                     Ok(data) => data,
                     Err(err) => return Some((Err(err), None)),
@@ -150,6 +304,48 @@ where
             }
         },
     ))
+}
+
+/// Turn one `FT.AGGREGATE` reply into [`RedisCursorData`].
+///
+/// The two paging modes produce different top-level shapes and both are
+/// `Value::Array` under RESP2, so we dispatch on the mode we asked for rather
+/// than sniffing:
+///
+/// - `WITHCURSOR` → `[ <results>, <cursor-id> ]`
+/// - `LIMIT`      → `<results>` on its own, with no cursor element
+fn parse_aggregate_reply(
+    raw_value: Value,
+    paging: &FtAggregatePaging,
+) -> Result<RedisCursorData, RedisError> {
+    match paging {
+        FtAggregatePaging::Cursor { .. } => RedisCursorData::try_from(raw_value),
+        FtAggregatePaging::Limit { .. } => {
+            let mut output = RedisCursorData::default();
+            parse_results_value(&mut output, raw_value)?;
+            // No server-side cursor exists; paging is driven by the offset.
+            output.cursor = 0;
+            Ok(output)
+        }
+    }
+}
+
+fn parse_results_value(
+    output: &mut RedisCursorData,
+    raw_value: Value,
+) -> Result<(), RedisError> {
+    match raw_value {
+        Value::Array(d) => resp2_data_parse(output, &d),
+        Value::Map(d) => resp3_data_parse(output, &d),
+        other => {
+            error!(?other, "Bad data in ft.aggregate, expected array or map");
+            Err(RedisError::from((
+                ErrorKind::Parse,
+                "Non map item",
+                format!("{other:?}"),
+            )))
+        }
+    }
 }
 
 fn resp2_data_parse(
@@ -337,12 +533,11 @@ fn resp3_data_parse(
                     )));
                 }
             }
-            _ => {
-                return Err(RedisError::from((
-                    ErrorKind::Parse,
-                    "Unexpected key in ft.aggregate",
-                    format!("{key} => {value:?}"),
-                )));
+            // valkey-search is a separate implementation and may add reply
+            // fields RediSearch never sent. An unrecognized informational key
+            // is not a reason to fail a scheduler poll.
+            other => {
+                warn!(key = %other, ?value, "Ignoring unknown key in ft.aggregate reply");
             }
         }
     }
@@ -367,21 +562,7 @@ impl TryFrom<Value> for RedisCursorData {
         }
         let mut output = Self::default();
         let mut value = value.into_iter();
-        match value.next().unwrap() {
-            Value::Array(d) => resp2_data_parse(&mut output, &d)?,
-            Value::Map(d) => resp3_data_parse(&mut output, &d)?,
-            other => {
-                error!(
-                    ?other,
-                    "Bad data in ft.aggregate, expected array for results"
-                );
-                return Err(RedisError::from((
-                    ErrorKind::Parse,
-                    "Non map item",
-                    format!("{other:?}"),
-                )));
-            }
-        }
+        parse_results_value(&mut output, value.next().unwrap())?;
         let Value::Int(cursor) = value.next().unwrap() else {
             return Err(RedisError::from((
                 ErrorKind::Parse,
@@ -390,5 +571,204 @@ impl TryFrom<Value> for RedisCursorData {
         };
         output.cursor = cursor as u64;
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load() -> FtLoad {
+        FtLoad::Named(vec!["data".to_string(), "version".to_string()])
+    }
+
+    fn args_of(cmd: &redis::Cmd) -> Vec<String> {
+        describe_args(cmd)
+    }
+
+    /// The `RediSearch` wire form must not drift — it is the path in production
+    /// today and the one `redis_store_test.rs` exercises against a real module.
+    #[test]
+    fn builds_cursor_wire_form() {
+        let cmd = build_aggregate_cmd(
+            "idx",
+            "@state:{ queued }",
+            &load(),
+            &["@sort_key".to_string()],
+            &FtAggregatePaging::Cursor {
+                count: 1500,
+                max_idle: 30_000,
+            },
+            0,
+        );
+        assert_eq!(
+            args_of(&cmd),
+            vec![
+                "FT.AGGREGATE",
+                "idx",
+                "@state:{ queued }",
+                "LOAD",
+                "2",
+                "data",
+                "version",
+                "WITHCURSOR",
+                "COUNT",
+                "1500",
+                "MAXIDLE",
+                "30000",
+                "SORTBY",
+                "2",
+                "@sort_key",
+                "ASC",
+            ]
+        );
+    }
+
+    /// valkey-search form: SORTBY before LIMIT, no cursor clause, and the
+    /// offset advances per page.
+    #[test]
+    fn builds_limit_wire_form_with_offset() {
+        let cmd = build_aggregate_cmd(
+            "idx",
+            "@state:{ queued }",
+            &load(),
+            &["@sort_key".to_string()],
+            &FtAggregatePaging::Limit { page_size: 1500 },
+            3000,
+        );
+        assert_eq!(
+            args_of(&cmd),
+            vec![
+                "FT.AGGREGATE",
+                "idx",
+                "@state:{ queued }",
+                "LOAD",
+                "2",
+                "data",
+                "version",
+                "SORTBY",
+                "2",
+                "@sort_key",
+                "ASC",
+                "LIMIT",
+                "3000",
+                "1500",
+            ]
+        );
+    }
+
+    /// The exact command issued against valkey-search. Verified by hand
+    /// against `ElastiCache` Valkey 9.1: naming `data`/`version` here fails with
+    /// ``Index field `data` does not exist`` because they are not in the index
+    /// schema, so `LOAD *` is load-bearing rather than a shortcut.
+    #[test]
+    fn builds_valkey_search_wire_form() {
+        let cmd = build_aggregate_cmd(
+            "aa__state_sort_key_3e762c15",
+            "@state:{ queued }",
+            &FtLoad::All,
+            &["@sort_key".to_string()],
+            &FtAggregatePaging::Limit { page_size: 1500 },
+            0,
+        );
+        assert_eq!(
+            args_of(&cmd),
+            vec![
+                "FT.AGGREGATE",
+                "aa__state_sort_key_3e762c15",
+                "@state:{ queued }",
+                "LOAD",
+                "*",
+                "SORTBY",
+                "2",
+                "@sort_key",
+                "ASC",
+                "LIMIT",
+                "0",
+                "1500",
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_limit_wire_form_without_sort_key() {
+        let cmd = build_aggregate_cmd(
+            "idx",
+            "*",
+            &FtLoad::Named(vec!["data".to_string()]),
+            &[],
+            &FtAggregatePaging::Limit { page_size: 10 },
+            0,
+        );
+        assert_eq!(
+            args_of(&cmd),
+            vec!["FT.AGGREGATE", "idx", "*", "LOAD", "1", "data", "LIMIT", "0", "10"]
+        );
+    }
+
+    /// A `LIMIT` reply has no trailing cursor element. Parsing it as the
+    /// cursor shape would consume the first row as the results array and the
+    /// second as a cursor id.
+    #[test]
+    fn parses_cursorless_resp2_reply() {
+        let reply = Value::Array(vec![
+            Value::Int(2),
+            Value::Array(vec![
+                Value::SimpleString("data".into()),
+                Value::SimpleString("a".into()),
+            ]),
+            Value::Array(vec![
+                Value::SimpleString("data".into()),
+                Value::SimpleString("b".into()),
+            ]),
+        ]);
+        let parsed =
+            parse_aggregate_reply(reply, &FtAggregatePaging::Limit { page_size: 1500 }).unwrap();
+        assert_eq!(parsed.total, 2);
+        assert_eq!(parsed.cursor, 0);
+        assert_eq!(parsed.data.len(), 2);
+    }
+
+    #[test]
+    fn parses_cursor_resp2_reply() {
+        let reply = Value::Array(vec![
+            Value::Array(vec![
+                Value::Int(1),
+                Value::Array(vec![
+                    Value::SimpleString("data".into()),
+                    Value::SimpleString("a".into()),
+                ]),
+            ]),
+            Value::Int(42),
+        ]);
+        let parsed = parse_aggregate_reply(
+            reply,
+            &FtAggregatePaging::Cursor {
+                count: 10,
+                max_idle: 30_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(parsed.total, 1);
+        assert_eq!(parsed.cursor, 42);
+        assert_eq!(parsed.data.len(), 1);
+    }
+
+    /// An unfamiliar informational key must not fail the poll.
+    #[test]
+    fn resp3_tolerates_unknown_keys() {
+        let mut output = RedisCursorData::default();
+        let map = vec![
+            (
+                Value::SimpleString("total_results".into()),
+                Value::Int(7),
+            ),
+            (
+                Value::SimpleString("some_new_valkey_field".into()),
+                Value::Int(1),
+            ),
+        ];
+        resp3_data_parse(&mut output, &map).unwrap();
+        assert_eq!(output.total, 7);
     }
 }

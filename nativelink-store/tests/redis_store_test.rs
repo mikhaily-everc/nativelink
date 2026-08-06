@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
-use nativelink_config::stores::{RedisMode, RedisSpec};
+use nativelink_config::stores::{RedisMode, RedisSearchBackend, RedisSpec};
 use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_redis_tester::{
@@ -112,6 +112,10 @@ async fn make_mock_store_with_prefix(
         // normalisation that `set_spec_defaults` would otherwise apply via the
         // spec-construction path, and the FT.CREATE mock expects TEMPORARY 86400.
         86400,
+        // These mocks pin the RediSearch wire form (TEMPORARY, NOHL, …), which
+        // is the default backend. valkey-search emits a different command and
+        // is covered by unit tests in `redis_utils::ft_aggregate`.
+        RedisSearchBackend::Redisearch,
         Duration::from_secs(4),
         rx,
         manager,
@@ -1137,7 +1141,7 @@ fn test_search_by_index_failure() -> Result<(), Error> {
         "Client: TEST - Client: unexpected command", "Error with ft_create in RedisStore::search_by_index_prefix(test:_content_prefix_sort_key_3e762c15)", "---", "Client: TEST - Client: unexpected command", "Error with second ft_aggregate in RedisStore::search_by_index_prefix(test:_content_prefix_sort_key_3e762c15)"].iter().map(ToString::to_string).collect()));
 
     assert!(logs_contain(
-        "Error calling ft.aggregate e=TEST - Client: unexpected command index=\"test:_content_prefix_sort_key_3e762c15\" query=\"*\" options=FtAggregateOptions { load: [\"data\", \"version\"], cursor: FtAggregateCursor { count: 1500, max_idle: 30000 }, sort_by: [\"@sort_key\"] } all_args=[\"FT.AGGREGATE\", \"test:_content_prefix_sort_key_3e762c15\", \"*\", \"LOAD\", \"2\", \"data\", \"version\", \"WITHCURSOR\", \"COUNT\", \"1500\", \"MAXIDLE\", \"30000\", \"SORTBY\", \"2\", \"@sort_key\", \"ASC\"]"
+        "Error calling ft.aggregate e=TEST - Client: unexpected command index=\"test:_content_prefix_sort_key_3e762c15\" query=\"*\" options=FtAggregateOptions { load: Named([\"data\", \"version\"]), paging: Cursor { count: 1500, max_idle: 30000 }, sort_by: [\"@sort_key\"] } all_args=[\"FT.AGGREGATE\", \"test:_content_prefix_sort_key_3e762c15\", \"*\", \"LOAD\", \"2\", \"data\", \"version\", \"WITHCURSOR\", \"COUNT\", \"1500\", \"MAXIDLE\", \"30000\", \"SORTBY\", \"2\", \"@sort_key\", \"ASC\"]"
     ));
 
     Ok(())

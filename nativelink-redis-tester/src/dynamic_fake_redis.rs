@@ -34,6 +34,10 @@ pub trait SubscriptionManagerNotify {
 pub struct FakeRedisBackend<S: SubscriptionManagerNotify> {
     /// Contains a list of all of the Redis keys -> fields.
     pub table: Arc<Mutex<HashMap<String, HashMap<String, Value>>>>,
+    /// Key -> TTL in seconds, as last set by `EXPIRE`. Nothing here actually
+    /// expires; the map exists so a test can assert that a write carried the
+    /// TTL it was supposed to.
+    pub expiries: Arc<Mutex<HashMap<String, u64>>>,
     subscription_manager: Arc<Mutex<Option<Arc<S>>>>,
 }
 
@@ -55,6 +59,7 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
     pub fn new() -> Self {
         Self {
             table: Arc::new(Mutex::new(HashMap::new())),
+            expiries: Arc::new(Mutex::new(HashMap::new())),
             subscription_manager: Arc::new(Mutex::new(None)),
         }
     }
@@ -347,6 +352,29 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
                             trace!(%key_name, "Getting keys with HMGET, empty");
                             let null_count = i64::try_from(args.len() - 1).unwrap();
                             Value::Array(vec![Value::Nil, Value::Int(null_count)])
+                        }
+                    }
+                    "EXPIRE" => {
+                        let key_name =
+                            str::from_utf8(args[0].as_bytes().expect("Key argument is not bytes"))
+                                .expect("Unable to parse key as string");
+                        let seconds: u64 =
+                            str::from_utf8(args[1].as_bytes().expect("TTL argument is not bytes"))
+                                .expect("Unable to parse TTL as string")
+                                .parse()
+                                .expect("TTL is not a number");
+                        // Redis answers 1 when the key existed and the TTL was
+                        // applied, 0 when there was no such key.
+                        if self.table.lock().unwrap().contains_key(key_name) {
+                            debug!(%key_name, seconds, "Setting TTL with EXPIRE");
+                            self.expiries
+                                .lock()
+                                .unwrap()
+                                .insert(key_name.into(), seconds);
+                            Value::Int(1)
+                        } else {
+                            debug!(%key_name, "EXPIRE on a key that does not exist");
+                            Value::Int(0)
                         }
                     }
                     actual => {

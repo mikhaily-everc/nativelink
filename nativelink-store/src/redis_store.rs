@@ -30,7 +30,7 @@ use const_format::formatcp;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future};
 use itertools::izip;
-use nativelink_config::stores::{RedisMode, RedisSpec};
+use nativelink_config::stores::{RedisMode, RedisSearchBackend, RedisSpec};
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_redis_tester::SubscriptionManagerNotify;
@@ -64,7 +64,8 @@ use uuid::Uuid;
 
 use crate::cas_utils::is_zero_digest;
 use crate::redis_utils::{
-    FtAggregateCursor, FtAggregateOptions, FtCreateOptions, SearchSchema, ft_aggregate, ft_create,
+    FtAggregateOptions, FtAggregatePaging, FtCreateOptions, FtLoad, SearchSchema, ft_aggregate,
+    ft_create,
 };
 
 /// The default size of the read chunk when reading data from Redis.
@@ -340,9 +341,13 @@ where
 
     /// TTL (seconds) passed to `FT.CREATE TEMPORARY` for scheduler RediSearch
     /// indexes created by this store. See
-    /// [`RedisSpec::experimental_index_ttl_s`].
+    /// [`RedisSpec::experimental_index_ttl_s`]. Ignored when
+    /// [`Self::search_backend`] is `ValkeySearch`, which has no `TEMPORARY`.
     #[metric(help = "TTL (seconds) applied to scheduler RediSearch indexes via FT.CREATE TEMPORARY")]
     index_ttl_s: u64,
+
+    /// Which `FT.*` dialect to emit. See [`RedisSearchBackend`].
+    search_backend: RedisSearchBackend,
 
     /// A manager for subscriptions to keys in Redis.
     subscription_manager: tokio::sync::OnceCell<Arc<RedisSubscriptionManager>>,
@@ -423,6 +428,7 @@ where
         max_client_permits: usize,
         max_count_per_cursor: u64,
         index_ttl_s: u64,
+        search_backend: RedisSearchBackend,
         health_check_timeout: Duration,
         subscriber_channel: UnboundedReceiver<PushInfo>,
         connection_manager: M,
@@ -443,6 +449,7 @@ where
             client_permits: Arc::new(Semaphore::new(max_client_permits)),
             max_count_per_cursor,
             index_ttl_s,
+            search_backend,
             health_check_timeout,
         })
     }
@@ -625,6 +632,7 @@ impl RedisStore<ClusterConnection, ClusterRedisManager<ClusterConnection>> {
             spec.max_client_permits,
             spec.max_count_per_cursor,
             spec.experimental_index_ttl_s,
+            spec.search_backend,
             Duration::from_millis(spec.health_check_timeout_ms),
             subscriber_channel,
             ClusterRedisManager::new(client.get_async_connection().await?).await?,
@@ -753,6 +761,7 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
             spec.max_client_permits,
             spec.max_count_per_cursor,
             spec.experimental_index_ttl_s,
+            spec.search_backend,
             Duration::from_millis(spec.health_check_timeout_ms),
             subscriber_channel,
             StandardRedisManager::new(Box::new(move || {
@@ -1205,6 +1214,10 @@ where
 
 /// The time in milliseconds that a redis cursor can be idle before it is closed.
 const CURSOR_IDLE_MS: u64 = 30_000;
+/// Tag value used to build a match-all query on valkey-search, which has no
+/// `*`. It must be a value no real index field can hold; index values are
+/// sanitized by [`try_sanitize`], which rejects the `:` this contains.
+const MATCH_ALL_SENTINEL_TAG: &str = "__nativelink:match_all";
 /// The name of the field in the Redis hash that stores the data.
 const DATA_FIELD_NAME: &str = "data";
 /// The name of the field in the Redis hash that stores the version.
@@ -1268,6 +1281,16 @@ return {{ 1, new_version }}
 );
 
 /// This is the output of the calculations below hardcoded into the executable.
+///
+/// Deliberately NOT bumped when [`RedisSearchBackend::ValkeySearch`] was added.
+/// The fingerprint exists to force a fresh index when the *schema* changes, and
+/// the schema is identical on both backends (`PREFIX aa_`, `state TAG`,
+/// `sort_key TAG SORTABLE`) — only the non-semantic layout hints
+/// (`NOHL`/`NOFIELDS`/`NOFREQS`/`NOOFFSETS`/`TEMPORARY`) differ, and those
+/// describe how RediSearch stores the index rather than what it contains.
+/// Keeping one value means `SCHEDULER_REDIS_INDEX_NAME` in
+/// `worker-provisioner-deployment.yaml` does not have to be rolled in lockstep,
+/// and a rollback to the RediSearch pod reuses the same index names.
 const FINGERPRINT_CREATE_INDEX_HEX: &str = "3e762c15";
 
 #[cfg(test)]
@@ -1797,15 +1820,37 @@ where
                     get_index_name!(K::KEY_PREFIX, K::INDEX_NAME, K::MAYBE_SORT_KEY)
                 ),
                 if index_value.is_empty() {
-                    "*".to_string()
+                    match self.search_backend {
+                        RedisSearchBackend::Redisearch => "*".to_string(),
+                        // valkey-search has no bare `*` match-all — it answers
+                        // `Invalid query string syntax`, and `@f:{*}` is
+                        // rejected as too short for a prefix wildcard. Negating
+                        // a tag value that cannot occur selects everything.
+                        RedisSearchBackend::ValkeySearch => {
+                            format!("-@{}:{{{MATCH_ALL_SENTINEL_TAG}}}", K::INDEX_NAME)
+                        }
+                    }
                 } else {
                     format!("@{}:{{ {} }}", K::INDEX_NAME, index_value)
                 },
                 FtAggregateOptions {
-                    load: vec![DATA_FIELD_NAME.into(), VERSION_FIELD_NAME.into()],
-                    cursor: FtAggregateCursor {
-                        count: self.max_count_per_cursor,
-                        max_idle: CURSOR_IDLE_MS,
+                    load: match self.search_backend {
+                        RedisSearchBackend::Redisearch => FtLoad::Named(vec![
+                            DATA_FIELD_NAME.into(),
+                            VERSION_FIELD_NAME.into(),
+                        ]),
+                        // See `FtLoad::All` — naming a non-indexed field is an
+                        // error on valkey-search, and the payload is not indexed.
+                        RedisSearchBackend::ValkeySearch => FtLoad::All,
+                    },
+                    paging: match self.search_backend {
+                        RedisSearchBackend::Redisearch => FtAggregatePaging::Cursor {
+                            count: self.max_count_per_cursor,
+                            max_idle: CURSOR_IDLE_MS,
+                        },
+                        RedisSearchBackend::ValkeySearch => FtAggregatePaging::Limit {
+                            page_size: self.max_count_per_cursor,
+                        },
                     },
                     sort_by: K::MAYBE_SORT_KEY.map_or_else(Vec::new, |v| vec![format!("@{v}")]),
                 },
@@ -1823,13 +1868,31 @@ where
                     sortable: true,
                 });
             }
-            let create_options = FtCreateOptions {
-                prefixes: vec![K::KEY_PREFIX.into()],
-                nohl: true,
-                nofields: true,
-                nofreqs: true,
-                nooffsets: true,
-                temporary: Some(self.index_ttl_s),
+            // valkey-search rejects the RediSearch index-layout flags and has
+            // no TEMPORARY, so the flag-free form is not a simplification —
+            // it is the only form that parses there. See `RedisSearchBackend`.
+            //
+            // Dropping TEMPORARY also drops the idle-expiry that used to
+            // garbage-collect the dedup index overnight. That is covered
+            // instead by per-key TTLs (`retain_completed_for_s` for `aa_*`,
+            // `client_mapping_ttl_s` for `cid_*`/`ck_*`).
+            let create_options = match self.search_backend {
+                RedisSearchBackend::Redisearch => FtCreateOptions {
+                    prefixes: vec![K::KEY_PREFIX.into()],
+                    nohl: true,
+                    nofields: true,
+                    nofreqs: true,
+                    nooffsets: true,
+                    temporary: Some(self.index_ttl_s),
+                },
+                RedisSearchBackend::ValkeySearch => FtCreateOptions {
+                    prefixes: vec![K::KEY_PREFIX.into()],
+                    nohl: false,
+                    nofields: false,
+                    nofreqs: false,
+                    nooffsets: false,
+                    temporary: None,
+                },
             };
             let index = format!(
                 "{}",
@@ -1974,16 +2037,15 @@ where
                         };
                         version = Some(raw_version);
                     }
-                    other => {
-                        if K::MAYBE_SORT_KEY == Some(other) {
-                            // ignore sort keys
-                        } else {
-                            return Some(Err(Error::new(
-                                Code::Internal,
-                                format!("Extra keys from ft_aggregate: {other}"),
-                            )));
-                        }
-                    }
+                    // Anything that is not the payload is ignored. Under
+                    // valkey-search we ask for `LOAD *` (it rejects named
+                    // non-indexed fields), so every indexed field on the hash
+                    // comes back too — the sort key, the index field, and the
+                    // dedup qualifier. This used to be an error, which was only
+                    // ever a guard against a stale LOAD list; the real
+                    // requirement is enforced below, where a missing `data` is
+                    // still fatal.
+                    _other => {}
                 }
             }
             let Some(found_bytes_data) = bytes_data else {

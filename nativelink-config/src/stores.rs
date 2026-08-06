@@ -1570,10 +1570,10 @@ pub struct RedisSpec {
     #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub max_count_per_cursor: u64,
 
-    /// TTL (seconds) passed to `FT.CREATE TEMPORARY` for scheduler RediSearch
+    /// TTL (seconds) passed to `FT.CREATE TEMPORARY` for scheduler `RediSearch`
     /// indexes created by this store. The idle timer resets on every
     /// `FT.SEARCH`, `FT.AGGREGATE`, or write to a matching-prefix hash; when
-    /// it elapses without activity, RediSearch auto-drops the index (which
+    /// it elapses without activity, `RediSearch` auto-drops the index (which
     /// clears the DocTable high-water mark and is re-created idempotently on
     /// next use). Only applies to stores that create search indexes
     /// (scheduler backend); no effect on pure K/V AC/CAS stores.
@@ -1583,6 +1583,38 @@ pub struct RedisSpec {
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::numeric"))]
     pub experimental_index_ttl_s: u64,
+
+    /// Which secondary-index engine the server provides. This changes the
+    /// `FT.*` dialect we emit; it is not a preference but a compatibility
+    /// switch, and getting it wrong produces syntax errors at index creation.
+    /// Only meaningful for stores that create search indexes (the scheduler
+    /// backend); ignored by pure K/V AC/CAS stores.
+    ///
+    /// Default: `redisearch`.
+    #[serde(default)]
+    pub search_backend: RedisSearchBackend,
+}
+
+/// The secondary-index engine backing `FT.*` commands.
+///
+/// These are not the same implementation and they do not accept the same
+/// syntax. `valkey-search` is a ground-up reimplementation, so index-creation
+/// flags that `RediSearch` treats as tuning hints are hard errors there.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub enum RedisSearchBackend {
+    /// The `RediSearch` module, as bundled with Redis Stack and Redis 8
+    /// (`redisearch.so`). Supports index-layout flags (`NOHL`, `NOFIELDS`,
+    /// `NOFREQS`), idle-expiring `TEMPORARY` indexes, and cursor paging
+    /// (`WITHCURSOR` / `FT.CURSOR READ`).
+    #[default]
+    Redisearch,
+
+    /// `valkey-search`, as shipped built-in by `ElastiCache` and `MemoryDB` for
+    /// Valkey 9.0+. Rejects `NOHL` / `NOFIELDS` / `NOFREQS` / `TEMPORARY`, and
+    /// has no `FT.CURSOR` at all, so result sets are paged with `LIMIT`.
+    ValkeySearch,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]

@@ -119,6 +119,24 @@ pub struct SimpleSpec {
     #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
     pub retain_completed_for_s: u32,
 
+    /// TTL applied to the client-mapping keys (`cid_*`) and client-keepalive
+    /// keys (`ck_*`) in the scheduler store.
+    ///
+    /// These are written once per action and otherwise cleaned up only lazily,
+    /// when a client happens to poll a dead mapping. That was survivable while
+    /// the scheduler store was an ephemeral pod that got wiped on every
+    /// restart; against a persistent store with `maxmemory-policy noeviction`
+    /// it is an unbounded leak that eventually fails writes.
+    ///
+    /// Must comfortably exceed the longest action a client will wait on — if
+    /// the mapping expires mid-build, that client can no longer resolve its
+    /// operation. 0 disables expiry entirely (the historical behaviour).
+    ///
+    /// Default: 0 (no expiry)
+    #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    #[cfg_attr(feature = "dev-schema", schemars(schema_with = "crate::serde_utils::schema::duration"))]
+    pub retain_client_mapping_for_s: u32,
+
     /// Mark operations as completed with error if no client has updated them
     /// within this duration.
     /// Default: 60 (seconds)

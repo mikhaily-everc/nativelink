@@ -152,6 +152,7 @@ async fn simple_scheduler_factory(
                 now_fn,
                 Default::default,
                 spec.retain_completed_for_s,
+                spec.retain_client_mapping_for_s,
             )
             .await
             .err_tip(|| "In state_manager_factory::redis_state_manager")?;
