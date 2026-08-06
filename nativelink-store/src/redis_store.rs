@@ -124,6 +124,36 @@ where
     /// Configure the connection to have a psubscribe on it and perform the
     /// subscription on reconnect.
     fn psubscribe(&self, pattern: &str) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// A connection guaranteed to carry no subscription, for `FT.*` traffic.
+    ///
+    /// valkey-search never answers an `FT.*` command on a connection that has
+    /// an active subscription — the command reaches the server and simply never
+    /// gets a reply, so the caller blocks until its command timeout. RediSearch
+    /// answers it normally, which is why this only appears on managed Valkey.
+    /// Reproduced with plain `redis-cli`, no NativeLink involved:
+    ///
+    /// ```text
+    /// SUBSCRIBE ch
+    /// FT.AGGREGATE idx ... -> valkey-search: hangs; RediSearch: returns
+    /// ```
+    ///
+    /// The scheduler store is *required* to hold a subscription, so search
+    /// traffic cannot share that connection. Implementations without this
+    /// hazard may keep using the ordinary connection.
+    fn get_search_connection(&self) -> impl Future<Output = Result<(C, Uuid), Error>> + Send {
+        self.get_connection()
+    }
+
+    /// [`Self::reconnect`] for the search connection. Must not fall back to
+    /// [`Self::reconnect`]: that returns the *subscribed* connection, which
+    /// would silently reintroduce the hang on the retry path.
+    fn reconnect_search(
+        &self,
+        uuid: Uuid,
+    ) -> impl Future<Output = Result<(C, Uuid), Error>> + Send {
+        self.reconnect(uuid)
+    }
 }
 
 #[derive(Debug)]
@@ -192,6 +222,11 @@ where
     /// Function used to re-connect to Redis.
     connect_func: Box<RedisConnectFn<C>>,
 
+    /// Builds a connection with **no** subscription on it. `connect_func`
+    /// psubscribes every connection it makes, which is why the search
+    /// connection needs its own factory rather than just its own connection.
+    connect_search_func: Box<RedisConnectFn<C>>,
+
     /// Redis script used to update a value in redis if the version matches.
     /// This is done by incrementing the version number and then setting the new
     /// data only if the version number matches the existing version number.
@@ -200,6 +235,11 @@ where
     /// The client pool connecting to the backing Redis instance(s) and a Uuid
     /// for this connection in order to avoid multiple reconnection attempts.
     connection_manager: tokio::sync::RwLock<(C, Uuid)>,
+
+    /// A second connection, never subscribed, used only for `FT.*` traffic.
+    /// See [`RedisManager::get_search_connection`] for why it must be separate.
+    /// Created on first use so stores that never search pay nothing for it.
+    search_connection: tokio::sync::RwLock<Option<(C, Uuid)>>,
 
     /// A list of subscription that should be performed on reconnect.
     subscriptions: Mutex<HashSet<String>>,
@@ -231,13 +271,18 @@ where
         Ok(())
     }
 
-    async fn new(connect_func: Box<RedisConnectFn<C>>) -> Result<Self, Error> {
+    async fn new(
+        connect_func: Box<RedisConnectFn<C>>,
+        connect_search_func: Box<RedisConnectFn<C>>,
+    ) -> Result<Self, Error> {
         let connection_manager = connect_func().await?;
         let update_if_version_matches_script = Script::new(LUA_VERSION_SET_SCRIPT);
         let connection = Self {
             connect_func,
+            connect_search_func,
             update_if_version_matches_script,
             connection_manager: tokio::sync::RwLock::new((connection_manager, Uuid::new_v4())),
+            search_connection: tokio::sync::RwLock::new(None),
             subscriptions: Mutex::new(HashSet::new()),
         };
         {
@@ -251,6 +296,39 @@ where
 impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager> {
     async fn get_connection(&self) -> Result<(ConnectionManager, Uuid), Error> {
         Ok(self.connection_manager.read().await.clone())
+    }
+
+    async fn get_search_connection(&self) -> Result<(ConnectionManager, Uuid), Error> {
+        if let Some(connection) = self.search_connection.read().await.as_ref() {
+            return Ok(connection.clone());
+        }
+        let mut guard = self.search_connection.write().await;
+        // Another task may have created it while we waited for the write lock.
+        if let Some(connection) = guard.as_ref() {
+            return Ok(connection.clone());
+        }
+        let mut connection_manager = (self.connect_search_func)().await?;
+        self.configure(&mut connection_manager).await?;
+        // Deliberately never `psubscribe`d, and deliberately not registered in
+        // `subscriptions`, so `reconnect` cannot subscribe it either.
+        let connection = (connection_manager, Uuid::new_v4());
+        *guard = Some(connection.clone());
+        Ok(connection)
+    }
+
+    async fn reconnect_search(&self, uuid: Uuid) -> Result<(ConnectionManager, Uuid), Error> {
+        let mut guard = self.search_connection.write().await;
+        // Someone else already replaced it; use theirs.
+        if let Some(connection) = guard.as_ref()
+            && connection.1 != uuid
+        {
+            return Ok(connection.clone());
+        }
+        let mut connection_manager = (self.connect_search_func)().await?;
+        self.configure(&mut connection_manager).await?;
+        let connection = (connection_manager, Uuid::new_v4());
+        *guard = Some(connection.clone());
+        Ok(connection)
     }
 
     async fn reconnect(&self, uuid: Uuid) -> Result<(ConnectionManager, Uuid), Error> {
@@ -750,6 +828,16 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
         }
 
         let (tx, subscriber_channel) = unbounded_channel();
+        // `connect` psubscribes whenever the spec names a channel, so the
+        // search connection is built from a spec with that cleared. It must
+        // carry no subscription: valkey-search never answers `FT.*` on a
+        // subscribed connection. See `RedisManager::get_search_connection`.
+        let search_spec = {
+            let mut search_spec = spec.clone();
+            search_spec.experimental_pub_sub_channel = None;
+            search_spec
+        };
+        let search_tx = tx.clone();
 
         Self::new_from_builder_and_parts(
             spec.experimental_pub_sub_channel.clone(),
@@ -764,9 +852,12 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
             spec.search_backend,
             Duration::from_millis(spec.health_check_timeout_ms),
             subscriber_channel,
-            StandardRedisManager::new(Box::new(move || {
-                Box::pin(Self::connect(spec.clone(), tx.clone()))
-            }))
+            StandardRedisManager::new(
+                Box::new(move || Box::pin(Self::connect(spec.clone(), tx.clone()))),
+                Box::new(move || {
+                    Box::pin(Self::connect(search_spec.clone(), search_tx.clone()))
+                }),
+            )
             .await?,
         )
         .await
@@ -1216,8 +1307,16 @@ where
 const CURSOR_IDLE_MS: u64 = 30_000;
 /// Tag value used to build a match-all query on valkey-search, which has no
 /// `*`. It must be a value no real index field can hold; index values are
-/// sanitized by [`try_sanitize`], which rejects the `:` this contains.
-const MATCH_ALL_SENTINEL_TAG: &str = "__nativelink:match_all";
+/// sanitized by [`try_sanitize`], which permits only `[A-Za-z0-9_]`, so the
+/// `:` here cannot appear in real data.
+///
+/// The `:` is written **escaped** because it is also reserved in the tag-filter
+/// grammar. Unescaped, RediSearch rejects the whole query with
+/// `SEARCH_SYNTAX: Syntax error ... near __nativelink`; valkey-search happens
+/// to accept it, which silently made the query engine-dependent. Both forms
+/// were run against both engines: escaped works on both, bare works only on
+/// valkey-search.
+const MATCH_ALL_SENTINEL_TAG: &str = r"__nativelink\:match_all";
 /// The name of the field in the Redis hash that stores the data.
 const DATA_FIELD_NAME: &str = "data";
 /// The name of the field in the Redis hash that stores the version.
@@ -1295,7 +1394,38 @@ const FINGERPRINT_CREATE_INDEX_HEX: &str = "3e762c15";
 
 #[cfg(test)]
 mod test {
-    use super::FINGERPRINT_CREATE_INDEX_HEX;
+    use super::{FINGERPRINT_CREATE_INDEX_HEX, MATCH_ALL_SENTINEL_TAG, try_sanitize};
+
+    /// The sentinel has to satisfy two things at once, and it is easy to fix
+    /// one and silently break the other:
+    ///
+    /// 1. no real index value can equal it, so the negation really does select
+    ///    everything — guaranteed by [`try_sanitize`] rejecting it;
+    /// 2. it is valid inside a tag filter on *both* engines, which means the
+    ///    reserved `:` must be backslash-escaped. Bare, RediSearch answers
+    ///    `SEARCH_SYNTAX` and only valkey-search accepts it.
+    #[test]
+    fn match_all_sentinel_is_escaped_and_uncollidable() {
+        assert_eq!(
+            MATCH_ALL_SENTINEL_TAG, r"__nativelink\:match_all",
+            "the tag-filter wire form changed; re-verify it against RediSearch \
+             and valkey-search before updating this expectation"
+        );
+        assert!(
+            !try_sanitize(MATCH_ALL_SENTINEL_TAG),
+            "sentinel must be rejected by try_sanitize, or a real index value could equal it"
+        );
+        // Every `:` must be preceded by a backslash.
+        let bytes = MATCH_ALL_SENTINEL_TAG.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b':' {
+                assert!(
+                    i > 0 && bytes[i - 1] == b'\\',
+                    "unescaped `:` at offset {i} is a syntax error on RediSearch"
+                );
+            }
+        }
+    }
 
     /// String of the `FT.CREATE` command used to create the index template.
     const CREATE_INDEX_TEMPLATE: &str = "FT.CREATE {} ON HASH PREFIX 1 {} NOOFFSETS NOHL NOFIELDS NOFREQS SCHEMA {} TAG CASESENSITIVE SORTABLE";
@@ -1354,6 +1484,21 @@ macro_rules! get_index_name {
 
 /// Try to sanitize a string to be used as a Redis key.
 /// We don't actually modify the string, just check if it's valid.
+/// Bytes of a Redis string reply, whichever framing the server chose.
+///
+/// Both connections run RESP3 (`resp=3` on the wire), and there valkey-search
+/// returns `FT.AGGREGATE` field names and values as **simple** strings while
+/// RediSearch returns bulk strings. Matching only `BulkString` made the decoder
+/// engine-specific and failed with
+/// `Non-BulkString key from ft_aggregate: simple-string("sort_key")`.
+const fn redis_str_bytes(value: &Value) -> Option<&[u8]> {
+    match value {
+        Value::BulkString(bytes) => Some(bytes.as_slice()),
+        Value::SimpleString(string) => Some(string.as_bytes()),
+        _ => None,
+    }
+}
+
 const fn try_sanitize(s: &str) -> bool {
     // Note: We cannot use for loops or iterators here because they are not const.
     // Allowing us to use a const function here gives the compiler the ability to
@@ -1902,7 +2047,10 @@ where
         };
 
         let get_connection_start = Instant::now();
-        let (connection_manager, connect_id) = self.connection_manager.get_connection().await?;
+        // Search traffic must not ride the subscribed connection — valkey-search
+        // never replies to `FT.*` there. See `RedisManager::get_search_connection`.
+        let (connection_manager, connect_id) =
+            self.connection_manager.get_search_connection().await?;
         let get_connection_elapsed = get_connection_start.elapsed();
         if get_connection_elapsed > Duration::from_millis(50) {
             warn!(
@@ -1915,7 +2063,7 @@ where
                 if err.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::ReadOnly) =>
             {
                 let (connection_manager, _connect_id) =
-                    self.connection_manager.reconnect(connect_id).await?;
+                    self.connection_manager.reconnect_search(connect_id).await?;
                 run_ft_aggregate(connection_manager).await.err_tip(|| {
                     format!(
                         "Error with reconnected ft_aggregate in RedisStore::search_by_index_prefix({})",
@@ -1931,7 +2079,7 @@ where
                                 == redis::ErrorKind::Server(redis::ServerErrorKind::ReadOnly) =>
                         {
                             let (connection_manager, _connect_id) =
-                                self.connection_manager.reconnect(connect_id).await?;
+                                self.connection_manager.reconnect_search(connect_id).await?;
                             (
                                 connection_manager.clone(),
                                 run_ft_create(connection_manager).await,
@@ -2000,10 +2148,10 @@ where
             let mut version: Option<i64> = None;
             while let Some(key) = redis_map_iter.next() {
                 let value = redis_map_iter.next().unwrap();
-                let Value::BulkString(k) = key else {
+                let Some(k) = redis_str_bytes(key) else {
                     return Some(Err(Error::new(
                         Code::Internal,
-                        format!("Non-BulkString key from ft_aggregate: {key:?}"),
+                        format!("Non-string key from ft_aggregate: {key:?}"),
                     )));
                 };
                 let Ok(str_key) = str::from_utf8(k) else {
@@ -2012,15 +2160,15 @@ where
                         format!("Non-utf8 key from ft_aggregate: {key:?}"),
                     )));
                 };
-                let Value::BulkString(v) = value else {
+                let Some(v) = redis_str_bytes(value) else {
                     return Some(Err(Error::new(
                         Code::Internal,
-                        format!("Non-BulkString value from ft_aggregate: {key:?}"),
+                        format!("Non-string value from ft_aggregate: {key:?}"),
                     )));
                 };
                 match str_key {
                     DATA_FIELD_NAME => {
-                        bytes_data = Some(v.clone().into());
+                        bytes_data = Some(Bytes::copy_from_slice(v));
                     }
                     VERSION_FIELD_NAME => {
                         let Ok(str_v) = str::from_utf8(v) else {
