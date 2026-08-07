@@ -40,9 +40,10 @@ use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{
-    DigestHasher, default_digest_hasher_func, make_ctx_for_hash_func,
+    DigestHasher, DigestHasherFunc, default_digest_hasher_func, make_ctx_for_hash_func,
 };
 use nativelink_util::store_trait::{Store, StoreLike};
+use opentelemetry::context::Context;
 use opentelemetry::context::FutureExt;
 use tonic::{Request, Response, Status};
 use tracing::{Instrument, Level, debug, error_span, instrument};
@@ -519,7 +520,17 @@ impl CasServer {
         let expected_size_usize = usize::try_from(expected_blob_digest.size_bytes())
             .err_tip(|| "Blob size does not fit into usize")?;
         let mut buffer = BytesMut::with_capacity(expected_size_usize.min(64 * 1024 * 1024));
-        let mut hasher = default_digest_hasher_func().hasher();
+        // Must come from the OTel ctx that `splice_blob` installed from the
+        // request's `digest_function`, NOT `default_digest_hasher_func()` — that
+        // is only the fallback when the client requested none, and it defaults to
+        // sha256. Hashing BLAKE3 chunks with sha256 yields a same-length digest,
+        // so the mismatch surfaces as bogus DataLoss "corrupted in CAS" rather
+        // than as a hash-function error. Same failure as the VerifyStore one
+        // fixed in grpc_store.rs.
+        let request_hasher = Context::current()
+            .get::<DigestHasherFunc>()
+            .map_or_else(default_digest_hasher_func, |v| *v);
+        let mut hasher = request_hasher.hasher();
         for (idx, chunk_digest) in chunk_digests.iter().enumerate() {
             let data = cas_store
                 .get_part_unchunked(*chunk_digest, 0, None)
@@ -537,7 +548,7 @@ impl CasServer {
             // corruption (e.g. from a concurrent ByteStream.Write race on the
             // same UUID) would otherwise only surface at the whole-blob hash
             // step below, with no signal which chunk is poisoned.
-            let mut chunk_hasher = default_digest_hasher_func().hasher();
+            let mut chunk_hasher = request_hasher.hasher();
             chunk_hasher.update(&data);
             let computed_chunk = chunk_hasher.finalize_digest();
             if computed_chunk != *chunk_digest {
