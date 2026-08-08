@@ -1211,14 +1211,25 @@ async fn make_verifying_chunking_store_manager() -> Result<Arc<StoreManager>, Er
 /// On-demand chunking must write chunks under the digest function the CLIENT
 /// asked for, and that must survive all the way down to the verify store.
 ///
-/// Regression test for a live outage: this repo builds with
-/// `--digest_function=BLAKE3`, `chunk_blob_on_demand` hashed chunks with BLAKE3
-/// correctly, but `VerifyStore` re-derived its own hasher and recomputed SHA256,
-/// so every chunk write was rejected as a hash mismatch and no large blob could
-/// be stored. Both existing chunking tests missed it twice over: they pin
-/// `digest_function: Sha256` (which happens to match the default) and they use a
-/// store that does not verify at all.
-#[nativelink_test]
+/// This is a CHARACTERISATION test, not a regression test — it has never failed.
+/// It was written to reproduce a live outage (chunk writes rejected as hash
+/// mismatches, `VerifyStore` reporting SHA256 while the client declared BLAKE3)
+/// and it does NOT reproduce it, which is the useful result: the in-process
+/// split path propagates the hasher correctly, so the cause lies elsewhere.
+/// Do not read it as proof that the outage is fixed.
+///
+/// It does close the two coverage gaps that let the outage reach production:
+/// the other chunking tests pin `digest_function: Sha256` — identical to the
+/// process default, so any hasher bug is invisible — and point `main_cas` at a
+/// bare `memory` store that never verifies hashes at all.
+///
+/// Note it only exercises one wrapper above `VerifyStore` (`ExistenceCache`);
+/// nothing below the verify store can influence which hasher it picks.
+// `multi_thread` is deliberate, not incidental. The digest function reaches
+// VerifyStore through an opentelemetry Context, which is a THREAD-LOCAL; the
+// default single-threaded test runtime cannot exercise a work-stealing runtime
+// moving this task between threads, which is what production runs.
+#[nativelink_test(flavor = "multi_thread")]
 async fn split_blob_chunks_verify_under_blake3() -> Result<(), Box<dyn core::error::Error>> {
     let store_manager = make_verifying_chunking_store_manager().await?;
     let cas_server = make_chunking_cas_server(&store_manager)?;
@@ -1226,7 +1237,12 @@ async fn split_blob_chunks_verify_under_blake3() -> Result<(), Box<dyn core::err
 
     // Upload the blob whole, under BLAKE3, so SplitBlob has to chunk it on
     // demand — the path remote-execution outputs take.
-    let blob_value = "a".repeat(64 * 1024);
+    // Large enough that FastCDC yields many chunks, so the buffered chunk
+    // writes overlap the way they do under real load (the production failure
+    // logged concurrent_uploads in the hundreds).
+    let blob_value: String = (0..(8 * 1024 * 1024))
+        .map(|i| char::from(b'a' + u8::try_from(i % 26).unwrap()))
+        .collect();
     let mut hasher = DigestHasherFunc::Blake3.hasher();
     hasher.update(blob_value.as_bytes());
     let blob_digest: Digest = hasher.finalize_digest().into();
