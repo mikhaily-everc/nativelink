@@ -46,6 +46,7 @@ use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status
 use nativelink_util::store_trait::{
     RemoveCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
+use opentelemetry::context::FutureExt;
 use pretty_assertions::assert_eq;
 use prost::Message;
 use prost_types::Timestamp;
@@ -1157,6 +1158,119 @@ async fn splice_and_split_round_trip() -> Result<(), Box<dyn core::error::Error>
     assert_eq!(metrics.split_requests_total.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.split_hits.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.split_misses.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+/// A CAS store shaped like production: a `verify` store (`verify_hash`) over
+/// memory. The other chunking tests point `main_cas` at a bare `memory` store,
+/// which never hashes what it is handed, so nothing there can catch a chunk
+/// written under the wrong digest function.
+async fn make_verifying_chunking_store_manager() -> Result<Arc<StoreManager>, Error> {
+    let store_manager = Arc::new(StoreManager::new());
+    // Mirrors the deployed CAS_STORE composition in
+    // tools/rbe/k8s/configs/cas-config/cas.json: existence_cache over verify
+    // over fast_slow. The layering matters — each wrapper gets a chance to lose
+    // the digest-function context on the way down to the verify store.
+    store_manager.add_store(
+        "main_cas",
+        store_factory(
+            &StoreSpec::ExistenceCache(Box::new(nativelink_config::stores::ExistenceCacheSpec {
+                backend: StoreSpec::Verify(Box::new(nativelink_config::stores::VerifySpec {
+                    backend: StoreSpec::FastSlow(Box::new(
+                        nativelink_config::stores::FastSlowSpec {
+                            fast: StoreSpec::Memory(MemorySpec::default()),
+                            fast_direction: nativelink_config::stores::StoreDirection::default(),
+                            slow: StoreSpec::Memory(MemorySpec::default()),
+                            slow_direction: nativelink_config::stores::StoreDirection::default(),
+                            presence_requires_slow_store: true,
+                            bypass_dedup_threshold_bytes: 0,
+                        },
+                    )),
+                    verify_size: true,
+                    verify_hash: true,
+                })),
+                eviction_policy: None,
+            })),
+            &store_manager,
+            None,
+        )
+        .await?,
+    )?;
+    store_manager.add_store(
+        "chunk_index",
+        store_factory(
+            &StoreSpec::Memory(MemorySpec::default()),
+            &store_manager,
+            None,
+        )
+        .await?,
+    )?;
+    Ok(store_manager)
+}
+
+/// On-demand chunking must write chunks under the digest function the CLIENT
+/// asked for, and that must survive all the way down to the verify store.
+///
+/// Regression test for a live outage: this repo builds with
+/// `--digest_function=BLAKE3`, `chunk_blob_on_demand` hashed chunks with BLAKE3
+/// correctly, but `VerifyStore` re-derived its own hasher and recomputed SHA256,
+/// so every chunk write was rejected as a hash mismatch and no large blob could
+/// be stored. Both existing chunking tests missed it twice over: they pin
+/// `digest_function: Sha256` (which happens to match the default) and they use a
+/// store that does not verify at all.
+#[nativelink_test]
+async fn split_blob_chunks_verify_under_blake3() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_verifying_chunking_store_manager().await?;
+    let cas_server = make_chunking_cas_server(&store_manager)?;
+    let store = store_manager.get_store("main_cas").unwrap();
+
+    // Upload the blob whole, under BLAKE3, so SplitBlob has to chunk it on
+    // demand — the path remote-execution outputs take.
+    let blob_value = "a".repeat(64 * 1024);
+    let mut hasher = DigestHasherFunc::Blake3.hasher();
+    hasher.update(blob_value.as_bytes());
+    let blob_digest: Digest = hasher.finalize_digest().into();
+
+    // The upload itself goes through the same verify store, so it has to run
+    // under a BLAKE3 context too.
+    let blob_digest_info = DigestInfo::try_from(blob_digest.clone())?;
+    store
+        .update_oneshot(blob_digest_info, blob_value.clone().into())
+        .with_context(nativelink_util::digest_hasher::make_ctx_for_hash_func(
+            DigestHasherFunc::Blake3,
+        )?)
+        .await?;
+
+    let split_response = cas_server
+        .split_blob(Request::new(SplitBlobRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            blob_digest: Some(blob_digest.clone()),
+            digest_function: digest_function::Value::Blake3.into(),
+            chunking_function: chunking_function::Value::FastCdc2020.into(),
+        }))
+        .await?
+        .into_inner();
+
+    assert!(
+        !split_response.chunk_digests.is_empty(),
+        "split produced no chunks"
+    );
+
+    // Every chunk must actually be readable back out of the CAS. Before the
+    // fix the verify store rejected each write, so this is what fails.
+    for chunk in &split_response.chunk_digests {
+        let got = store
+            .get_part_unchunked(DigestInfo::try_from(chunk.clone())?, 0, None)
+            .await
+            .unwrap_or_else(|e| panic!("chunk {} was never stored: {e}", chunk.hash));
+        let mut chunk_hasher = DigestHasherFunc::Blake3.hasher();
+        chunk_hasher.update(&got);
+        assert_eq!(
+            chunk_hasher.finalize_digest().packed_hash().to_string(),
+            chunk.hash,
+            "stored chunk does not hash to its BLAKE3 digest"
+        );
+    }
     Ok(())
 }
 

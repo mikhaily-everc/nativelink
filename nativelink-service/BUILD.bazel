@@ -111,6 +111,7 @@ rust_test_suite(
         "@crates//:http-body-util",
         "@crates//:hyper-1.7.0",
         "@crates//:hyper-util",
+        "@crates//:opentelemetry",
         "@crates//:pretty_assertions",
         "@crates//:prost",
         "@crates//:prost-types",
