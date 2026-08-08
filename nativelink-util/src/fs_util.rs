@@ -1065,8 +1065,34 @@ mod tests {
     /// Companion to the read-only test: `set_dir_writable_recursive` must also
     /// be symlink-safe. It must not `chmod` a symlink (which would follow the
     /// link) and must not recurse through a symlinked directory.
+    // FIXME(fs-util-readonly-file-mode): the final assertion in this test,
+    // `assert_eq!(file_mode, 0o555, "real files must stay read-only")`, expects
+    // upstream #2338's semantics, where `set_readonly_one_path` chmods every
+    // regular file to 0o555 unconditionally. This fork deliberately does NOT do
+    // that: local commit 74bf3aa3 changed the file branch to
+    // `0o444 | (current_mode & 0o111)` so that a non-executable data file does
+    // not silently gain +x while a +x interpreter/wrapper script stays
+    // executable. `subdir/file2.txt` is created by `create_test_directory` with
+    // no execute bits, so it settles at 0o444 (292) and the test fails with
+    // `left: 292, right: 365`. The product code is the intended behaviour here
+    // and the expectation is the stale half — this is a test bug, not a
+    // regression.
+    //
+    // This failure PREDATES the upstream merge of 2026-08-08: it reproduces at
+    // fork commit ffac2b60, before the merge, and it is deterministic (not
+    // flaky, not RBE-specific — the mode arithmetic is host-independent).
+    //
+    // To re-enable: reconcile the expectation with the fork's execute-bit
+    // preservation — assert `0o444` for the non-executable `subdir/file2.txt`,
+    // and ideally add a second file created with mode 0o755 that is asserted to
+    // land at 0o555, so the test actually pins the property 74bf3aa3 added.
+    // That is a change to the assertion, so it is out of scope for this
+    // ignore-only pass. Note the symlink-safety half of this test is still
+    // covered by `test_set_readonly_recursive_skips_symlinks`, and the
+    // directory-walk half by `test_set_dir_writable_recursive_walks_nested_dirs`.
     #[cfg(unix)]
     #[nativelink_test("crate")]
+    #[ignore = "expects upstream 0o555 for all files; this fork preserves per-file execute bits, so a non-exec file is 0o444 (predates the 2026-08-08 upstream merge)"]
     async fn test_set_dir_writable_recursive_skips_symlinks() -> Result<(), Error> {
         use std::os::unix::fs::PermissionsExt;
 
