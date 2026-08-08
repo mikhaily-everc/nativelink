@@ -14,7 +14,7 @@
 
 use core::borrow::Borrow;
 use core::cmp::Eq;
-use core::fmt::Debug;
+use core::fmt::{Debug, Display};
 use core::future::Future;
 use core::hash::Hash;
 use core::marker::PhantomData;
@@ -218,6 +218,49 @@ pub struct EvictingMap<
     max_count: u64,
 }
 
+// debugging helper used mostly to get a snapshot of what eviction threshold might be causing issues
+#[derive(Debug, Copy, Clone)]
+pub struct EvictionSnapshot {
+    max_bytes: u64,
+    current_bytes: u64,
+    max_items: u64,
+    current_items: usize,
+    max_seconds: i32,
+}
+
+impl Display for EvictionSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.max_bytes != 0 {
+            write!(
+                f,
+                "Bytes: {} of {} ({:.3}%); ",
+                self.current_bytes,
+                self.max_bytes,
+                (self.current_bytes as f64 * 100.0) / (self.max_bytes as f64)
+            )?;
+        } else {
+            write!(f, "Bytes: {} of unlimited; ", self.current_bytes)?;
+        }
+        if self.max_items != 0 {
+            write!(
+                f,
+                "Items: {} of {} ({:.3}%); ",
+                self.current_items,
+                self.max_items,
+                (self.current_items as f64 * 100.0) / (self.max_items as f64)
+            )?;
+        } else {
+            write!(f, "Items: {} of unlimited; ", self.current_items)?;
+        }
+        if self.max_seconds > 0 {
+            write!(f, "Timeout: {}s", self.max_seconds)?;
+        } else {
+            write!(f, "Timeout: unlimited")?;
+        }
+        Ok(())
+    }
+}
+
 impl<K, Q, T, I, C> EvictingMap<K, Q, T, I, C>
 where
     K: Ord + Hash + Eq + Clone + Debug + Send + Sync + Borrow<Q>,
@@ -245,7 +288,7 @@ where
             anchor_time,
             max_bytes: config.max_bytes as u64,
             evict_bytes: config.evict_bytes as u64,
-            max_seconds: config.max_seconds as i32,
+            max_seconds: config.max_seconds.try_into().unwrap_or(i32::MAX),
             max_count: config.max_count,
         }
     }
@@ -316,6 +359,19 @@ where
         is_over_size || old_item_exists || is_over_count
     }
 
+    // Gets a debugging snapshot of the state of the map. It's inevitably out of date by the time it gets sent to the user
+    // but does provide a momentary glimpse into possible issues e.g. if current_bytes is close to max_bytes
+    pub fn get_snapshot(&self) -> EvictionSnapshot {
+        let state = self.state.lock();
+        EvictionSnapshot {
+            max_bytes: self.max_bytes,
+            current_bytes: state.sum_store_size,
+            max_items: self.max_count,
+            current_items: state.lru.len(),
+            max_seconds: self.max_seconds,
+        }
+    }
+
     #[must_use]
     fn evict_items(&self, state: &mut State<K, Q, T, C>) -> (Vec<T>, Vec<RemoveFuture>) {
         let Some((_, mut peek_entry)) = state.lru.peek_lru() else {
@@ -343,10 +399,10 @@ where
                 .lru
                 .pop_lru()
                 .expect("Tried to peek() then pop() but failed");
-            debug!(?key, "Evicting",);
+            debug!(?key, "Evicting");
             let (data, futures) = state.remove(key.borrow(), &eviction_item, false);
             items_to_unref.push(data);
-            removal_futures.extend(futures.into_iter());
+            removal_futures.extend(futures);
 
             peek_entry = if let Some((_, entry)) = state.lru.peek_lru() {
                 entry
@@ -409,7 +465,7 @@ where
                                     state.remove(key.borrow(), &eviction_item, false);
                                 // Store data for later unref - we can't drop state here as we're still iterating
                                 data_to_unref.push(data);
-                                removal_futures.extend(futures.into_iter());
+                                removal_futures.extend(futures);
                             }
                         } else {
                             if !peek {
@@ -431,6 +487,25 @@ where
         while callbacks.next().await.is_some() {}
         let mut callbacks: FuturesUnordered<_> =
             data_to_unref.iter().map(LenEntry::unref).collect();
+        while callbacks.next().await.is_some() {}
+    }
+
+    /// Fires the registered remove callbacks for `key` without touching the map.
+    /// A store uses this to invalidate downstream listeners (e.g. an
+    /// `ExistenceCacheStore`) when a write is rejected outright and never
+    /// inserted — mirroring the callbacks an insert-then-immediate-evict would
+    /// otherwise have fired. It only *notifies*; it does not remove anything from
+    /// the map (there is nothing to remove). A no-op when no callbacks are
+    /// registered.
+    pub async fn fire_remove_callbacks(&self, key: &Q) {
+        let mut callbacks: FuturesUnordered<_> = {
+            let state = self.state.lock();
+            state
+                .remove_callbacks
+                .iter()
+                .map(|callback| callback.callback(key))
+                .collect()
+        };
         while callbacks.next().await.is_some() {}
     }
 
@@ -574,7 +649,8 @@ where
             };
 
             if let Some((old_item, futures)) = state.put(&key, eviction_item) {
-                removal_futures.extend(futures.into_iter());
+                removal_futures.extend(futures);
+                debug!(?key, "Evicting old item");
                 replaced_items.push(old_item);
             }
             state.sum_store_size += new_item_size;
@@ -602,7 +678,7 @@ where
             // Then try to remove the requested item
             let removed = if let Some(entry) = state.lru.pop(key.borrow()) {
                 let (removed_item, more_removal_futures) = state.remove(key, &entry, false);
-                removal_futures.extend(more_removal_futures.into_iter());
+                removal_futures.extend(more_removal_futures);
                 Some(removed_item)
             } else {
                 None
@@ -621,6 +697,7 @@ where
 
         // Unref removed item if any
         if let Some(item) = removed_item {
+            debug!(?key, "Evicting (direct remove)");
             item.unref().await;
             return true;
         }
@@ -646,7 +723,7 @@ where
                 // Then try to remove the requested item
                 let removed_item = if let Some(entry) = state.lru.pop(key.borrow()) {
                     let (item, more_removal_futures) = state.remove(key, &entry, false);
-                    removal_futures.extend(more_removal_futures.into_iter());
+                    removal_futures.extend(more_removal_futures);
                     Some(item)
                 } else {
                     None
@@ -669,6 +746,7 @@ where
 
         // Unref removed item if any
         if let Some(item) = removed_item {
+            debug!(?key, "Evicting (conditional remove)");
             item.unref().await;
             true
         } else {

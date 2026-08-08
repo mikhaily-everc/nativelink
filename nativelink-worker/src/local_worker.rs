@@ -32,8 +32,8 @@ use nativelink_metric::{MetricsComponent, RootMetricsComponent};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ExecuteComplete, ExecuteResult, GoingAwayRequest, KeepAliveRequest, UpdateForWorker,
-    execute_result,
+    ActionResourceUsage, ExecuteComplete, ExecuteResult, GoingAwayRequest, KeepAliveRequest,
+    UpdateForWorker, execute_result,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId};
@@ -74,6 +74,13 @@ const DEFAULT_ENDPOINT_TIMEOUT_S: f32 = 5.;
 /// If this value gets modified the documentation in `cas_server.rs` must also be updated.
 const DEFAULT_MAX_ACTION_TIMEOUT: Duration = Duration::from_mins(20);
 const DEFAULT_MAX_UPLOAD_TIMEOUT: Duration = Duration::from_mins(10);
+const DEFAULT_MAX_CLEANUP_WAIT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_CLEANUP_BACKOFF: Duration = Duration::from_millis(500);
+
+struct FinishedActionResult {
+    action_result: ActionResult,
+    resource_usage: Option<ActionResourceUsage>,
+}
 
 struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> {
     config: &'a LocalWorkerConfig,
@@ -300,6 +307,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             instance_name,
                                             operation_id: start_execute.operation_id,
                                             result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker shutting down").into())),
+                                            resource_usage: None,
                                         }
                                     ).await?;
                                 }
@@ -368,11 +376,18 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                 Ok(result)
                                             })
                                             .and_then(RunningAction::upload_results)
-                                            .and_then(RunningAction::get_finished_result)
+                                            .and_then(|action| async move {
+                                                let resource_usage = action.resource_usage();
+                                                let action_result = action.get_finished_result().await?;
+                                                Ok(FinishedActionResult {
+                                                    action_result,
+                                                    resource_usage,
+                                                })
+                                            })
                                             // Note: We need ensure we run cleanup even if one of the other steps fail.
                                             .then(|result| async move {
                                                 if let Err(e) = action.cleanup().await {
-                                                    return Result::<ActionResult, Error>::Err(e).merge(result);
+                                                    return Result::<FinishedActionResult, Error>::Err(e).merge(result);
                                                 }
                                                 result
                                             })
@@ -394,11 +409,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
                                 let running_actions_manager = self.running_actions_manager.clone();
                                 let publish_ctx_inner = publish_ctx.clone();
-                                move |res: Result<ActionResult, Error>| async move {
+                                let worker_id = self.worker_id.clone();
+                                move |res: Result<FinishedActionResult, Error>| async move {
                                     let instance_name = maybe_instance_name
                                         .err_tip(|| "`instance_name` could not be resolved; this is likely an internal error in local_worker.")?;
                                     match res {
-                                        Ok(action_result) => {
+                                        Ok(FinishedActionResult { action_result, resource_usage }) => {
                                             // Deliver the action result to the scheduler IMMEDIATELY and run
                                             // cache_action_result in the background.
                                             //
@@ -419,11 +435,19 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             // sent to the client, because we don't wait for the historical
                                             // upload to compute the URL. That's a cosmetic loss only.
                                             let action_stage = ActionStage::Completed(action_result.clone());
+                                            // Stamp the identity onto the usage record BEFORE the
+                                            // `ExecuteResult` literal below, which moves `operation_id`.
+                                            let resource_usage = resource_usage.map(|mut resource_usage| {
+                                                resource_usage.operation_id.clone_from(&operation_id);
+                                                resource_usage.worker_id.clone_from(&worker_id);
+                                                resource_usage
+                                            });
                                             grpc_client.execution_response(
                                                 ExecuteResult{
                                                     instance_name,
                                                     operation_id,
                                                     result: Some(execute_result::Result::ExecuteResponse(action_stage.into())),
+                                                    resource_usage,
                                                 }
                                             )
                                             .await
@@ -482,12 +506,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     instance_name,
                                                     operation_id,
                                                     result: Some(execute_result::Result::ExecuteResponse(action_stage.into())),
+                                                    resource_usage: None,
                                                 }).await.err_tip(|| "Error calling execution_response with missing inputs")?;
                                             } else {
                                                 grpc_client.execution_response(ExecuteResult{
                                                     instance_name,
                                                     operation_id,
                                                     result: Some(execute_result::Result::InternalError(e.into())),
+                                                    resource_usage: None,
                                                 }).await.err_tip(|| "Error calling execution_response with error")?;
                                             }
                                         },
@@ -668,22 +694,30 @@ pub async fn new_local_worker(
     } else {
         Some(config.entrypoint.clone())
     };
-    let max_action_timeout = if config.max_action_timeout == 0 {
+    let max_action_timeout = if config.max_action_timeout_s == 0 {
         DEFAULT_MAX_ACTION_TIMEOUT
     } else {
-        Duration::from_secs(config.max_action_timeout as u64)
+        Duration::from_secs(config.max_action_timeout_s as u64)
     };
-    let max_upload_timeout = if config.max_upload_timeout == 0 {
+    let max_upload_timeout = if config.max_upload_timeout_s == 0 {
         DEFAULT_MAX_UPLOAD_TIMEOUT
     } else {
-        Duration::from_secs(config.max_upload_timeout as u64)
+        Duration::from_secs(config.max_upload_timeout_s as u64)
+    };
+    let max_cleanup_wait = if config.max_cleanup_wait_s == 0 {
+        DEFAULT_MAX_CLEANUP_WAIT
+    } else {
+        Duration::from_secs(config.max_cleanup_wait_s as u64)
+    };
+    let max_cleanup_backoff = if config.max_cleanup_backoff_ms == 0 {
+        DEFAULT_MAX_CLEANUP_BACKOFF
+    } else {
+        Duration::from_millis(config.max_cleanup_backoff_ms as u64)
     };
 
     // Initialize directory cache if configured
     let directory_cache = if let Some(cache_config) = &config.directory_cache {
         use std::path::PathBuf;
-
-        use nativelink_store::filesystem_store::FilesystemStore;
 
         use crate::directory_cache::{
             DirectoryCache, DirectoryCacheConfig as WorkerDirCacheConfig,
@@ -699,30 +733,15 @@ pub async fn new_local_worker(
         };
 
         let worker_cache_config = WorkerDirCacheConfig {
+            max_entries: cache_config.max_entries,
             max_size_bytes: cache_config.max_size_bytes,
             cache_root,
+            experimental_subtree_caching: cache_config.experimental_subtree_caching,
+            max_concurrent_fetches: cache_config.max_concurrent_fetches,
+            experimental_get_tree_prefetch: cache_config.experimental_get_tree_prefetch,
         };
 
-        // The cache hardlinks from the filesystem-store fast tier of
-        // `fast_slow_store`. Mirrors the downcast in
-        // `RunningActionsManagerImpl::new_with_callbacks` so both consumers
-        // see the same FilesystemStore Arc.
-        let filesystem_store_for_cache = fast_slow_store
-            .fast_store()
-            .downcast_ref::<FilesystemStore>(None)
-            .err_tip(|| {
-                "Expected FastSlowStore.fast_store to be a FilesystemStore when directory_cache is enabled"
-            })?
-            .get_arc()
-            .err_tip(|| "FilesystemStore's internal Arc was lost")?;
-
-        match DirectoryCache::new(
-            worker_cache_config,
-            fast_slow_store.clone(),
-            filesystem_store_for_cache,
-        )
-        .await
-        {
+        match DirectoryCache::new(worker_cache_config, fast_slow_store.clone()).await {
             Ok(cache) => {
                 tracing::info!("Directory cache initialized successfully");
                 Some(Arc::new(cache))
@@ -795,6 +814,8 @@ pub async fn new_local_worker(
             upload_action_result_config: &config.upload_action_result,
             max_action_timeout,
             max_upload_timeout,
+            max_cleanup_wait,
+            max_cleanup_backoff,
             timeout_handled_externally: config.timeout_handled_externally,
             directory_cache,
             #[cfg(target_os = "linux")]
@@ -979,24 +1000,36 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
 
             // Now listen for connections and run all other services.
             if let Err(err) = inner.run(update_for_worker_stream, &mut shutdown_rx).await {
-                'no_more_actions: {
-                    // Ensure there are no actions in transit before we try to kill
-                    // all our actions.
-                    const ITERATIONS: usize = 1_000;
+                // Give in-transit actions a chance to settle before we kill
+                // them, so their results still reach the scheduler.
+                const ITERATIONS: usize = 1_000;
 
-                    const ERROR_MSG: &str = "Actions in transit did not reach zero before we disconnected from the scheduler";
-
-                    let sleep_duration = ACTIONS_IN_TRANSIT_TIMEOUT_S / ITERATIONS as f32;
-                    for _ in 0..ITERATIONS {
-                        if inner.actions_in_transit.load(Ordering::Acquire) == 0 {
-                            break 'no_more_actions;
-                        }
-                        (sleep_fn_pin)(Duration::from_secs_f32(sleep_duration)).await;
+                let sleep_duration = ACTIONS_IN_TRANSIT_TIMEOUT_S / ITERATIONS as f32;
+                let mut drained = false;
+                for _ in 0..ITERATIONS {
+                    if inner.actions_in_transit.load(Ordering::Acquire) == 0 {
+                        drained = true;
+                        break;
                     }
-                    error!(ERROR_MSG);
-                    return Err(err.append(ERROR_MSG));
+                    (sleep_fn_pin)(Duration::from_secs_f32(sleep_duration)).await;
                 }
-                error!(?err, "Worker disconnected from scheduler");
+                if !drained {
+                    // Deliberately not fatal. Returning here propagates out of
+                    // the worker's main loop and aborts the process, so a
+                    // scheduler blip that happened to catch an action in
+                    // transit took the whole worker down — and every action it
+                    // held then had to run again elsewhere. At fleet scale that
+                    // is a restart storm. kill_all() below discards these
+                    // actions anyway, so the wait is a courtesy and overrunning
+                    // it costs nothing beyond the actions we were already
+                    // giving up on.
+                    error!(
+                        actions_in_transit = inner.actions_in_transit.load(Ordering::Acquire),
+                        "Actions in transit did not reach zero before we disconnected from the scheduler"
+                    );
+                }
+
+                error!(?err, "Worker disconnected from scheduler, reconnecting");
                 // Kill off any existing actions because if we re-connect, we'll
                 // get some more and it might resource lock us.
                 self.running_actions_manager.kill_all().await;

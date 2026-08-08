@@ -340,7 +340,7 @@ impl ConnectionManagerWorker {
     }
 
     fn provide_channel(
-        &mut self,
+        &self,
         channel: EstablishedChannel,
         tx: oneshot::Sender<Connection>,
         permit: OwnedSemaphorePermit,

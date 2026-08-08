@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-26]
+        os: [ubuntu-24.04]
     name: Bazel Dev / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
@@ -38,19 +38,27 @@ jobs:
         with:
           nativelink_attic_token: ${{ secrets.NATIVELINK_ATTIC_TOKEN }}
 
+      - name: Setup NativeLink Cloud
+        uses: ./.github/actions/setup-nativelink-cloud
+        with:
+          ci-mode: ${{ vars.NATIVELINK_CI_MODE }}
+          claim-base: ${{ secrets.NATIVELINK_STAGING_CLAIM_BASE }}
+          bes-results-url: ${{ secrets.NATIVELINK_STAGING_BES_RESULTS_URL }}
+          api-key: >-
+            ${{ github.event_name == 'push'
+                && secrets.NATIVELINK_STAGING_API_KEY_RW
+                || secrets.NATIVELINK_STAGING_API_KEY_RO }}
+          mode: ${{ github.event_name == 'push' && 'write' || 'read' }}
+          # Remote execution only on Linux; the action hard-fails exec on
+          # non-Linux runners, so macOS lanes fall back to cache.
+          exec: ${{ runner.os == 'Linux' && 'on' || 'off' }}
+
       - name: Invoke Bazel build in Nix shell
         run: |
-          if [ "$RUNNER_OS" == "Linux" ]; then
-            nix develop --fallback --impure --command \
-            bash -c "bazel test ... --verbose_failures --lockfile_mode=error"
-          elif [ "$RUNNER_OS" == "macOS" ]; then
-            nix develop --fallback --impure --command \
-            bash -c "bazel test //... --verbose_failures --lockfile_mode=error"
-          else
-            echo "Unsupported runner OS: $RUNNER_OS"
-            exit 1
-          fi
-        shell: bash
+          nix develop --impure --command \
+            bazel-retry test //... \
+              --verbose_failures \
+              --lockfile_mode=error \
 
       - name: Teardown Worker
         uses: ./.github/actions/end-nix
@@ -62,7 +70,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-26]
+        os: [ubuntu-24.04]
     name: Cargo Dev / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
@@ -76,9 +84,13 @@ jobs:
         with:
           nativelink_attic_token: ${{ secrets.NATIVELINK_ATTIC_TOKEN }}
 
+      - name: Rust cache
+        uses: >- # v2.9.1
+          Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+
       - name: Invoke Cargo build in Nix shell
         run: >
-          nix develop --fallback --impure --command
+          nix develop --impure --command
           bash -c "cargo test --all --profile=smol"
 
       - name: Teardown Worker
@@ -93,7 +105,6 @@ jobs:
       matrix:
         os:
           - ubuntu-24.04
-          - macos-26
     name: Installation / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
@@ -109,7 +120,7 @@ jobs:
 
       - name: Test nix run
         run: |
-          nix run --fallback -L .#nativelink-is-executable-test
+          nix run -L .#nativelink-is-executable-test
 
       - name: Teardown Worker
         uses: ./.github/actions/end-nix
@@ -137,7 +148,7 @@ jobs:
 
       - name: Test ${{ matrix.test-name }} run
         run: |
-          nix run --fallback -L .#${{ matrix.test-name }}-with-nativelink-test
+          nix run -L .#${{ matrix.test-name }}-with-nativelink-test
 
       - name: Teardown Worker
         uses: ./.github/actions/end-nix
@@ -163,7 +174,7 @@ jobs:
 
       - name: Get commands list
         run: |
-          COMMANDS=$(nix run --fallback .#rbe-toolchain-with-nativelink-test list)
+          COMMANDS=$(nix run .#rbe-toolchain-with-nativelink-test list)
           echo "matrix={\"command\":${COMMANDS}}" >> $GITHUB_OUTPUT
         id: set-matrix
 
@@ -186,7 +197,7 @@ jobs:
 
       - name: Test ${{ matrix.command }} with rbe
         run: |
-          nix run --fallback -L .#rbe-toolchain-with-nativelink-test ${{ matrix.command }}
+          nix run -L .#rbe-toolchain-with-nativelink-test ${{ matrix.command }}
 
       - name: Teardown Worker
         uses: ./.github/actions/end-nix

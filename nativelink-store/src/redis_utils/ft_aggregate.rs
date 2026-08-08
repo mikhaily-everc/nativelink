@@ -75,6 +75,23 @@ pub(crate) struct FtAggregateOptions {
 /// far beyond any real scheduler queue.
 const MAX_LIMIT_PAGES: u64 = 64;
 
+/// Per-query `FT.AGGREGATE` timeout in milliseconds.
+///
+/// `RediSearch`'s module default (≈500 ms) is far too tight for the
+/// scheduler's awaited-action index under any meaningful load: queries
+/// time out, `NativeLink` surfaces them as parse errors, and the dedup
+/// lookup fails. When dedup fails the scheduler creates a duplicate
+/// operation for an action that is already in flight — observed as
+/// "two same actions running on different PRs" with each running the
+/// full `max_action_executing_timeout_s` window before completing. Pass an
+/// explicit value generous enough to absorb 1M+ document scans on a
+/// busy `RediSearch` instance.
+///
+/// valkey-search also accepts `TIMEOUT` (probed against the live dev
+/// `ElastiCache`), so it lives in the shared prefix rather than behind the
+/// `Cursor` arm.
+const FT_AGGREGATE_TIMEOUT_MS: u64 = 10_000;
+
 /// Build one `FT.AGGREGATE` invocation.
 ///
 /// Argument order differs per paging mode on purpose. The cursor form keeps
@@ -90,7 +107,11 @@ fn build_aggregate_cmd(
     offset: u64,
 ) -> redis::Cmd {
     let mut cmd = redis::cmd("FT.AGGREGATE");
-    cmd.arg(index).arg(query).arg("LOAD");
+    cmd.arg(index)
+        .arg(query)
+        .arg("TIMEOUT")
+        .arg(FT_AGGREGATE_TIMEOUT_MS)
+        .arg("LOAD");
     match load {
         FtLoad::All => {
             cmd.arg("*");
@@ -466,12 +487,25 @@ fn resp3_data_parse(
                         };
                         match map_key.as_str() {
                             "extra_attributes" => {
-                                let Value::Map(extra_attributes_values) = raw_map_value else {
-                                    return Err(RedisError::from((
-                                        ErrorKind::Parse,
-                                        "Expected Map for extra_attributes",
-                                        format!("{raw_map_value:?}"),
-                                    )));
+                                let extra_attributes_values = match raw_map_value {
+                                    Value::Map(extra_attributes_values) => extra_attributes_values,
+                                    // A document that expired or was deleted between
+                                    // the search phase and the load phase comes back
+                                    // as a row with Nil attributes. Under load this is
+                                    // routine — completed awaited-action records expire
+                                    // constantly — so drop the row instead of failing
+                                    // the whole aggregate. Failing here surfaced to
+                                    // clients as `INVALID_ARGUMENT`, which Bazel treats
+                                    // as permanent, so a single expiry race killed the
+                                    // build.
+                                    Value::Nil => continue,
+                                    other => {
+                                        return Err(RedisError::from((
+                                            ErrorKind::Parse,
+                                            "Expected Map for extra_attributes",
+                                            format!("{other:?}"),
+                                        )));
+                                    }
                                 };
                                 let mut output_array = vec![];
                                 for (e_key, e_value) in extra_attributes_values {
@@ -607,6 +641,8 @@ mod tests {
                 "FT.AGGREGATE",
                 "idx",
                 "@state:{ queued }",
+                "TIMEOUT",
+                "10000",
                 "LOAD",
                 "2",
                 "data",
@@ -642,6 +678,8 @@ mod tests {
                 "FT.AGGREGATE",
                 "idx",
                 "@state:{ queued }",
+                "TIMEOUT",
+                "10000",
                 "LOAD",
                 "2",
                 "data",
@@ -677,6 +715,8 @@ mod tests {
                 "FT.AGGREGATE",
                 "aa__state_sort_key_3e762c15",
                 "@state:{ queued }",
+                "TIMEOUT",
+                "10000",
                 "LOAD",
                 "*",
                 "SORTBY",
@@ -702,7 +742,19 @@ mod tests {
         );
         assert_eq!(
             args_of(&cmd),
-            vec!["FT.AGGREGATE", "idx", "*", "LOAD", "1", "data", "LIMIT", "0", "10"]
+            vec![
+                "FT.AGGREGATE",
+                "idx",
+                "*",
+                "TIMEOUT",
+                "10000",
+                "LOAD",
+                "1",
+                "data",
+                "LIMIT",
+                "0",
+                "10"
+            ]
         );
     }
 

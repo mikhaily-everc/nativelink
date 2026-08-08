@@ -14,6 +14,7 @@
 
 use core::fmt::Debug;
 use core::pin::Pin;
+use core::time::Duration;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -29,10 +30,11 @@ use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthS
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    RemoveItemCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+    RemoveCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
 };
 use rand::Rng;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
+use tracing::warn;
 
 use crate::cas_utils::is_zero_digest;
 use crate::gcs_client::client::{GcsClient, GcsOperations};
@@ -51,7 +53,7 @@ pub struct GcsStore<Client: GcsOperations, NowFn> {
     key_prefix: String,
     retrier: Retrier,
     #[metric(help = "The number of seconds to consider an object expired")]
-    consider_expired_after_s: i64,
+    consider_expired_after_s: u64,
     #[metric(help = "The number of bytes to buffer for retrying requests")]
     max_retry_buffer_size: usize,
     #[metric(help = "The size of chunks for resumable uploads")]
@@ -92,7 +94,7 @@ where
             .unwrap_or(DEFAULT_CONCURRENT_UPLOADS);
 
         let jitter_amt = spec.common.retry.jitter;
-        let jitter_fn = Arc::new(move |delay: tokio::time::Duration| {
+        let jitter_fn = Arc::new(move |delay: Duration| {
             if jitter_amt == 0.0 {
                 return delay;
             }
@@ -135,7 +137,7 @@ where
                 jitter_fn,
                 spec.common.retry.clone(),
             ),
-            consider_expired_after_s: i64::from(spec.common.consider_expired_after_s),
+            consider_expired_after_s: u64::from(spec.common.consider_expired_after_s),
             max_retry_buffer_size,
             max_chunk_size,
             max_concurrent_uploads: max_connections,
@@ -160,7 +162,7 @@ where
                         if consider_expired_after_s != 0
                             && let Some(update_time) = &metadata.update_time
                         {
-                            let now_s = now_fn().unix_timestamp() as i64;
+                            let now_s = now_fn().unix_timestamp();
                             if update_time.seconds + consider_expired_after_s <= now_s {
                                 return Some((RetryResult::Ok(None), object_path));
                             }
@@ -204,6 +206,10 @@ where
     Client: GcsOperations + 'static,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -233,13 +239,14 @@ where
         digest: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         if is_zero_digest(digest.borrow()) {
             return reader.recv().await.and_then(|should_be_empty| {
-                should_be_empty
-                    .is_empty()
-                    .then_some(())
-                    .ok_or_else(|| make_err!(Code::Internal, "Zero byte hash not empty"))
+                if should_be_empty.is_empty() {
+                    Ok(0)
+                } else {
+                    Err(make_err!(Code::Internal, "Zero byte hash not empty"))
+                }
             });
         }
 
@@ -255,13 +262,14 @@ where
             && size < MIN_MULTIPART_SIZE
         {
             let content = reader.consume(Some(usize::try_from(size)?)).await?;
+            let content_len = content.len() as u64;
             let client = &self.client;
 
             return self
                 .retrier
                 .retry(unfold(content, |content| async {
                     match client.write_object(&object_path, content.to_vec()).await {
-                        Ok(()) => Some((RetryResult::Ok(()), content)),
+                        Ok(()) => Some((RetryResult::Ok(content_len), content)),
                         Err(e) => Some((RetryResult::Retry(e), content)),
                     }
                 }))
@@ -356,7 +364,7 @@ where
                             )
                             .await
                         {
-                            Ok(()) => Some((RetryResult::Ok(()), ())),
+                            Ok(()) => Some((RetryResult::Ok(offset), ())),
                             Err(e) => Some((RetryResult::Retry(e), ())),
                         }
                     }))
@@ -368,7 +376,7 @@ where
                 .retrier
                 .retry(unfold((), |()| async {
                     match client.write_object(&object_path, Vec::new()).await {
-                        Ok(()) => Some((RetryResult::Ok(()), ())),
+                        Ok(()) => Some((RetryResult::Ok(0), ())),
                         Err(e) => Some((RetryResult::Retry(e), ())),
                     }
                 }))
@@ -392,7 +400,7 @@ where
             }))
             .await?;
 
-        Ok(())
+        Ok(offset)
     }
 
     async fn get_part(
@@ -421,15 +429,24 @@ where
                         .await
                     {
                         Ok(stream) => stream,
-                        Err(e) if e.code == Code::NotFound => {
-                            return Some((RetryResult::Err(e), (offset, writer)));
-                        }
+                        // NotFound is intentionally not special-cased here:
+                        // the retrier doesn't retry NotFound by default, but
+                        // emitting `Retry` lets `retry.retry_on_errors` opt
+                        // reads into retrying read-after-write races where
+                        // an object is still finalizing or being repopulated.
                         Err(e) => return Some((RetryResult::Retry(e), (offset, writer))),
                     };
 
                     while let Some(next_chunk) = stream.next().await {
                         match next_chunk {
                             Ok(bytes) => {
+                                // HTTP/2 peers may emit zero-length DATA frames
+                                // (e.g. a bare END_STREAM frame), which surface
+                                // here as empty chunks. `send()` rejects empty
+                                // buffers by contract, so skip them.
+                                if bytes.is_empty() {
+                                    continue;
+                                }
                                 offset += bytes.len() as u64;
                                 if let Err(err) = writer.send(bytes).await {
                                     return Some((RetryResult::Err(err), (offset, writer)));
@@ -465,10 +482,7 @@ where
         registry.register_indicator(self);
     }
 
-    fn register_remove_callback(
-        self: Arc<Self>,
-        _callback: Arc<dyn RemoveItemCallback>,
-    ) -> Result<(), Error> {
+    fn register_remove_callback(self: Arc<Self>, _callback: RemoveCallback) -> Result<(), Error> {
         // As we're backed by GCS, this store doesn't actually drop stuff
         // so we can actually just ignore this
         Ok(())
@@ -486,7 +500,36 @@ where
         "GcsStore"
     }
 
-    async fn check_health(&self, namespace: Cow<'static, str>) -> HealthStatus {
-        StoreDriver::check_health(Pin::new(self), namespace).await
+    /// Lightweight probe: a single `object_exists` against a fixed
+    /// never-existing path. Shares no resources with production traffic
+    /// and stays well under the `HealthServer` per-indicator budget.
+    async fn check_health(&self, _namespace: Cow<'static, str>) -> HealthStatus {
+        const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let probe_path = ObjectPath::new(
+            self.bucket.clone(),
+            "__nativelink_health_probe__/does-not-exist",
+        );
+
+        let probe = self.client.object_exists(&probe_path);
+        match timeout(HEALTH_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(_)) => HealthStatus::new_ok(self, "GcsStore::check_health: ok".into()),
+            Ok(Err(e)) => {
+                warn!(?e, "GcsStore::check_health: object_exists errored");
+                HealthStatus::new_failed(
+                    self,
+                    format!("GcsStore::check_health: object_exists errored: {e}").into(),
+                )
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = HEALTH_PROBE_TIMEOUT.as_secs(),
+                    "GcsStore::check_health: probe timed out",
+                );
+                HealthStatus::Timeout {
+                    struct_name: self.struct_name(),
+                }
+            }
+        }
     }
 }

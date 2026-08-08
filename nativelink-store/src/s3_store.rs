@@ -47,7 +47,7 @@ use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthS
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    RemoveItemCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+    RemoveCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
 };
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -56,6 +56,10 @@ use tracing::{error, info};
 
 use crate::cas_utils::is_zero_digest;
 use crate::common_s3_utils::{BodyWrapper, TlsClient};
+
+// S3 object cannot be larger than this number. See:
+// https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
+const MAX_UPLOAD_SIZE: u64 = 48 * 1024 * 1024 * 1024 * 1024; // 48TiB (technically should be 48.8 TiB, but close enough)
 
 // S3 parts cannot be smaller than this number. See:
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
@@ -67,7 +71,8 @@ const MAX_MULTIPART_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5GB.
 
 // S3 parts cannot be more than this number. See:
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
-const MAX_UPLOAD_PARTS: usize = 10_000;
+// Note: Type 'u64' chosen to simplify calculations
+const MAX_UPLOAD_PARTS: u64 = 10_000;
 
 // Default max buffer size for retrying upload requests.
 // Note: If you change this, adjust the docs in the config.
@@ -136,7 +141,7 @@ pub struct S3Store<NowFn> {
     // `ExperimentalAwsSpec::single_upload_timeout_s` (0 → default).
     single_upload_deadline: Duration,
 
-    remove_callbacks: Mutex<Vec<Arc<dyn RemoveItemCallback>>>,
+    remove_callbacks: Mutex<Vec<RemoveCallback>>,
 }
 
 impl<I, NowFn> S3Store<NowFn>
@@ -148,12 +153,13 @@ where
         let jitter_fn = spec.common.retry.make_jitter_fn();
         let s3_client = {
             let http_client = TlsClient::new(&spec.common.clone());
+            let credential_http_client = TlsClient::new_for_credentials(&spec.common);
 
             let credential_provider = credentials::DefaultCredentialsChain::builder()
                 .configure(
                     ProviderConfig::without_region()
                         .with_region(Some(Region::new(Cow::Owned(spec.region.clone()))))
-                        .with_http_client(http_client.clone()),
+                        .with_http_client(credential_http_client),
                 )
                 .build()
                 .await;
@@ -254,7 +260,10 @@ where
                             if self.consider_expired_after_s != 0
                                 && let Some(last_modified) = head_object_output.last_modified
                             {
-                                let now_s = (self.now_fn)().unix_timestamp() as i64;
+                                let now_s = (self.now_fn)()
+                                    .unix_timestamp()
+                                    .try_into()
+                                    .unwrap_or(i64::MAX);
                                 if last_modified.secs() + self.consider_expired_after_s <= now_s {
                                     let remove_callbacks = self.remove_callbacks.lock().clone();
                                     let mut callbacks: FuturesUnordered<_> = remove_callbacks
@@ -302,6 +311,10 @@ where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -332,12 +345,20 @@ where
         digest: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let s3_path = &self.make_s3_path(&digest);
 
         let max_size = match upload_size {
             UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
         };
+
+        // Sanity check S3 maximum upload size.
+        if max_size > MAX_UPLOAD_SIZE {
+            return Err(make_err!(
+                Code::FailedPrecondition,
+                "File size exceeds max of {MAX_UPLOAD_SIZE}"
+            ));
+        }
 
         // Note(aaronmondal) It might be more optimal to use a different
         // heuristic here, but for simplicity we use a hard coded value.
@@ -374,19 +395,21 @@ where
                                 .put_object()
                                 .bucket(&self.bucket)
                                 .key(s3_path.clone())
-                                .content_length(sz as i64)
+                                .content_length(sz.try_into().unwrap_or(i64::MAX))
                                 .body(ByteStream::from_body_1_x(BodyWrapper {
                                     reader: rx,
                                     size: sz,
                                 }))
                                 .send()
-                                .map_ok_or_else(|e| Err(Error::from_std_err(Code::Aborted, &e)), |_| Ok(())),
+                                .map_ok_or_else(|e| Err(Error::from_std_err(Code::Aborted, &e)), |_| Ok(sz)),
                             // Stream all data from the reader channel to the writer channel.
                             tx.bind_buffered(reader_ref)
                         );
-                        upload_res
-                            .merge(bind_res)
-                            .err_tip(|| "Failed to upload file to s3 in single chunk")
+                        match (upload_res, bind_res) {
+                            (Ok(size), Ok(())) => Ok(size),
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        }
+                        .err_tip(|| "Failed to upload file to s3 in single chunk")
                     };
                     let result = match timeout(self.single_upload_deadline, upload_fut).await {
                         Ok(result) => result,
@@ -426,7 +449,7 @@ where
                             "Retryable S3 error"
                         );
                         RetryResult::Retry(err)
-                    }, |()| RetryResult::Ok(()));
+                    }, RetryResult::Ok);
                     Some((retry_result, reader))
                 }))
                 .await;
@@ -475,9 +498,24 @@ where
             .await?;
 
         // S3 requires us to upload in parts if the size is greater than 5GB. The part size must be at least
-        // 5mb (except last part) and can have up to 10,000 parts.
+        // 5MB (except last part) and can have up to 10,000 parts.
+
+        // Calculate of number of chunks if we upload in 5MB chucks (min chunk size), clamping to
+        // 10,000 parts and correcting for lossy integer division. This provides the
+        let chunk_count = (max_size / MIN_MULTIPART_SIZE).clamp(0, MAX_UPLOAD_PARTS - 1) + 1;
+
+        // Using clamped first approximation of number of chunks, calculate byte count of each
+        // chunk, excluding last chunk, clamping to min/max upload size 5MB, 5GB.
         let bytes_per_upload_part =
-            (max_size / (MIN_MULTIPART_SIZE - 1)).clamp(MIN_MULTIPART_SIZE, MAX_MULTIPART_SIZE);
+            (max_size / chunk_count).clamp(MIN_MULTIPART_SIZE, MAX_MULTIPART_SIZE);
+
+        // Sanity check before continuing.
+        if !(MIN_MULTIPART_SIZE..MAX_MULTIPART_SIZE).contains(&bytes_per_upload_part) {
+            return Err(make_err!(
+                Code::FailedPrecondition,
+                "Failed to calculate file chuck size (min, max, calc): {MIN_MULTIPART_SIZE}, {MAX_MULTIPART_SIZE}, {bytes_per_upload_part}",
+            ));
+        }
 
         let upload_parts = move || async move {
             // This will ensure we only have `multipart_max_concurrent_uploads` * `bytes_per_upload_part`
@@ -486,6 +524,7 @@ where
 
             let read_stream_fut = async move {
                 let retrier = &Pin::get_ref(self).retrier;
+                let mut total_uploaded = 0;
                 // Note: Our break condition is when we reach EOF.
                 for part_number in 1..i32::MAX {
                     let write_buf = reader
@@ -497,6 +536,8 @@ where
                     if write_buf.is_empty() {
                         break; // Reached EOF.
                     }
+
+                    total_uploaded += write_buf.len() as u64;
 
                     tx.send(retrier.retry(unfold(write_buf, move |write_buf| {
                         async move {
@@ -550,18 +591,16 @@ where
                             .append("Failed to send part to channel in s3_store")
                     })?;
                 }
-                Result::<_, Error>::Ok(())
+                Result::<_, Error>::Ok(total_uploaded)
             }
             .fuse();
 
             let mut upload_futures = FuturesUnordered::new();
+            let mut total_uploaded = 0;
 
             let mut completed_parts = Vec::with_capacity(
-                usize::try_from(cmp::min(
-                    MAX_UPLOAD_PARTS as u64,
-                    (max_size / bytes_per_upload_part) + 1,
-                ))
-                .err_tip(|| "Could not convert u64 to usize")?,
+                usize::try_from(cmp::min(MAX_UPLOAD_PARTS, chunk_count))
+                    .err_tip(|| "Could not convert u64 to usize")?,
             );
             tokio::pin!(read_stream_fut);
             loop {
@@ -569,7 +608,9 @@ where
                     break; // No more data to process.
                 }
                 tokio::select! {
-                    result = &mut read_stream_fut => result?, // Return error or wait for other futures.
+                    result = &mut read_stream_fut => {
+                        total_uploaded = result?;
+                    }, // Return error or wait for other futures.
                     Some(upload_result) = upload_futures.next() => completed_parts.push(upload_result?),
                     Some(fut) = rx.recv() => upload_futures.push(fut),
                 }
@@ -609,7 +650,7 @@ where
                                     ),
                                 )
                             },
-                            |_| RetryResult::Ok(()),
+                            |_| RetryResult::Ok(total_uploaded),
                         ),
                     };
                     Some((retry_result, completed_parts))
@@ -619,26 +660,22 @@ where
         // Upload our parts and complete the multipart upload.
         // If we fail attempt to abort the multipart upload (cleanup).
         upload_parts()
-            .or_else(move |e| async move {
-                Result::<(), _>::Err(e).merge(
-                    // Note: We don't retry here because this is just a best attempt.
-                    self.s3_client
-                        .abort_multipart_upload()
-                        .bucket(&self.bucket)
-                        .key(s3_path)
-                        .upload_id(upload_id)
-                        .send()
-                        .await
-                        .map_or_else(
-                            |e| {
-                                let err = Error::from_std_err(Code::Aborted, &e)
-                                    .append("Failed to abort multipart upload in S3 store");
-                                info!(?err, "Multipart upload error");
-                                Err(err)
-                            },
-                            |_| Ok(()),
-                        ),
-                )
+            .or_else(move |mut e| async move {
+                let abort_res = self
+                    .s3_client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(s3_path)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
+                if let Err(abort_err) = abort_res {
+                    let err = Error::from_std_err(Code::Aborted, &abort_err)
+                        .append("Failed to abort multipart upload in S3 store");
+                    info!(?err, "Multipart upload error");
+                    e = e.merge(err);
+                }
+                Err(e)
             })
             .await
     }
@@ -761,10 +798,7 @@ where
         registry.register_indicator(self);
     }
 
-    fn register_remove_callback(
-        self: Arc<Self>,
-        callback: Arc<dyn RemoveItemCallback>,
-    ) -> Result<(), Error> {
+    fn register_remove_callback(self: Arc<Self>, callback: RemoveCallback) -> Result<(), Error> {
         self.remove_callbacks.lock().push(callback);
         Ok(())
     }

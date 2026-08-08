@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::{self, FuturesOrdered, StreamExt, TryStreamExt};
+use futures::try_join;
 use nativelink_config::stores::DedupSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
@@ -26,7 +27,7 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::fastcdc::FastCDC;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    RemoveCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::FramedRead;
@@ -176,6 +177,14 @@ impl DedupStore {
 
 #[async_trait]
 impl StoreDriver for DedupStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        try_join!(
+            self.index_store.clone().into_inner().post_init(),
+            self.content_store.clone().into_inner().post_init(),
+        )?;
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -208,10 +217,10 @@ impl StoreDriver for DedupStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let mut bytes_reader = StreamReader::new(reader);
         let frame_reader = FramedRead::new(&mut bytes_reader, self.fast_cdc_decoder.clone());
-        let index_entries = frame_reader
+        let index_entries: Vec<_> = frame_reader
             .map(|r| r.err_tip(|| "Failed to decode frame from fast_cdc"))
             .map_ok(|frame| async move {
                 let hash = blake3::hash(&frame[..]).into();
@@ -236,6 +245,8 @@ impl StoreDriver for DedupStore {
             .try_collect()
             .await?;
 
+        let total_size = index_entries.iter().map(DigestInfo::size_bytes).sum();
+
         let serialized_index = wincode::config::serialize(
             &DedupIndex {
                 entries: index_entries,
@@ -255,7 +266,7 @@ impl StoreDriver for DedupStore {
             .await
             .err_tip(|| "Failed to insert our index entry to index_store in dedup_store")?;
 
-        Ok(())
+        Ok(total_size)
     }
 
     async fn get_part(
@@ -385,10 +396,7 @@ impl StoreDriver for DedupStore {
         self
     }
 
-    fn register_remove_callback(
-        self: Arc<Self>,
-        callback: Arc<dyn RemoveItemCallback>,
-    ) -> Result<(), Error> {
+    fn register_remove_callback(self: Arc<Self>, callback: RemoveCallback) -> Result<(), Error> {
         self.index_store
             .register_remove_callback(callback.clone())?;
         self.content_store.register_remove_callback(callback)?;

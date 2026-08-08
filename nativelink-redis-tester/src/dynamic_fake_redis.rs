@@ -22,6 +22,7 @@ use redis::Value;
 use redis_protocol::resp2::decode::decode;
 use redis_protocol::resp2::types::{OwnedFrame, Resp2Frame};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot::{self, Sender};
 use tracing::{debug, info, trace};
 
 use crate::fake_redis::{arg_as_string, fake_redis_internal};
@@ -36,7 +37,7 @@ pub struct FakeRedisBackend<S: SubscriptionManagerNotify> {
     pub table: Arc<Mutex<HashMap<String, HashMap<String, Value>>>>,
     /// Key -> TTL in seconds, as last set by `EXPIRE`. Nothing here actually
     /// expires; the map exists so a test can assert that a write carried the
-    /// TTL it was supposed to.
+    /// bounded lifetime it was supposed to.
     pub expiries: Arc<Mutex<HashMap<String, u64>>>,
     subscription_manager: Arc<Mutex<Option<Arc<S>>>>,
 }
@@ -71,7 +72,7 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
             .replace(subscription_manager);
     }
 
-    async fn dynamic_fake_redis(self, listener: TcpListener) {
+    async fn dynamic_fake_redis(self, listener: TcpListener, listener_ready_tx: Sender<()>) {
         let inner = move |buf: &[u8]| -> String {
             let mut output = String::new();
             let mut buf_index = 0;
@@ -142,9 +143,21 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
                             panic!("Aggregate query should be a string: {args:?}");
                         };
                         let query = str::from_utf8(raw_query).unwrap();
+                        // The real ft_aggregate caller now passes an explicit
+                        // `TIMEOUT <ms>` clause before `LOAD`. Tolerate both
+                        // shapes here so this fake doesn't break older callers
+                        // and the LOAD-args check still validates the bit we
+                        // actually care about.
+                        let load_offset = if matches!(args.get(2), Some(OwnedFrame::BulkString(b)) if b == b"TIMEOUT")
+                        {
+                            // Skip "TIMEOUT" and its millisecond argument.
+                            4
+                        } else {
+                            2
+                        };
                         // Lazy implementation making assumptions.
                         assert_eq!(
-                            args[2..6],
+                            args[load_offset..load_offset + 4],
                             vec![
                                 OwnedFrame::BulkString(b"LOAD".to_vec()),
                                 OwnedFrame::BulkString(b"2".to_vec()),
@@ -389,7 +402,7 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
             }
             output
         };
-        fake_redis_internal(listener, vec![inner]).await;
+        fake_redis_internal(listener, listener_ready_tx, vec![inner]).await;
     }
 
     pub async fn run(self) -> u16 {
@@ -397,9 +410,15 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
         let port = listener.local_addr().unwrap().port();
         info!("Using port {port}");
 
+        let (listener_ready_tx, listener_ready_rx) = oneshot::channel::<()>();
+
         background_spawn!("listener", async move {
-            self.dynamic_fake_redis(listener).await;
+            self.dynamic_fake_redis(listener, listener_ready_tx).await;
         });
+
+        listener_ready_rx
+            .await
+            .expect("Expected successful listener boot");
 
         port
     }

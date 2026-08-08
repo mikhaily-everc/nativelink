@@ -2,6 +2,7 @@
 [workspace]
 exclude = [
   "nativelink-config/generate-stores-config",
+  "nativelink-test/fuzz",
   "tools/generate-bazel-rc",
 ]
 resolver = "2"
@@ -10,7 +11,7 @@ resolver = "2"
 edition = "2024"
 name = "nativelink"
 rust-version = "1.93.1"
-version = "1.3.1"
+version = "1.6.4"
 
 [profile.release]
 lto = true
@@ -74,11 +75,11 @@ tokio = { version = "1.52.2", features = [
 tokio-rustls = { version = "0.26.2", default-features = false, features = [
   "ring",
 ] }
-tonic = { version = "0.13.0", features = [
+tonic = { version = "0.14.0", features = [
   "tls-ring",
   "transport",
 ], default-features = false }
-tonic-web = { version = "0.13.0" }
+tonic-web = { version = "0.14.0" }
 tower = { version = "0.5.2", default-features = false }
 tower-http = { version = "0.6.6", features = ["cors"], default-features = false }
 tracing = { version = "0.1.41", default-features = false }
@@ -95,7 +96,6 @@ serial_test = ["async"]
 tokio = ["fs", "io-util", "rt-multi-thread", "signal"]
 tokio-stream = ["fs"]
 tonic = ["tls", "transport"]
-tonic-build = ["prost"]
 uuid = ["serde", "v4"]
 
 [workspace.lints.rust]
@@ -133,7 +133,6 @@ missing-abi = "warn"
 missing-copy-implementations = "warn"
 missing-debug-implementations = "warn"
 noop-method-call = "warn"
-single-use-lifetimes = "warn"
 trivial-casts = "warn"
 trivial-numeric-casts = "warn"
 unreachable-pub = "warn"
@@ -146,48 +145,54 @@ variant-size-differences = "warn"
 [workspace.lints.clippy]
 
 # Global configuration
-all = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
+all = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 
 # Restriction Denies with default priority
 alloc-instead-of-core = "deny"
 as-underscore = "deny"
 await-holding-lock = "deny"
 bind-instead-of-map = "deny"
+cast_possible_wrap = { level = "deny", priority = 1 }
 collapsible-if = "deny"
 disallowed-methods = "deny"
 doc-markdown = "deny"
 elidable-lifetime-names = "deny"
 explicit-into-iter-loop = "deny"
 future-not-send = "deny"
+ignored-unit-patterns = "deny"
 implicit-clone = "deny"
 implicit-hasher = "deny"
+items-after-statements = "deny"
 manual-is-variant-and = "deny"
 map-unwrap-or = "deny"
+new-ret-no-self = "deny"
 or-fun-call = "deny"
+print-stdout = "deny"
 ptr-arg = "deny"
+redundant-closure = "deny"
 redundant-closure-for-method-calls = "deny"
 semicolon-if-nothing-returned = "deny"
+similar-names = "deny"
 single-char-pattern = "deny"
+single-match-else = "deny"
 std-instead-of-core = "deny"
 string-lit-as-bytes = "deny"
 todo = "deny"
 unchecked-time-subtraction = "deny"
 unnecessary-semicolon = "deny"
+use-debug = "deny"
 used-underscore-binding = "deny"
 useless-format = "deny"
 
 # Restriction Warnings with default priority
 dbg-macro = "warn"
-decimal-literal-representation = "warn"
 get-unwrap = "allow"                    # TODO(jhpratt) Flip
 missing-docs-in-private-items = "allow" # TODO(jhpratt) Flip
-print-stdout = "warn"
 unimplemented = "warn"
 unwrap-in-result = "allow"              # TODO(jhpratt) Flip
 unwrap-used = "allow"                   # TODO(jhpratt) Flip
-use-debug = "warn"
 
 # Nursery denies we want once they get out of Nursery
 missing-const-for-fn = "deny"
@@ -203,7 +208,6 @@ uninhabited-references = { level = "allow", priority = 1 }      # rust-lang/rust
 
 # TODO(palfrey): Remove these to get to pedantic.
 cast_possible_truncation = { level = "deny", priority = 1 }
-cast_possible_wrap = { level = "allow", priority = 1 }
 cast_precision_loss = { level = "allow", priority = 1 }
 cast_sign_loss = { level = "allow", priority = 1 }
 large_futures = { level = "allow", priority = 1 }

@@ -47,6 +47,10 @@ use nativelink_util::fs;
 use nativelink_util::retry::{Retrier, RetryResult};
 use tokio::time::sleep;
 
+pub(crate) fn install_default_rustls_crypto_provider() {
+    drop(rustls::crypto::ring::default_provider().install_default());
+}
+
 #[derive(Clone)]
 pub struct TlsClient {
     client: LegacyClient<HttpsConnector<LegacyHttpConnector>, SdkBody>,
@@ -56,9 +60,24 @@ pub struct TlsClient {
 impl TlsClient {
     #[must_use]
     pub fn new(common: &CommonObjectSpec) -> Self {
+        Self::new_with_http_support(common, common.insecure_allow_http)
+    }
+
+    /// Creates a client for AWS credential discovery.
+    ///
+    /// The default credential chain uses plain HTTP for link-local metadata
+    /// services, including the EKS Pod Identity, ECS, and EC2 providers.
+    #[must_use]
+    pub fn new_for_credentials(common: &CommonObjectSpec) -> Self {
+        Self::new_with_http_support(common, true)
+    }
+
+    fn new_with_http_support(common: &CommonObjectSpec, allow_http: bool) -> Self {
+        install_default_rustls_crypto_provider();
+
         let connector_with_roots = HttpsConnectorBuilder::new().with_platform_verifier();
 
-        let connector_with_schemes = if common.insecure_allow_http {
+        let connector_with_schemes = if allow_http {
             connector_with_roots.https_or_http()
         } else {
             connector_with_roots.https_only()
@@ -77,6 +96,8 @@ impl TlsClient {
         common: &CommonObjectSpec,
         connector: HttpsConnector<LegacyHttpConnector>,
     ) -> Self {
+        install_default_rustls_crypto_provider();
+
         let client = LegacyClient::builder(TokioExecutor::new()).build(connector);
 
         Self {

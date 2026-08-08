@@ -15,6 +15,7 @@
 use core::net::SocketAddr;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::sync::Arc;
 
 use async_lock::Mutex as AsyncMutex;
@@ -24,13 +25,14 @@ use clap::Parser;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Either, OptionFuture, TryFutureExt, try_join_all};
 use hyper::StatusCode;
-use hyper_util::rt::tokio::{TokioIo, TokioTimer};
+use hyper_util::rt::TokioTimer;
+use hyper_util::rt::tokio::TokioIo;
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
 use nativelink_config::cas_server::{
-    CasConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig, SchedulerConfig,
-    ServerConfig, StoreConfig, WorkerConfig,
+    CasConfig, CasStoreConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig,
+    SchedulerConfig, ServerConfig, StoreConfig, WithInstanceName, WorkerConfig,
 };
 use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
@@ -47,12 +49,14 @@ use nativelink_service::fetch_server::FetchServer;
 use nativelink_service::health_server::HealthServer;
 use nativelink_service::push_server::PushServer;
 use nativelink_service::scheduler_event_bridge::SchedulerEventBridge;
+use nativelink_service::wire_compression::RemoteCacheCompressionInstances;
 use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::fs::set_open_file_limit;
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
 use nativelink_util::health_utils::HealthRegistryBuilder;
+use nativelink_util::operation_state_manager::ClientStateManager;
 use nativelink_util::origin_event_publisher::OriginEventPublisher;
 #[cfg(target_family = "unix")]
 use nativelink_util::shutdown_guard::Priority;
@@ -66,7 +70,7 @@ use nativelink_util::{background_spawn, fs, spawn};
 use nativelink_worker::local_worker::new_local_worker;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateRevocationListDer, PrivateKeyDer};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::select;
 #[cfg(target_family = "unix")]
 use tokio::signal::unix::{SignalKind, signal};
@@ -96,6 +100,21 @@ const DEFAULT_MAX_QUEUE_EVENTS: usize = 0x0001_0000;
 /// Broadcast Channel Capacity
 /// Note: The actual capacity may be greater than the provided capacity.
 const BROADCAST_CAPACITY: usize = 1;
+
+fn install_default_rustls_crypto_provider() {
+    drop(tokio_rustls::rustls::crypto::ring::default_provider().install_default());
+}
+
+/// Bind a [`TcpListener`] with `IP_FREEBIND` set.
+fn bind_freebind(socket_addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
+    let socket = match socket_addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }?;
+    fs::set_freebind(&socket)?;
+    socket.bind(socket_addr)?;
+    socket.listen(1024)
+}
 
 /// Backend for bazel remote execution / cache API.
 #[derive(Parser, Debug)]
@@ -202,8 +221,11 @@ async fn inner_main(
             let store = store_factory(&spec, &store_manager, Some(&mut health_register_store))
                 .await
                 .err_tip(|| format!("Failed to create store '{name}'"))?;
-            store_manager.add_store(&name, store);
+            store_manager
+                .add_store(&name, store)
+                .err_tip(|| format!("Failed to add store '{name}'"))?;
         }
+        store_manager.run_post_init().await?;
     }
 
     let mut root_futures: Vec<BoxFuture<Result<(), Error>>> = Vec::new();
@@ -253,6 +275,17 @@ async fn inner_main(
     // when inner_main returns (i.e. servers stopped), which aborts the supervisor.
     let mut scheduler_event_bridges: Vec<SchedulerEventBridge> = Vec::new();
 
+    // The capabilities service advertises chunking support for CAS instances
+    // that may be served from a different server block (e.g. behind an L7
+    // router), so collect the CAS configs across all blocks.
+    let all_cas_configs: Vec<WithInstanceName<CasStoreConfig>> = server_cfgs
+        .iter()
+        .filter_map(|server_cfg| server_cfg.services.as_ref())
+        .filter_map(|services| services.cas.as_deref())
+        .flatten()
+        .cloned()
+        .collect();
+
     for server_cfg in server_cfgs {
         let services = server_cfg
             .services
@@ -268,19 +301,11 @@ async fn inner_main(
             .transpose()
             .err_tip(|| "Could not create Execution service")?;
 
-        // Build the CAS server up front so we can expose its per-instance
-        // "chunking support" map to the Capabilities service below.
-        let cas_server = services
-            .cas
-            .map(|cfg| CasServer::new(&cfg, &store_manager))
-            .transpose()
-            .err_tip(|| "Could not create CAS service")?;
-        let chunking_enabled_for_instance = cas_server
-            .as_ref()
-            .map(CasServer::chunking_instances)
-            .unwrap_or_default();
-
         let mut bep_subscription_svc = None;
+
+        let capabilities_configs = services.capabilities.as_deref().unwrap_or_default();
+        let remote_cache_compression_instances =
+            RemoteCacheCompressionInstances::from_capabilities_configs(capabilities_configs);
 
         let tonic_services = Routes::builder()
             .routes()
@@ -293,7 +318,16 @@ async fn inner_main(
                     })
                     .err_tip(|| "Could not create AC service")?,
             )
-            .add_optional_service(cas_server.map(|v| service_setup!(v.into_service(), http_config)))
+            .add_optional_service(
+                services
+                    .cas
+                    .as_deref()
+                    .map_or(Ok(None), |cfg| {
+                        CasServer::new(cfg, &store_manager, &remote_cache_compression_instances)
+                            .map(|v| Some(service_setup!(v.into_service(), http_config)))
+                    })
+                    .err_tip(|| "Could not create CAS service")?,
+            )
             .add_optional_service(
                 execution_server
                     .clone()
@@ -324,8 +358,12 @@ async fn inner_main(
                 services
                     .bytestream
                     .map_or(Ok(None), |cfg| {
-                        ByteStreamServer::new(&cfg, &store_manager)
-                            .map(|v| Some(service_setup!(v.into_service(), http_config)))
+                        ByteStreamServer::new(
+                            &cfg,
+                            &store_manager,
+                            &remote_cache_compression_instances,
+                        )
+                        .map(|v| Some(service_setup!(v.into_service(), http_config)))
                     })
                     .err_tip(|| "Could not create ByteStream service")?,
             )
@@ -334,7 +372,8 @@ async fn inner_main(
                     CapabilitiesServer::new(
                         cfg,
                         &action_schedulers,
-                        chunking_enabled_for_instance.clone(),
+                        &remote_cache_compression_instances,
+                        &all_cas_configs,
                     )
                 }))
                 .await
@@ -372,8 +411,17 @@ async fn inner_main(
 
                     // Bridge scheduler operation state into this BEP pipeline so
                     // WatchBuild can overlay remote-execution data per build.
+                    // Upstream narrowed `scheduler_factory` to hand back
+                    // `Arc<dyn KnownPlatformPropertyProvider>`; that trait has
+                    // `ClientStateManager` as a supertrait, so upcast to the
+                    // interface the bridge actually consumes.
                     scheduler_event_bridges.push(SchedulerEventBridge::new(
-                        action_schedulers.values().cloned().collect(),
+                        action_schedulers
+                            .values()
+                            .map(|scheduler| {
+                                Arc::clone(scheduler) as Arc<dyn ClientStateManager>
+                            })
+                            .collect(),
                         bep.store(),
                         bep.index(),
                         bep.sender(),
@@ -554,7 +602,26 @@ async fn inner_main(
                 Error::from_std_err(Code::InvalidArgument, &e)
                     .append(format!("Invalid address '{}'", http_config.socket_address))
             })?;
-        let tcp_listener = TcpListener::bind(&socket_addr).await?;
+        let tcp_listener = if http_config.freebind {
+            bind_freebind(socket_addr)
+        } else {
+            TcpListener::bind(&socket_addr).await
+        }
+        .map_err(|e| match e.kind() {
+            ErrorKind::AddrInUse => make_err!(
+                Code::AlreadyExists,
+                "Address '{socket_addr}' is already in use by another process.",
+            ),
+            ErrorKind::PermissionDenied => make_err!(
+                Code::PermissionDenied,
+                "Permission denied. You may need root privileges to bind to address '{socket_addr}'.",
+            ),
+            ErrorKind::InvalidInput => {
+                make_input_err!("The provided address '{socket_addr}' is invalid.")
+            }
+            _ => Error::from_std_err(Code::Internal, &e)
+                .append(format!("Failed to bind to socket address '{socket_addr}'")),
+        })?;
         let mut http = auto::Builder::new(TaskExecutor::default());
         http.http2().timer(TokioTimer::new());
 
@@ -585,7 +652,7 @@ async fn inner_main(
         if let Some(value) = http_config.experimental_http2_max_concurrent_streams {
             http.http2().max_concurrent_streams(value);
         }
-        if let Some(value) = http_config.experimental_http2_keep_alive_timeout {
+        if let Some(value) = http_config.experimental_http2_keep_alive_timeout_s {
             http.http2()
                 .keep_alive_timeout(Duration::from_secs(u64::from(value)));
         }
@@ -763,6 +830,8 @@ fn get_config() -> Result<CasConfig, Error> {
 }
 
 fn main() -> Result<(), Box<dyn core::error::Error>> {
+    install_default_rustls_crypto_provider();
+
     // Set QoS to USER_INITIATED on the main thread *before* the tokio
     // runtime is built so the spawned worker threads inherit P-core
     // scheduling preference via pthread QoS inheritance on Apple
@@ -782,7 +851,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     // The OTLP exporters need to run in a Tokio context
     // Do this first so all the other logging works
     #[expect(clippy::disallowed_methods, reason = "tracing init on main runtime")]
-    runtime.block_on(async { tokio::spawn(async { init_tracing() }).await? })?;
+    runtime.block_on(async { tokio::spawn(async { init_tracing().await }).await? })?;
 
     let mut cfg = get_config()?;
 
@@ -838,13 +907,13 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             .expect("Failed to listen to SIGTERM")
             .recv()
             .await;
-        warn!("Process terminated via SIGTERM",);
+        warn!("Process terminated via SIGTERM");
         drop(shutdown_tx_clone.send(shutdown_guard.clone()));
         scheduler_shutdown_rx
             .await
             .expect("Failed to receive scheduler shutdown");
         let () = shutdown_guard.wait_for(Priority::P0).await;
-        warn!("Successfully shut down nativelink.",);
+        warn!("Successfully shut down nativelink.");
         std::process::exit(143);
     });
 

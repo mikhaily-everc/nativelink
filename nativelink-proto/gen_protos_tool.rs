@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::{Arg, ArgAction, Command};
-use prost_build::Config;
+use tonic_prost_build::Config;
 
 fn main() -> std::io::Result<()> {
     let matches = Command::new("Rust gRPC Codegen")
@@ -56,16 +56,17 @@ fn main() -> std::io::Result<()> {
     // include "external/nativelink+/nativelink-proto"), since import
     // statements inside the .proto files reference paths relative to
     // nativelink-proto/.
-    let include = paths
+    let include: PathBuf = paths
         .first()
         .and_then(|p| {
             const MARKER: &str = "nativelink-proto/";
-            p.rfind(MARKER).map(|i| p[..i + MARKER.len() - 1].to_string())
+            p.rfind(MARKER)
+                .map(|i| PathBuf::from(&p[..i + MARKER.len() - 1]))
         })
-        .unwrap_or_else(|| "nativelink-proto".to_string());
+        .unwrap_or_else(|| PathBuf::from("nativelink-proto"));
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .out_dir(output_dir)
-        .compile_protos_with_config(config, &paths, &[include])?;
+        .compile_with_config(config, &paths, &[&include])?;
     Ok(())
 }

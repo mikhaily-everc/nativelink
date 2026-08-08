@@ -24,13 +24,14 @@ use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
 use nativelink_util::common::PackedHash;
-use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
+use nativelink_util::digest_hasher::{
+    DigestHasher, DigestHasherFunc, digest_hasher_func_from_context,
+};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::store_trait::{
-    RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    RemoveCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
-use opentelemetry::context::Context;
 use tracing::{info, warn};
 
 // Process-wide counter of in-flight VerifyStore::update calls. Useful when
@@ -72,8 +73,9 @@ impl VerifyStore {
         mut rx: DropCloserReadHalf,
         maybe_expected_digest_size: Option<u64>,
         original_hash: &PackedHash,
+        digest_function: Option<DigestHasherFunc>,
         mut maybe_hasher: Option<&mut D>,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let mut sum_size: u64 = 0;
         loop {
             let chunk = rx
@@ -133,18 +135,23 @@ impl VerifyStore {
                         // mismatch, a shared-state leak between writes is the
                         // most likely culprit; if = 1, the client genuinely sent
                         // wrong data.
-                        let concurrent =
-                            VERIFY_STORE_INFLIGHT.load(Ordering::Relaxed);
+                        let concurrent = VERIFY_STORE_INFLIGHT.load(Ordering::Relaxed);
                         warn!(
                             declared_hash = %original_hash,
                             computed_hash = %hash_result,
                             bytes_received = sum_size,
                             expected_size = ?maybe_expected_digest_size,
                             concurrent_uploads = concurrent,
+                            ?digest_function,
                             "VerifyStore: hash mismatch — data received does not match declared digest",
                         );
+                        let Some(digest_function) = digest_function else {
+                            return Err(make_input_err!(
+                                "Hash verification failed without a digest function"
+                            ));
+                        };
                         return Err(make_input_err!(
-                            "Hashes do not match, got: {original_hash} but digest hash was {hash_result}",
+                            "Hash verification using {digest_function} failed: client declared {digest_function}:{original_hash}, but the server computed {digest_function}:{hash_result}",
                         ));
                     }
                 }
@@ -163,12 +170,17 @@ impl VerifyStore {
                 .await
                 .err_tip(|| "Failed to write chunk to inner store in verify store")?;
         }
-        Ok(())
+        Ok(sum_size)
     }
 }
 
 #[async_trait]
 impl StoreDriver for VerifyStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        self.inner_store.clone().into_inner().post_init().await?;
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -182,7 +194,7 @@ impl StoreDriver for VerifyStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let StoreKey::Digest(digest) = key else {
             return Err(make_input_err!(
                 "Only digests are supported in VerifyStore. Got {key:?}"
@@ -201,16 +213,12 @@ impl StoreDriver for VerifyStore {
             ));
         }
 
-        let mut hasher = if self.verify_hash {
-            Some(
-                Context::current()
-                    .get::<DigestHasherFunc>()
-                    .map_or_else(default_digest_hasher_func, |v| *v)
-                    .hasher(),
-            )
+        let digest_function = if self.verify_hash {
+            Some(digest_hasher_func_from_context())
         } else {
             None
         };
+        let mut hasher = digest_function.map(|digest_function| digest_function.hasher());
 
         let maybe_digest_size = if self.verify_size {
             Some(digest_size)
@@ -237,6 +245,7 @@ impl StoreDriver for VerifyStore {
             reader,
             maybe_digest_size,
             digest.packed_hash(),
+            digest_function,
             hasher.as_mut(),
         );
 
@@ -244,7 +253,11 @@ impl StoreDriver for VerifyStore {
 
         VERIFY_STORE_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
 
-        update_res.merge(check_res)
+        match (update_res, check_res) {
+            // Prioritize the check future's error, as it's more specific.
+            (_, Err(e)) | (Err(e), Ok(_)) => Err(e),
+            (Ok(size), Ok(_)) => Ok(size),
+        }
     }
 
     async fn get_part(
@@ -269,10 +282,7 @@ impl StoreDriver for VerifyStore {
         self
     }
 
-    fn register_remove_callback(
-        self: Arc<Self>,
-        callback: Arc<dyn RemoveItemCallback>,
-    ) -> Result<(), Error> {
+    fn register_remove_callback(self: Arc<Self>, callback: RemoveCallback) -> Result<(), Error> {
         self.inner_store.register_remove_callback(callback)
     }
 }

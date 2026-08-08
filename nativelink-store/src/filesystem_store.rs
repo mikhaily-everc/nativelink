@@ -38,12 +38,15 @@ use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
 use nativelink_util::common::{DigestInfo, fs};
-use nativelink_util::evicting_map::{EvictingMap, LenEntry};
+use nativelink_util::evicting_map::{EvictingMap, EvictionSnapshot, LenEntry};
+use nativelink_util::fs::FileSlot;
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 #[cfg(unix)]
 use nativelink_util::spawn_blocking;
+#[cfg(unix)]
+use nativelink_util::store_trait::RemoveItemCallback;
 use nativelink_util::store_trait::{
-    RemoveItemCallback, StoreDriver, StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
+    RemoveCallback, StoreDriver, StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Take};
 use tokio::sync::Semaphore;
@@ -51,7 +54,7 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::ReadDirStream;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::callback_utils::RemoveItemCallbackHolder;
+use crate::callback_utils::RemoveCallbackHolder;
 use crate::cas_utils::is_zero_digest;
 
 // Default size to allocate memory of the buffer when reading files.
@@ -77,7 +80,9 @@ pub const DIGEST_FOLDER: &str = "d";
 /// **executable** (0o555) variants of CAS blobs (see
 /// [`FilesystemStore::get_executable_hardlink_source`]). It is a sibling of
 /// `content_path` rather than a child so the normal content/temp scan and prune
-/// logic never touches it. Cleared on startup; entries are regenerable.
+/// logic never touches it. Cleared on writable startup; entries are
+/// regenerable. If the wipe is blocked by a read-only filesystem, executable
+/// variants are disabled so surviving files are never trusted.
 #[cfg(unix)]
 const EXECUTABLE_DIR_SUFFIX: &str = ".exec";
 
@@ -162,13 +167,15 @@ impl Drop for EncodedFilePath {
             "Spawned a filesystem_delete_file"
         );
         background_spawn!("filesystem_delete_file", async move {
-            let result = fs::remove_file(&file_path)
-                .await
-                .err_tip(|| format!("Failed to remove file {}", file_path.display()));
-            if let Err(err) = result {
-                error!(?file_path, ?err, "Failed to delete file",);
-            } else {
-                debug!(?file_path, "File deleted",);
+            match fs::remove_file(&file_path).await {
+                Ok(()) => debug!(?file_path, "File deleted"),
+                // The file already being gone is the desired end state of a
+                // delete, not a failure — e.g. an entry marked Temp after an
+                // already-gone unref points at a path that was never created.
+                Err(err) if err.code == Code::NotFound => {
+                    debug!(?file_path, "File already gone, nothing to delete");
+                }
+                Err(err) => error!(?file_path, ?err, "Failed to delete file"),
             }
             // .fetch_sub returns previous value, so we subtract one to get approximate current value
             let current_active_drop_spawns = shared_context
@@ -211,9 +218,12 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     fn make_and_open_file(
         block_size: u64,
         encoded_file_path: EncodedFilePath,
-    ) -> impl Future<Output = Result<(Self, fs::FileSlot, OsString), Error>> + Send
+    ) -> impl Future<Output = Result<(Self, FileSlot, OsString), Error>> + Send
     where
         Self: Sized;
+
+    /// Returns the underlying size of the data in bytes
+    fn data_size(&self) -> u64;
 
     /// Returns the underlying reference to the size of the data in bytes
     fn data_size_mut(&mut self) -> &mut u64;
@@ -229,7 +239,7 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
         &self,
         offset: u64,
         length: u64,
-    ) -> impl Future<Output = Result<Take<fs::FileSlot>, Error>> + Send;
+    ) -> impl Future<Output = Result<Take<FileSlot>, Error>> + Send;
 
     /// This function is a safe way to extract the file name of the underlying file. To protect users from
     /// accidentally creating undefined behavior we encourage users to do the logic they need to do with
@@ -275,7 +285,7 @@ impl FileEntry for FileEntryImpl {
     async fn make_and_open_file(
         block_size: u64,
         encoded_file_path: EncodedFilePath,
-    ) -> Result<(Self, fs::FileSlot, OsString), Error> {
+    ) -> Result<(Self, FileSlot, OsString), Error> {
         let temp_full_path = encoded_file_path.get_file_path().to_os_string();
         let temp_file_result = fs::create_file(temp_full_path.clone())
             .or_else(|mut err| async {
@@ -309,6 +319,10 @@ impl FileEntry for FileEntryImpl {
         ))
     }
 
+    fn data_size(&self) -> u64 {
+        self.data_size
+    }
+
     fn data_size_mut(&mut self) -> &mut u64 {
         &mut self.data_size
     }
@@ -325,7 +339,7 @@ impl FileEntry for FileEntryImpl {
         &self,
         offset: u64,
         length: u64,
-    ) -> impl Future<Output = Result<Take<fs::FileSlot>, Error>> + Send {
+    ) -> impl Future<Output = Result<Take<FileSlot>, Error>> + Send {
         self.get_file_path_locked(move |full_content_path| async move {
             let file = fs::open_file(&full_content_path, offset, length)
                 .await
@@ -373,8 +387,274 @@ fn make_temp_digest(mut digest: DigestInfo) -> DigestInfo {
     digest
 }
 
-fn make_temp_key(key: &StoreKey) -> StoreKey<'static> {
+pub fn make_temp_key(key: &StoreKey) -> StoreKey<'static> {
     StoreKey::Digest(make_temp_digest(key.borrow().into_digest()))
+}
+
+/// Group-commit flush coalescer (macOS only).
+///
+/// On macOS, `File::sync_all` issues `fcntl(F_FULLFSYNC)` — a full
+/// device-cache flush — once per call. The flush is serialized at the
+/// device, costs multiple milliseconds, and dominates uploads of many
+/// small blobs (a 4,400-tiny-file action input tree spends ~12s of its
+/// ~14.5s materialization in these flushes). Linux does not have this
+/// problem because concurrent `fsync` calls coalesce inside the
+/// filesystem journal's group commit.
+///
+/// This applies the same group-commit idea in userspace, exploiting an
+/// asymmetry in `F_FULLFSYNC`: writing a file's pages to the storage
+/// device is per-file work (plain `fsync(2)`, cheap), while the expensive
+/// device-cache drain is device-wide by nature. Each writer first pushes
+/// its own data to the device with `fsync(2)`, then joins the current
+/// commit round; a single long-lived flusher task per DEVICE issues one
+/// `F_FULLFSYNC` (on a dedicated sentinel file) per round, covering every
+/// previously-`fsync`ed blob at once. Rounds self-batch exactly like a
+/// journal: while one flush is running, later writers accumulate into
+/// the next round.
+///
+/// The coalescer (and its flusher task) is per store instance. Sharing
+/// one coalescer across all stores on a device would amortize further —
+/// the flush is device-wide — but a process-global flusher task cannot
+/// safely outlive the tokio runtime that spawned it (multiple runtimes
+/// coexist in one process, e.g. one per test); doing this correctly
+/// needs a runtime-agnostic flusher (a dedicated OS thread) and is left
+/// as a follow-up.
+///
+/// Durability is identical to per-file `F_FULLFSYNC`: a writer only
+/// proceeds (and only renames its blob into the content directory) after
+/// a device-cache flush that started after its own `fsync(2)` completed.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct FlushCoalescer {
+    /// The round currently accepting waiters. Swapped out by the flusher
+    /// right before it flushes, so writers whose `fsync(2)` finished
+    /// after the flush began land in the next round.
+    current_round: parking_lot::Mutex<Arc<FlushRound>>,
+    /// Wakes the flusher task. Writers notify after subscribing to their
+    /// round, so a wakeup can never be observed before its waiter.
+    wake: Arc<tokio::sync::Notify>,
+    /// Dedicated file the `F_FULLFSYNC` is issued on. A SIBLING of the
+    /// store's content path (like the `.exec` variant directory), so
+    /// neither the startup scan nor `move_old_cache`'s legacy root sweep
+    /// ever sees it.
+    sentinel: Arc<std::fs::File>,
+    /// Number of device-wide barriers issued. Kept separately from the
+    /// per-file `fsync(2)` count so tests can pin the coalescing invariant.
+    full_flush_count: Arc<AtomicU64>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct FlushRound {
+    /// Broadcasts the flush outcome to every writer in the round.
+    result_tx: tokio::sync::watch::Sender<Option<Result<(), Error>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl FlushRound {
+    fn new() -> Arc<Self> {
+        let (result_tx, _) = tokio::sync::watch::channel(None);
+        Arc::new(Self { result_tx })
+    }
+}
+
+/// Guarantees a [`FlushRound`]'s waiters always receive a result: if the
+/// flusher task is cancelled at an await point (runtime shutdown), waiters
+/// must get an error rather than pend forever — their own `Arc<FlushRound>`
+/// keeps the channel alive, so a dropped-sender wakeup can never happen.
+#[cfg(target_os = "macos")]
+struct SendOnDrop(Option<Arc<FlushRound>>);
+
+#[cfg(target_os = "macos")]
+impl SendOnDrop {
+    fn finish(mut self, result: Result<(), Error>) {
+        if let Some(round) = self.0.take() {
+            // Ignore send errors: every waiter may have been cancelled.
+            drop(round.result_tx.send(Some(result)));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SendOnDrop {
+    fn drop(&mut self) {
+        if let Some(round) = self.0.take() {
+            drop(round.result_tx.send(Some(Err(make_err!(
+                Code::Internal,
+                "Flush coalescer round task cancelled before completing"
+            )))));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for FlushCoalescer {
+    fn drop(&mut self) {
+        // Wake the flusher so it observes the dead Weak and exits instead
+        // of parking forever.
+        self.wake.notify_one();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl FlushCoalescer {
+    /// Creates the coalescer for a store and spawns its flusher task on
+    /// the current runtime (the same runtime the store's uploads run on).
+    async fn for_content_path(content_path: &str) -> Result<Arc<Self>, Error> {
+        // Sibling of `content_path` (never inside it): the startup scan
+        // and `move_old_cache` sweep everything under the content root.
+        let sentinel_path = format!("{content_path}.flush_sentinel");
+        let sentinel = spawn_blocking!("filesystem_store_flush_sentinel_open", move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&sentinel_path)
+                .map_err(|e| {
+                    make_err!(
+                        Code::Internal,
+                        "Failed to create flush sentinel {sentinel_path}: {e:?}"
+                    )
+                })
+        })
+        .await
+        .err_tip(|| "Failed to join flush sentinel open task")??;
+
+        let coalescer = Arc::new(Self {
+            current_round: parking_lot::Mutex::new(FlushRound::new()),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            sentinel: Arc::new(sentinel),
+            full_flush_count: Arc::new(AtomicU64::new(0)),
+        });
+
+        let weak = Arc::downgrade(&coalescer);
+        let wake = coalescer.wake.clone();
+        background_spawn!("filesystem_store_flush_coalescer", async move {
+            loop {
+                wake.notified().await;
+                let Some(coalescer) = weak.upgrade() else {
+                    return;
+                };
+                coalescer.flush_one_round().await;
+                // Drop the strong ref before parking so the store can be
+                // torn down while the flusher is idle.
+            }
+        });
+        Ok(coalescer)
+    }
+
+    /// Waits until a device-cache flush that started after this call has
+    /// completed. Callers must have already `fsync(2)`ed their own file.
+    async fn commit(&self) -> Result<(), Error> {
+        let round = self.current_round.lock().clone();
+        let mut result_rx = round.result_tx.subscribe();
+        // Notify strictly after subscribing: the flusher skips rounds
+        // with no receivers, so this ordering makes lost wakeups
+        // impossible (a permit is stored even while the flusher is busy).
+        self.wake.notify_one();
+        let result_ref = result_rx
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| make_err!(Code::Internal, "Flush coalescer round dropped"))?;
+        result_ref
+            .clone()
+            .unwrap_or_else(|| Err(make_err!(Code::Internal, "Flush round result missing")))
+    }
+
+    async fn flush_one_round(&self) {
+        let round = self.current_round.lock().clone();
+        if round.result_tx.receiver_count() == 0 {
+            // Spurious wakeup (e.g. a permit left over from a round that
+            // a previous iteration already served).
+            return;
+        }
+        let send_guard = SendOnDrop(Some(round.clone()));
+
+        // Brief accumulation window, only when this round actually has
+        // multiple waiters: lets a burst pack more writers into the round
+        // before it closes, trading ~3ms of publish latency (about the
+        // cost of one device flush) for fewer device flushes. A solo
+        // writer on an idle store skips it and pays only its own flush.
+        if round.result_tx.receiver_count() > 1 {
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        // Close the round: writers arriving from here on cannot assume
+        // this flush covers them, so they must get a fresh round.
+        {
+            let mut current = self.current_round.lock();
+            if Arc::ptr_eq(&*current, &round) {
+                *current = FlushRound::new();
+            }
+        }
+        let sentinel = self.sentinel.clone();
+        let full_flush_count = self.full_flush_count.clone();
+        let flush_result = spawn_blocking!("filesystem_store_full_flush", move || {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::FileExt;
+            // Keep the sentinel dirty so the flush is never a no-op.
+            // Best-effort: a failed write (e.g. ENOSPC on a full CoW
+            // volume) must not fail the whole round — the fcntl below is
+            // what provides the device-cache drain.
+            if let Err(err) = sentinel.write_at(b"f", 0) {
+                warn!(?err, "Flush sentinel write failed; issuing flush anyway");
+            }
+            // Count the actual blocking operation, rather than merely counting
+            // rounds scheduled by the async task.
+            full_flush_count.fetch_add(1, Ordering::Relaxed);
+            loop {
+                if unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_FULLFSYNC) } != -1 {
+                    return Ok(());
+                }
+                let err = std::io::Error::last_os_error();
+                // std's sync_all retries EINTR (cvt_r); match it.
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(Error::from(err).append("F_FULLFSYNC failed in flush coalescer"));
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(Error::from_std_err(Code::Internal, &e).append("Flush coalescer task failed"))
+        });
+        send_guard.finish(flush_result);
+    }
+}
+
+#[cfg(unix)]
+async fn prepare_executable_dir(content_path: &str) -> Result<bool, Error> {
+    fn is_non_writable_error(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+        )
+    }
+
+    let executable_dir = format!("{content_path}{EXECUTABLE_DIR_SUFFIX}");
+    let executable_digest_dir = format!("{executable_dir}/{DIGEST_FOLDER}");
+    spawn_blocking!("filesystem_store_prepare_executable_dir", move || {
+        match std::fs::remove_dir_all(&executable_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            // A read-only cache must remain available for ordinary reads. Do
+            // not reuse the directory, though: a surviving executable variant
+            // may be stale or torn after an unclean shutdown.
+            Err(err) if is_non_writable_error(&err) => return Ok(false),
+            Err(err) => {
+                return Err(Error::from(err)
+                    .append(format!("Failed to clear executable dir {executable_dir}")));
+            }
+        }
+
+        match std::fs::create_dir_all(&executable_digest_dir) {
+            Ok(()) => Ok(true),
+            Err(err) if is_non_writable_error(&err) => Ok(false),
+            Err(err) => Err(Error::from(err).append(format!(
+                "Failed to create executable dir {executable_digest_dir}"
+            ))),
+        }
+    })
+    .await
+    .err_tip(|| "Failed to join executable-dir preparation task")?
 }
 
 impl LenEntry for FileEntryImpl {
@@ -409,28 +689,34 @@ impl LenEntry for FileEntryImpl {
         let to_path = to_full_path_from_key(&encoded_file_path.shared_context.temp_path, &new_key);
 
         if let Err(err) = fs::rename(&from_path, &to_path).await {
-            // ENOENT here means the file we expected at `from_path`
-            // was already gone — typically because another thread's
-            // eviction beat us to the unref, or because the entry
-            // ended up in our map without its file ever landing on
-            // disk (the "phantom-map" case the runtime recovers from
-            // via `FastSlowStore::get_part`'s slow-store fallback).
-            // It is benign at this site — there is no file to move
-            // — and historically dominates the log volume of this
-            // store under heavy write+evict concurrency, fast enough
-            // to drown the runtime under sustained pressure. Demote
-            // to `debug` and drop the per-emission path fields so it
-            // stops costing serialization in the hot path.
-            //
-            // Other rename failures (EACCES, EXDEV, EBUSY, …) are
-            // genuinely unexpected and stay at `warn` with full
-            // context.
-            if err.code == Code::NotFound {
+            // ENOENT from rename is ambiguous: the source may be gone, or
+            // a directory component of the destination (the temp dir) may
+            // be missing. Confirm the source is genuinely gone before
+            // treating it as benign — otherwise a removed temp dir would
+            // flip an intact content file to Temp and orphan it on disk.
+            let source_gone = err.code == Code::NotFound
+                && matches!(
+                    fs::metadata(&from_path).await,
+                    Err(meta_err) if meta_err.code == Code::NotFound
+                );
+            if source_gone {
+                // The file is already gone — typically another thread's
+                // eviction beat us, or the entry never got its file on
+                // disk. Benign here, and it dominates log volume under
+                // heavy write+evict concurrency, so keep it at `debug`.
+                // Mark the entry Temp (as a successful rename would) so a
+                // repeat unref is a no-op and drop stops claiming the
+                // content path.
                 debug!(
                     key = ?encoded_file_path.key,
                     "Failed to rename file (already gone, treating as benign)",
                 );
+                encoded_file_path.path_type = PathType::Temp;
+                encoded_file_path.key = new_key;
             } else {
+                // Either a non-ENOENT failure (EACCES, EXDEV, EBUSY, …) or
+                // ENOENT with the source still present (missing temp dir).
+                // The content file is intact; leave the entry as Content.
                 warn!(
                     key = ?encoded_file_path.key,
                     ?from_path,
@@ -471,7 +757,7 @@ pub fn key_from_file(file_name: &str, file_type: FileType) -> Result<StoreKey<'_
 const SIMULTANEOUS_METADATA_READS: usize = 200;
 
 type FsEvictingMap<'a, Fe> =
-    EvictingMap<StoreKeyBorrow, StoreKey<'a>, Arc<Fe>, SystemTime, RemoveItemCallbackHolder>;
+    EvictingMap<StoreKeyBorrow, StoreKey<'a>, Arc<Fe>, SystemTime, RemoveCallbackHolder>;
 
 async fn add_files_to_cache<Fe: FileEntry>(
     evicting_map: &FsEvictingMap<'_, Fe>,
@@ -683,6 +969,148 @@ async fn prune_temp_path(temp_path: &str) -> Result<(), Error> {
     Ok(())
 }
 
+// Sometimes we get files to emplace that are identical to the existing files
+// Due to the evict/remove/replace cycle taking some amount of time, we actually
+// want to drop these
+// Return value is "is duplicate"
+pub async fn check_duplicate_files<Fe>(
+    evicting_map: &Arc<FsEvictingMap<'_, Fe>>,
+    key: &StoreKey<'static>,
+    entry: &Arc<Fe>,
+) -> Result<bool, Error>
+where
+    Fe: FileEntry,
+{
+    let temp_file_encoded_file_path = entry.get_encoded_file_path().write().await;
+    let maybe_existing_item = evicting_map.get(&key.borrow().into_owned()).await;
+    if let Some(existing_item) = maybe_existing_item {
+        if Arc::ptr_eq(entry, &existing_item) {
+            warn!("Tried to check duplicate of an entry we already have!");
+            return Ok(true);
+        }
+        let existing_item_encoded_file_path = existing_item.get_encoded_file_path().write().await;
+        if entry.data_size() == existing_item.data_size() {
+            const CHUNK_SIZE: usize = 16 * 1024; // 16kb chunks, kinda picked out of the air
+            let file_length = entry.data_size();
+            let existing_path = existing_item_encoded_file_path.get_file_path();
+            let temp_path = temp_file_encoded_file_path.get_file_path();
+            trace!(?existing_path, ?temp_path, "Checking duplicate files");
+            let mut temp_file = fs::open_file(&temp_path, 0, file_length).await?;
+            let mut existing_file = fs::open_file(&existing_path, 0, file_length).await?;
+
+            let mut temp_buffer: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
+            let mut existing_buffer: [u8; CHUNK_SIZE] = [0; CHUNK_SIZE];
+            // in a file_length file, there are 0 to file_length-1 entries
+            // not file_length. It's counting all the bytes, starting from 0
+            for offset in (0..file_length - 1).step_by(CHUNK_SIZE) {
+                let buffer_size = if offset + (CHUNK_SIZE as u64) <= file_length {
+                    CHUNK_SIZE
+                } else if file_length < CHUNK_SIZE as u64 {
+                    usize::try_from(file_length)
+                        .expect("Always succeeds because file_length < 16384")
+                } else {
+                    usize::try_from(file_length - offset).expect("Always succeeds because offset < file_length, and offset-file_length must be < 16384")
+                };
+                if let Err(err) = temp_file.read_exact(&mut temp_buffer[0..buffer_size]).await {
+                    warn!(
+                        ?err,
+                        ?temp_path,
+                        file_length,
+                        offset,
+                        buffer_size,
+                        "Failed to read temp file, skipping duplicate check"
+                    );
+                    return Ok(false);
+                }
+                if let Err(err) = existing_file
+                    .read_exact(&mut existing_buffer[0..buffer_size])
+                    .await
+                {
+                    warn!(
+                        ?err,
+                        ?existing_path,
+                        file_length,
+                        offset,
+                        buffer_size,
+                        "Failed to read existing, skipping duplicate check"
+                    );
+                    return Ok(false);
+                }
+                if temp_buffer.ne(&existing_buffer) {
+                    trace!(
+                        ?existing_path,
+                        ?temp_path,
+                        "Files are different, so non-duplicate"
+                    );
+                    return Ok(false);
+                }
+            }
+            trace!(
+                ?existing_path,
+                ?temp_path,
+                "Identical files, so don't need to edit, skipping emplace"
+            );
+            return Ok(true);
+        }
+        trace!(
+            entry_data_size = entry.data_size(),
+            existing_data_size = existing_item.data_size(),
+            existing_path = ?existing_item_encoded_file_path.get_file_path(),
+            "Different data sizes, so non-duplicate"
+        );
+    } else {
+        trace!(
+            temp_file = ?temp_file_encoded_file_path.get_file_path(),
+            "No existing entry, so not duplicate"
+        );
+    }
+    Ok(false)
+}
+
+/// Deletes a digest's `.exec` variant (see
+/// [`FilesystemStore::get_executable_hardlink_source`]) when that digest is
+/// evicted or replaced in the primary CAS `evicting_map`. Without this, the
+/// `.exec` directory is invisible to `max_bytes` and is only ever cleared by
+/// the startup `remove_dir_all`, so it grows without bound at runtime (#2474).
+/// Tying its lifetime to the primary entry instead bounds total disk use to
+/// roughly `2 * max_bytes` in the worst case (every blob also executable).
+#[cfg(unix)]
+#[derive(Debug)]
+struct ExecutableVariantRemover {
+    content_path: String,
+}
+
+#[cfg(unix)]
+impl RemoveItemCallback for ExecutableVariantRemover {
+    fn callback<'a>(
+        &'a self,
+        store_key: StoreKey<'a>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let StoreKey::Digest(digest) = store_key else {
+                return;
+            };
+            let variant_path = format!(
+                "{}{EXECUTABLE_DIR_SUFFIX}/{DIGEST_FOLDER}/{digest}",
+                self.content_path
+            );
+            match fs::remove_file(&variant_path).await {
+                Ok(()) => debug!(
+                    ?variant_path,
+                    "Deleted executable variant for evicted digest"
+                ),
+                // Common case: no variant was ever materialized for this digest.
+                Err(err) if err.code == Code::NotFound => {}
+                Err(err) => warn!(
+                    ?variant_path,
+                    ?err,
+                    "Failed to delete executable variant for evicted digest"
+                ),
+            }
+        })
+    }
+}
+
 #[derive(Debug, MetricsComponent)]
 pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     #[metric]
@@ -693,16 +1121,31 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     block_size: u64,
     #[metric(help = "Size of the configured read buffer size")]
     read_buffer_size: usize,
+    /// See [`FilesystemSpec::evict_page_cache`]. When false (the default) the
+    /// per-blob `posix_fadvise(DONTNEED)` calls are skipped.
+    evict_page_cache: bool,
     weak_self: Weak<Self>,
     rename_fn: fn(&OsStr, &OsStr) -> Result<(), std::io::Error>,
     /// Limits concurrent write operations to prevent disk I/O saturation.
     write_semaphore: Option<Semaphore>,
+    /// See [`FlushCoalescer`]: amortizes the per-blob `F_FULLFSYNC` cost
+    /// across concurrent uploads without weakening durability. `None` when
+    /// the sentinel could not be created (e.g. read-only content volume);
+    /// uploads then fall back to per-file `sync_all`, matching the old
+    /// behavior (and such stores fail at write time anyway).
+    #[cfg(target_os = "macos")]
+    flush_coalescer: Option<Arc<FlushCoalescer>>,
     /// Per-digest single-flight locks guarding creation of the executable
     /// variant in `{content_path}.exec`, so each variant's writable fd is
     /// opened exactly once. The outer lock is sync and only ever held to
     /// get/insert/remove the per-digest async lock — never across I/O.
     #[cfg(unix)]
     executable_locks: std::sync::Mutex<HashMap<DigestInfo, Arc<Mutex<()>>>>,
+    /// False when the startup wipe could not safely remove old executable
+    /// variants from a read-only filesystem. Ordinary CAS reads remain
+    /// available, but executable hardlink sources must not reuse stale files.
+    #[cfg(unix)]
+    executable_variants_enabled: bool,
 }
 
 impl<Fe: FileEntry> FilesystemStore<Fe> {
@@ -736,18 +1179,33 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
 
         // Executable-variant directory: a sibling of `content_path` holding
         // per-digest 0o555 copies used as hardlink sources for executable
-        // inputs (see `get_executable_hardlink_source`). Cleared on startup —
-        // the variants are regenerable and we never want a stale one to leak
-        // across runs. Unix-only: the executable bit (and the ETXTBSY race it
-        // guards against) does not apply on Windows.
+        // inputs (see `get_executable_hardlink_source`). Cleared on writable
+        // startup — the variants are regenerable and we never want a stale one
+        // to leak across runs. If a read-only filesystem prevents the wipe,
+        // ordinary CAS reads remain enabled but executable variants do not.
+        // Unix-only: the executable bit (and the ETXTBSY race it guards
+        // against) does not apply on Windows.
         #[cfg(unix)]
-        {
-            let executable_dir = format!("{}{EXECUTABLE_DIR_SUFFIX}", spec.content_path);
-            drop(fs::remove_dir_all(&executable_dir).await);
-            fs::create_dir_all(format!("{executable_dir}/{DIGEST_FOLDER}"))
-                .await
-                .err_tip(|| format!("Failed to create executable dir {executable_dir}"))?;
-        }
+        let executable_variants_enabled = {
+            let enabled = prepare_executable_dir(&spec.content_path).await?;
+            if !enabled {
+                warn!(
+                    executable_dir = %format!("{}{EXECUTABLE_DIR_SUFFIX}", spec.content_path),
+                    "Executable directory is not writable; serving CAS reads with executable variants disabled"
+                );
+            }
+            if enabled {
+                // Only register cleanup when executable variants are enabled.
+                // Otherwise surviving variants are deliberately quarantined,
+                // and repeated deletion warnings would obscure the fallback.
+                evicting_map.add_remove_callback(RemoveCallbackHolder::new(Arc::new(
+                    ExecutableVariantRemover {
+                        content_path: spec.content_path.clone(),
+                    },
+                )));
+            }
+            enabled
+        };
 
         let shared_context = Arc::new(SharedContext {
             active_drop_spawns: AtomicU64::new(0),
@@ -780,16 +1238,35 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         } else {
             None
         };
+        // Never make construction fail over the durability optimization:
+        // a read-only content volume must still serve reads, exactly as
+        // it did before the coalescer existed.
+        #[cfg(target_os = "macos")]
+        let flush_coalescer = FlushCoalescer::for_content_path(&shared_context.content_path)
+            .await
+            .inspect_err(|err| {
+                warn!(
+                    ?err,
+                    "Failed to create flush coalescer; falling back to per-file sync_all"
+                );
+            })
+            .ok();
+
         Ok(Arc::new_cyclic(|weak_self| Self {
             shared_context,
             evicting_map,
             block_size,
             read_buffer_size,
+            evict_page_cache: spec.evict_page_cache,
             weak_self: weak_self.clone(),
             rename_fn,
             write_semaphore,
+            #[cfg(target_os = "macos")]
+            flush_coalescer,
             #[cfg(unix)]
             executable_locks: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(unix)]
+            executable_variants_enabled,
         }))
     }
 
@@ -828,6 +1305,12 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         &self,
         digest: &DigestInfo,
     ) -> Result<OsString, Error> {
+        if !self.executable_variants_enabled {
+            return Err(make_err!(
+                Code::FailedPrecondition,
+                "Executable hardlink sources are disabled because the startup wipe could not safely clear the read-only executable directory"
+            ));
+        }
         let variant_path = self.executable_variant_path(digest);
 
         // Fast path: the variant already exists, so the caller can hardlink it
@@ -859,6 +1342,24 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         }
 
         let result = self.create_executable_variant(digest, &variant_path).await;
+
+        // The digest may have been evicted mid-copy: its eviction callback ran
+        // before the rename published the variant, so nothing owns the file
+        // anymore. This orphans the variant from eviction accounting, but the
+        // race is rare enough (needs an eviction to land in the narrow window
+        // between rename and this check, on a digest's first-ever variant
+        // materialization) that it's a self-limiting leak, not a systemic one
+        // — cheaper to log and let this action succeed with the still-valid
+        // file than to fail an otherwise-successful action over it.
+        if result.is_ok() && self.evicting_map.get(&digest.into()).await.is_none() {
+            warn!(
+                %digest,
+                ?variant_path,
+                "Digest evicted while materializing its executable variant; \
+                 variant is now untracked by eviction accounting"
+            );
+        }
+
         // Drop the per-digest lock entry regardless of outcome so the map
         // cannot grow unbounded; a concurrent waiter already cloned the Arc.
         self.forget_executable_lock(digest);
@@ -927,10 +1428,33 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                             "executable-variant chmod 0o555 failed: {e:?}"
                         )
                     })?;
-                // Reopen read-only purely to fsync the bytes durable before publish.
+                // Belt-and-suspenders flush before publish. The `.exec`
+                // directory is cleared before executable variants are enabled,
+                // so durability is not needed across process restarts. The
+                // flush still ensures a published variant is complete for the
+                // current process. Non-macOS keeps the prior `sync_all`
+                // behavior; macOS uses plain `fsync(2)` (data handed to the
+                // device, no multi-ms `F_FULLFSYNC` device-cache drain), which
+                // covers kernel panics — the next writable startup wipe covers
+                // power loss.
                 let f = std::fs::File::open(&temp_owned)
                     .map_err(|e| make_err!(Code::Internal, "executable-variant reopen: {e:?}"))?;
-                f.sync_all()
+                #[cfg(target_os = "macos")]
+                let flush_result = {
+                    use std::os::fd::AsRawFd;
+                    loop {
+                        if unsafe { libc::fsync(f.as_raw_fd()) } == 0 {
+                            break Ok(());
+                        }
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() != std::io::ErrorKind::Interrupted {
+                            break Err(err);
+                        }
+                    }
+                };
+                #[cfg(not(target_os = "macos"))]
+                let flush_result = f.sync_all();
+                flush_result
                     .map_err(|e| make_err!(Code::Internal, "executable-variant fsync: {e:?}"))?;
                 drop(f);
                 rename_fn(temp_owned.as_os_str(), variant_owned.as_os_str()).map_err(|e| {
@@ -967,10 +1491,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     async fn update_file(
         self: Pin<&Self>,
         mut entry: Fe,
-        mut temp_file: fs::FileSlot,
+        mut temp_file: FileSlot,
         final_key: StoreKey<'static>,
         mut reader: DropCloserReadHalf,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let mut data_size = 0;
         let recv_start = std::time::Instant::now();
         loop {
@@ -1024,26 +1548,39 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             None
         };
 
-        timeout(FS_WRITE_DEADLINE, temp_file.as_ref().sync_all())
+        // tokio defers write errors to the next write or flush call, so without an explicit flush
+        // the final write's failure is silently swallowed by `sync_all`, and a truncated file would
+        // be renamed into the content path.
+        temp_file
+            .flush()
+            .await
+            .err_tip(|| "Failed to flush in filesystem store")?;
+        // `flush_durably` is the fsync (it replaced the bare `sync_all`), so
+        // the FS_WRITE_DEADLINE ceiling belongs here — we still hold the
+        // write_semaphore permit across it.
+        timeout(FS_WRITE_DEADLINE, self.flush_durably(&temp_file))
             .await
             .map_err(|_| {
                 make_err!(
                     Code::DeadlineExceeded,
-                    "filesystem sync_all exceeded {}s ({:?})",
+                    "filesystem flush_durably exceeded {}s ({:?})",
                     FS_WRITE_DEADLINE.as_secs(),
                     final_key,
                 )
             })?
-            .err_tip(|| "Failed to sync_data in filesystem store")?;
+            .err_tip(|| "Failed to sync in filesystem store")?;
 
         drop(permit);
 
-        temp_file.advise_dontneed();
+        if self.evict_page_cache {
+            temp_file.advise_dontneed();
+        }
         trace!(?temp_file, "Dropping file to update_file");
         drop(temp_file);
 
         *entry.data_size_mut() = data_size;
-        self.emplace_file(final_key, Arc::new(entry)).await
+        self.emplace_file(final_key, Arc::new(entry)).await?;
+        Ok(data_size)
     }
 
     async fn emplace_file(&self, key: StoreKey<'static>, entry: Arc<Fe>) -> Result<(), Error> {
@@ -1070,6 +1607,13 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // We need to guarantee that this will get to the end even if the parent future is dropped.
         // See: https://github.com/TraceMachina/nativelink/issues/495
         background_spawn!("filesystem_store_emplace_file", async move {
+            // Sometimes we get files to emplace that are identical to the existing files
+            // Due to the evict/remove/replace cycle taking some amount of time, we actually
+            // want to drop these
+            if check_duplicate_files(&evicting_map, &key, &entry).await? {
+                return Ok(());
+            }
+
             evicting_map
                 .insert(key.borrow().into_owned().into(), entry.clone())
                 .await;
@@ -1140,6 +1684,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                     .await;
                 return Err(err);
             }
+            trace!(?key, "Finished emplace file");
             encoded_file_path.path_type = PathType::Content;
             encoded_file_path.key = key;
             Ok(())
@@ -1147,10 +1692,104 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         .await
         .err_tip(|| "Failed to create spawn in filesystem store update_file")?
     }
+
+    /// Makes `file`'s contents durable with `sync_all` semantics.
+    ///
+    /// On macOS the naive equivalent (`fcntl(F_FULLFSYNC)` per file) is a
+    /// full device-cache flush that serializes at the device and dominates
+    /// many-small-blob uploads, so the flush is split into the cheap
+    /// per-file part (`fsync(2)`: push this file's pages to the device)
+    /// and a device-wide cache drain shared with every concurrent upload
+    /// via [`FlushCoalescer`]. Other platforms get their journal's group
+    /// commit for free and keep plain `sync_all`.
+    async fn flush_durably(&self, file: &FileSlot) -> Result<(), Error> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let Some(flush_coalescer) = &self.flush_coalescer else {
+                return file.as_ref().sync_all().await.map_err(Into::into);
+            };
+            // Dup the handle so the blocking task owns its own fd: if
+            // this future is cancelled mid-await, the temp file's fd can
+            // close and be reused, and an already-started blocking task
+            // must never fsync an unrelated descriptor.
+            let file_dup = file
+                .as_ref()
+                .try_clone()
+                .await
+                .err_tip(|| "Failed to dup fd for fsync in filesystem store")?
+                .into_std()
+                .await;
+            // Deliberately NOT via `fs::call_with_permit`: the caller's
+            // `FileSlot` already holds an open-file permit, so requiring a
+            // second one here deadlocks when the semaphore is drained (the
+            // exact scenario the #2051 regression test pins at one
+            // permit). Concurrency is still bounded: every in-flight fsync
+            // belongs to an upload holding a `FileSlot` permit.
+            spawn_blocking!("filesystem_store_fsync", move || {
+                loop {
+                    if unsafe { libc::fsync(file_dup.as_raw_fd()) } == 0 {
+                        return Ok(());
+                    }
+                    let err = std::io::Error::last_os_error();
+                    // std's sync_all retries EINTR (cvt_r); match it.
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(Error::from(err).append("fsync failed in filesystem store"));
+                    }
+                }
+            })
+            .await
+            .err_tip(|| "Failed to join fsync task in filesystem store")??;
+            flush_coalescer.commit().await
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            file.as_ref().sync_all().await.map_err(Into::into)
+        }
+    }
+
+    pub fn get_eviction_snapshot(&self) -> EvictionSnapshot {
+        self.evicting_map.get_snapshot()
+    }
+
+    // Only for tests, so we can run check_duplicate_files
+    pub fn get_evicting_map(&self) -> Arc<FsEvictingMap<'static, Fe>> {
+        self.evicting_map.clone()
+    }
+
+    /// Returns the number of device-wide durability barriers issued by this
+    /// store's macOS flush coalescer. Exposed so the integration test can pin
+    /// the batching behavior rather than only checking data correctness.
+    #[cfg(target_os = "macos")]
+    pub fn full_flush_count_for_test(&self) -> Option<u64> {
+        self.flush_coalescer
+            .as_ref()
+            .map(|coalescer| coalescer.full_flush_count.load(Ordering::Relaxed))
+    }
+
+    // Separated out so tests can use this
+    pub async fn make_temp_file(
+        &self,
+        temp_key: StoreKey<'static>,
+    ) -> Result<(Fe, FileSlot, OsString), Error> {
+        Fe::make_and_open_file(
+            self.block_size,
+            EncodedFilePath {
+                shared_context: self.shared_context.clone(),
+                path_type: PathType::Temp,
+                key: temp_key,
+            },
+        )
+        .await
+    }
 }
 
 #[async_trait]
 impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -1190,10 +1829,10 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         if is_zero_digest(key.borrow()) {
-            // don't need to add, because zero length files are just assumed to exist
-            return Ok(());
+            // don't need to add, because zero length files are just assumed to exist.
+            return Ok(0);
         }
 
         let temp_key = make_temp_key(&key);
@@ -1206,15 +1845,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // reader available to know that the populator is active.
         reader.peek().await?;
 
-        let (entry, temp_file, temp_full_path) = Fe::make_and_open_file(
-            self.block_size,
-            EncodedFilePath {
-                shared_context: self.shared_context.clone(),
-                path_type: PathType::Temp,
-                key: temp_key,
-            },
-        )
-        .await?;
+        let (entry, temp_file, temp_full_path) = self.make_temp_file(temp_key).await?;
 
         self.update_file(entry, temp_file, key.into_owned(), reader)
             .await
@@ -1239,16 +1870,10 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         }
 
         let temp_key = make_temp_key(&key);
-        let (mut entry, mut temp_file, temp_full_path) = Fe::make_and_open_file(
-            self.block_size,
-            EncodedFilePath {
-                shared_context: self.shared_context.clone(),
-                path_type: PathType::Temp,
-                key: temp_key,
-            },
-        )
-        .await
-        .err_tip(|| "Failed to create temp file in filesystem store update_oneshot")?;
+        let (mut entry, mut temp_file, temp_full_path) = self
+            .make_temp_file(temp_key)
+            .await
+            .err_tip(|| "Failed to create temp file in filesystem store update_oneshot")?;
 
         // Write directly without channel overhead
         if !data.is_empty() {
@@ -1280,21 +1905,28 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             None
         };
 
-        timeout(FS_WRITE_DEADLINE, temp_file.as_ref().sync_all())
+        // See comment in `update_file` above.
+        temp_file
+            .flush()
+            .await
+            .err_tip(|| "Failed to flush in filesystem store update_oneshot")?;
+        timeout(FS_WRITE_DEADLINE, self.flush_durably(&temp_file))
             .await
             .map_err(|_| {
                 make_err!(
                     Code::DeadlineExceeded,
-                    "filesystem update_oneshot sync_all exceeded {}s ({:?})",
+                    "filesystem update_oneshot flush_durably exceeded {}s ({:?})",
                     FS_WRITE_DEADLINE.as_secs(),
                     key,
                 )
             })?
-            .err_tip(|| "Failed to sync_data in filesystem store update_oneshot")?;
+            .err_tip(|| "Failed to sync in filesystem store update_oneshot")?;
 
         drop(_permit);
 
-        temp_file.advise_dontneed();
+        if self.evict_page_cache {
+            temp_file.advise_dontneed();
+        }
         drop(temp_file);
 
         *entry.data_size_mut() = data.len() as u64;
@@ -1305,9 +1937,9 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         self: Pin<&Self>,
         key: StoreKey<'_>,
         path: OsString,
-        file: fs::FileSlot,
+        file: FileSlot,
         upload_size: UploadSizeInfo,
-    ) -> Result<Option<fs::FileSlot>, Error> {
+    ) -> Result<(u64, Option<FileSlot>), Error> {
         let file_size = match upload_size {
             UploadSizeInfo::ExactSize(size) => size,
             UploadSizeInfo::MaxSize(_) => file
@@ -1319,7 +1951,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         };
         if file_size == 0 {
             // don't need to add, because zero length files are just assumed to exist
-            return Ok(None);
+            return Ok((0, None));
         }
         let entry = Fe::create(
             file_size,
@@ -1333,12 +1965,14 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // We are done with the file, if we hold a reference to the file here, it could
         // result in a deadlock if `emplace_file()` also needs file descriptors.
         trace!(?file, "Dropping file to to update_with_whole_file");
-        file.advise_dontneed();
+        if self.evict_page_cache {
+            file.advise_dontneed();
+        }
         drop(file);
         self.emplace_file(key.into_owned(), Arc::new(entry))
             .await
             .err_tip(|| "Could not move file into store in upload_file_to_store, maybe dest is on different volume?")?;
-        return Ok(None);
+        return Ok((file_size, None));
     }
 
     async fn get_part(
@@ -1369,10 +2003,14 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         let mut temp_file = entry.read_file_part(offset, read_limit).or_else(|err| async move {
             // If the file is not found, we need to remove it from the eviction map.
             if err.code == Code::NotFound {
-                error!(
+                // Map said the file was present but `open()` hit ENOENT.
+                // Self-heals: we remove the stale entry below and a
+                // fast/slow caller re-populates from the slow store, so
+                // this is a recoverable warn, not a fatal error.
+                warn!(
                     ?err,
                     key = ?owned_key,
-                    "Entry was in our map, but not found on disk. Removing from map as a precaution, but process probably need restarted."
+                    "Filesystem store map/disk divergence: removing entry; reader will fall through to slow store",
                 );
                 self.evicting_map.remove(&owned_key).await;
             }
@@ -1393,7 +2031,9 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
                 .await
                 .err_tip(|| "Failed to send chunk in filesystem store get_part")?;
         }
-        temp_file.get_ref().advise_dontneed();
+        if self.evict_page_cache {
+            temp_file.get_ref().advise_dontneed();
+        }
         writer
             .send_eof()
             .err_tip(|| "Filed to send EOF in filesystem store get_part")?;
@@ -1417,12 +2057,9 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         registry.register_indicator(self);
     }
 
-    fn register_remove_callback(
-        self: Arc<Self>,
-        callback: Arc<dyn RemoveItemCallback>,
-    ) -> Result<(), Error> {
+    fn register_remove_callback(self: Arc<Self>, callback: RemoveCallback) -> Result<(), Error> {
         self.evicting_map
-            .add_remove_callback(RemoveItemCallbackHolder::new(callback));
+            .add_remove_callback(RemoveCallbackHolder::new(callback));
         Ok(())
     }
 }
@@ -1433,7 +2070,47 @@ impl<Fe: FileEntry> HealthStatusIndicator for FilesystemStore<Fe> {
         "FilesystemStore"
     }
 
-    async fn check_health(&self, namespace: Cow<'static, str>) -> HealthStatus {
-        StoreDriver::check_health(Pin::new(self), namespace).await
+    /// Lightweight probe: `stat()` the `content_path` directory. No
+    /// write-semaphore / eviction-map contention with production
+    /// traffic, and bounded so a hung NFS / EBS mount can't wedge the
+    /// indicator.
+    async fn check_health(&self, _namespace: Cow<'static, str>) -> HealthStatus {
+        const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let content_path = &self.shared_context.content_path;
+        let stat = tokio::fs::metadata(&content_path);
+        match timeout(HEALTH_PROBE_TIMEOUT, stat).await {
+            Ok(Ok(meta)) if meta.is_dir() => {
+                HealthStatus::new_ok(self, "FilesystemStore::check_health: ok".into())
+            }
+            Ok(Ok(_)) => HealthStatus::new_failed(
+                self,
+                format!(
+                    "FilesystemStore::check_health: content_path {content_path} is not a directory"
+                )
+                .into(),
+            ),
+            Ok(Err(e)) => {
+                warn!(
+                    ?e,
+                    %content_path,
+                    "FilesystemStore::check_health: stat errored",
+                );
+                HealthStatus::new_failed(
+                    self,
+                    format!("FilesystemStore::check_health: stat errored: {e}").into(),
+                )
+            }
+            Err(_) => {
+                warn!(
+                    %content_path,
+                    timeout_secs = HEALTH_PROBE_TIMEOUT.as_secs(),
+                    "FilesystemStore::check_health: stat timed out",
+                );
+                HealthStatus::Timeout {
+                    struct_name: self.struct_name(),
+                }
+            }
+        }
     }
 }

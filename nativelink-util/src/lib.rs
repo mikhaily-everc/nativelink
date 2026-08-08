@@ -25,7 +25,6 @@ pub mod fs;
 pub mod fs_util;
 pub mod health_utils;
 pub mod instant_wrapper;
-pub mod known_platform_property_provider;
 pub mod metrics;
 pub mod metrics_utils;
 pub mod operation_state_manager;
@@ -40,6 +39,7 @@ pub mod store_trait;
 pub mod task;
 pub mod telemetry;
 pub mod tls_utils;
+pub mod wire_compression;
 
 // Re-export tracing mostly for use in macros.
 pub use tracing as __tracing;

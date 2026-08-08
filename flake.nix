@@ -17,7 +17,7 @@
     };
     nix2container = {
       # TODO(SchahinRohani): Use a specific commit hash until nix2container is stable.
-      url = "github:nlewo/nix2container/66f4b8a47e92aa744ec43acbb5e9185078983909";
+      url = "github:nlewo/nix2container/76be9608a7f4d6c985d28b0e7be903ae2547df3e";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -81,13 +81,24 @@
         lib,
         ...
       }: let
-        craneLibFor = p: (crane.mkLib p).overrideToolchain pkgs.lre.stableRustFor;
-        nightlyCraneLibFor = p: (crane.mkLib p).overrideToolchain pkgs.lre.nightlyRustFor;
+        # On Linux we build fully static musl binaries, elsewhere the default stdenv.
+        stdenvSelectorFor = q:
+          if q.stdenv.targetPlatform.isLinux
+          then q.pkgsMusl.stdenv
+          else q.stdenv;
+        craneLibFor = p:
+          ((crane.mkLib p).overrideToolchain pkgs.lre.stableRustFor).overrideScope (_: _: {
+            stdenvSelector = stdenvSelectorFor;
+          });
+        nightlyCraneLibFor = p:
+          ((crane.mkLib p).overrideToolchain pkgs.lre.nightlyRustFor).overrideScope (_: _: {
+            stdenvSelector = stdenvSelectorFor;
+          });
 
         src = pkgs.lib.cleanSourceWith {
           src = (craneLibFor pkgs).path ./.;
           filter = path: type:
-            (builtins.match "^.*(examples/.+\.json5|data/.+|nativelink-config/README\.md)" path != null)
+            (builtins.match "^.*(tests/.+\.json5|examples/.+\.json5|data/.+|nativelink-config/README\.md)" path != null)
             || ((craneLibFor pkgs).filterCargoSources path type);
         };
 
@@ -98,6 +109,7 @@
         commonArgsFor = p: let
           isLinuxBuild = p.stdenv.buildPlatform.isLinux;
           isLinuxTarget = p.stdenv.targetPlatform.isLinux;
+          isCrossCompile = p.stdenv.targetPlatform.system != pkgs.stdenv.targetPlatform.system;
           # Map the nix system to the Rust target triple that we'd want to target
           # by default.
           targetArch =
@@ -124,10 +136,6 @@
         in
           {
             inherit src;
-            stdenv = q:
-              if q.stdenv.targetPlatform.isLinux
-              then q.pkgsMusl.stdenv
-              else q.stdenv;
             strictDeps = true;
             buildInputs =
               [p.cacert]
@@ -148,9 +156,12 @@
               ];
             CARGO_BUILD_TARGET = targetArch;
           }
+          // (pkgs.lib.optionalAttrs (isLinuxTarget && !isCrossCompile) {
+            # customClang is only defined for the host compiler, so doesn't work for cross-compiling
+            TARGET_CC = "${pkgs.lre.clang}/bin/customClang"; # So mimalloc gets the right compiler not defaulting to gcc
+          })
           // (pkgs.lib.optionalAttrs isLinuxTarget {
             CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
-            TARGET_CC = "${pkgs.lre.clang}/bin/customClang"; # So mimalloc gets the right compiler not defaulting to gcc
             # FIXME(palfrey): Attempted workaround from https://github.com/llvm/llvm-project/issues/32849#issuecomment-2353071071 but doesn't work
             # CFLAGS = "-femit-all-decls";
             ${linkerEnvVar} = linkerPath;
@@ -164,12 +175,15 @@
           (craneLibFor p).buildPackage ((commonArgsFor p)
             // {
               cargoArtifacts = cargoArtifactsFor p;
+              # If you're testing Nativelink locally, doing a dev profile will
+              # massively speedup build times. Just don't commit/push anything build with dev!
+              # CARGO_PROFILE = "dev";
             });
 
         nativeTargetPkgs =
-          if pkgs.system == "x86_64-linux"
+          if pkgs.stdenv.hostPlatform.system == "x86_64-linux"
           then pkgs.pkgsCross.musl64
-          else if pkgs.system == "aarch64-linux"
+          else if pkgs.stdenv.hostPlatform.system == "aarch64-linux"
           then pkgs.pkgsCross.aarch64-multiplatform-musl
           else pkgs;
 
@@ -191,29 +205,28 @@
 
         docs = pkgs.callPackage ./tools/docs.nix {rust = pkgs.lre.stable-rust;};
 
+        bazel = pkgs.writeShellScriptBin "bazel" ''
+          unset TMPDIR TMP
+          exec ${pkgs.bazelisk}/bin/bazelisk "$@"
+        '';
+        bazel-retry = pkgs.writeScriptBin "bazel-retry" (builtins.readFile ./tools/bazel-retry.sh);
+
         inherit (nix2container.packages.${system}.nix2container) pullImage;
         inherit (nix2container.packages.${system}.nix2container) buildImage;
 
-        # TODO(palfrey): Allow "crosscompiling" this image. At the moment
-        #                    this would set a wrong container architecture. See:
-        #                    https://github.com/nlewo/nix2container/issues/138.
-        nativelink-image = let
-          nativelinkForImage =
-            if pkgs.stdenv.isx86_64
-            then nativelink-x86_64-linux
-            else nativelink-aarch64-linux;
-        in
+        nativelinkImageFor = archPackages: arch:
           buildImage {
+            inherit arch;
             name = "nativelink";
             copyToRoot = [
               (pkgs.buildEnv {
                 name = "nativelink-buildEnv";
-                paths = [nativelinkForImage];
+                paths = [archPackages];
                 pathsToLink = ["/bin"];
               })
             ];
             config = {
-              Entrypoint = [(pkgs.lib.getExe' nativelinkForImage "nativelink")];
+              Entrypoint = [(pkgs.lib.getExe' archPackages "nativelink")];
               Labels = {
                 "org.opencontainers.image.description" = "An RBE compatible, high-performance cache and remote executor.";
                 "org.opencontainers.image.documentation" = "https://github.com/TraceMachina/nativelink";
@@ -226,7 +239,27 @@
             };
           };
 
-        nativelink-worker-init = pkgs.callPackage ./tools/nativelink-worker-init.nix {inherit buildImage self nativelink-image;};
+        nativelink-image-for-x64 = nativelinkImageFor nativelink-x86_64-linux "amd64";
+        nativelink-image-for-aarch64 = nativelinkImageFor nativelink-aarch64-linux "arm64";
+
+        nativelink-image =
+          if pkgs.stdenv.isx86_64
+          then nativelink-image-for-x64
+          else nativelink-image-for-aarch64;
+
+        nativelinkWorkerInitFor = archImage: archPackages: arch:
+          pkgs.callPackage ./tools/nativelink-worker-init.nix {
+            inherit buildImage self arch archPackages;
+            nativelink-image = archImage;
+          };
+
+        nativelink-init-for-x64 = nativelinkWorkerInitFor nativelink-image-for-x64 pkgs.pkgsCross.musl64 "amd64";
+        nativelink-init-for-aarch64 = nativelinkWorkerInitFor nativelink-image-for-aarch64 pkgs.pkgsCross.aarch64-multiplatform-musl "arm64";
+
+        nativelink-worker-init =
+          if pkgs.stdenv.isx86_64
+          then nativelink-init-for-x64
+          else nativelink-init-for-aarch64;
 
         createWorker = pkgs.nativelink-tools.lib.createWorker self;
 
@@ -249,7 +282,7 @@
               pkgs.unzip
               pkgs.zstd
               pkgs.cargo-bloat
-              pkgs.mold-wrapped
+              pkgs.mold
               pkgs.reindeer
               pkgs.lld_22
               pkgs.clang_22
@@ -293,10 +326,39 @@
         };
 
         nativelinkCoverageFor = p: let
-          coverageArgs = commonArgsFor p;
-        in
-          (nightlyCraneLibFor p).cargoLlvmCov (coverageArgs
+          coverageArgs =
+            (commonArgsFor p)
             // {
+              # TODO(palfrey): For some reason we're triggering an edgecase where
+              #                    mimalloc builds against glibc headers in coverage
+              #                    builds. This leads to nonexistend __memcpy_chk and
+              #                    __memset_chk symbols if fortification is enabled.
+              #                    Our regular builds also have this issue, but we
+              #                    should investigate further.
+              hardeningDisable = ["fortify"];
+            };
+          cargoExtraArgs = builtins.concatStringsSep " " [
+            "--workspace"
+            "--locked"
+            "--features nix"
+            # "--branch" # FIXME(palfrey): because of https://github.com/llvm/llvm-project/issues/119558
+            "--ignore-filename-regex '.*(genproto|vendor-cargo-deps|crates).*'"
+          ];
+        in
+          (nightlyCraneLibFor p).mkCargoDerivation (coverageArgs
+            // {
+              # We build our own custom command so we can run with report for both html and text output
+              # Mostly derived from the upstream cargoLlvmCov though
+              # See https://github.com/ipetkov/crane/blob/59a82a1222dd3b2080b5cc52a1a2e8d5f1b77f37/lib/cargoLlvmCov.nix
+              installPhaseCommand = "";
+              buildPhaseCargoCommand = ''
+                cargoWithProfile llvm-cov test ${cargoExtraArgs} --html --output-dir $out
+                cargoWithProfile llvm-cov report --workspace --text --output-dir $out
+              '';
+              doInstallCargoArtifacts = false;
+              pnameSuffix = "-llvm-cov";
+              nativeBuildInputs = [(p.callPackage ./tools/cargo-llvm-cov/package.nix {})];
+
               cargoArtifacts = nightlyCargoArtifactsFor p;
               preConfigurePhases = ["tempHome"];
               tempHome = ''
@@ -318,14 +380,6 @@
                 ln -s ${p.mongodb}/bin/mongod ''${MONGOD}
                 ''${MONGOD} --version
               '';
-              cargoExtraArgs = builtins.concatStringsSep " " [
-                "--all"
-                "--locked"
-                "--features nix"
-                # "--branch" # FIXME(palfrey): because of https://github.com/llvm/llvm-project/issues/119558
-                "--ignore-filename-regex '.*(genproto|vendor-cargo-deps|crates).*'"
-              ];
-              cargoLlvmCovExtraArgs = "--html --output-dir $out";
             });
 
         nativelinkCoverageForHost = nativelinkCoverageFor pkgs;
@@ -356,13 +410,17 @@
               nativelinkCoverageForHost
               nativelink-aarch64-linux
               nativelink-image
+              nativelink-image-for-aarch64
+              nativelink-image-for-x64
               nativelink-is-executable-test
               nativelink-worker-init
+              nativelink-init-for-x64
+              nativelink-init-for-aarch64
               nativelink-x86_64-linux
               ;
 
             # Used by the CI
-            inherit (pkgs.nativelink-tools) local-image-test publish-ghcr;
+            inherit (pkgs.nativelink-tools) local-image-test publish-ghcr create-multi-arch-image regctl-ghcr-login;
 
             default = nativelink;
 
@@ -385,7 +443,7 @@
               inherit nativelink mongodb wait4x bazelisk;
             };
             rbe-toolchain-with-nativelink-test = pkgs.callPackage toolchain-examples/rbe-toolchain-test.nix {
-              inherit nativelink bazelisk;
+              inherit nativelink bazel-retry bazel;
             };
             buck2-with-nativelink-test = pkgs.callPackage integration_tests/buck2/buck2-with-nativelink-test.nix {
               inherit nativelink buck2;
@@ -413,21 +471,10 @@
             }
             else {}
           );
-        checks = {
-          # TODO(palfrey): Fix the tests.
-          # tests = craneLib.cargoNextest (commonArgs
-          #   // {
-          #   inherit cargoArtifacts;
-          #   cargoNextestExtraArgs = "--all";
-          #   partitions = 1;
-          #   partitionType = "count";
-          # });
-        };
         pre-commit.settings = {
           hooks = import ./tools/pre-commit-hooks.nix {
             inherit pkgs;
             inherit (packages) generate-bazel-rc generate-stores-config;
-            renovate-patched = pkgs.callPackage ./tools/renovate.nix {};
             nightly-rust = pkgs.rust-bin.nightly.${pkgs.lre.nightly-rust.meta.version};
           };
         };
@@ -469,12 +516,7 @@
           "${gnused}/bin"
         ];
         devShells.default = pkgs.mkShell {
-          packages = let
-            bazel = pkgs.writeShellScriptBin "bazel" ''
-              unset TMPDIR TMP
-              exec ${pkgs.bazelisk}/bin/bazelisk "$@"
-            '';
-          in
+          packages =
             [
               # Development tooling
               pkgs.git
@@ -486,6 +528,7 @@
 
               # Rust
               bazel
+              bazel-retry
               pkgs.lre.stable-rust
               pkgs.lre.lre-rs.lre-rs-configs-gen
               pkgs.rust-analyzer
@@ -526,6 +569,7 @@
               pkgs.lre.lre-cc.lre-cc-configs-gen
               pkgs.nativelink-tools.local-image-test
               pkgs.nativelink-tools.create-local-image
+              pkgs.nativelink-tools.create-multi-arch-image
               pkgs.attic-client
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
@@ -563,7 +607,7 @@
               export CC=clang
               export PULUMI_K8S_AWAIT_ALL=true
               export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
-              export PLAYWRIGHT_NODEJS_PATH=${pkgs.nodePackages_latest.nodejs}
+              export PLAYWRIGHT_NODEJS_PATH=${pkgs.nodejs}
             ''
             # TODO(palfrey): Generalize this.
             + pkgs.lib.optionalString (system == "x86_64-linux") ''

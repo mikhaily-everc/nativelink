@@ -4,12 +4,13 @@
   "dependencies": {
     "@nativelink/tokens": "workspace:*",
     "@nativelink/ui": "workspace:*",
-    "fumadocs-core": "^15.8.0",
-    "fumadocs-mdx": "^12.0.0",
-    "fumadocs-ui": "^15.8.0",
+    "@next/third-parties": "^16.2.11",
+    "fumadocs-core": "^16",
+    "fumadocs-mdx": "^15",
+    "fumadocs-ui": "^16",
     "geist": "^1.5.1",
     "mermaid": "^11.4.1",
-    "next": "^15.1.6",
+    "next": "^16",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
@@ -17,17 +18,19 @@
     "@nativelink/config": "workspace:*",
     "@tailwindcss/postcss": "^4.0.0",
     "@types/mdx": "^2.0.13",
-    "@types/node": "^22.10.5",
+    "@types/node": "^26.0.0",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.0.3",
     "tailwindcss": "^4.0.0",
-    "typescript": "^5.7.2"
+    "typescript": "^6.0.0"
   },
   "private": true,
   "scripts": {
-    "build": "next build",
+    "build": "node scripts/gen-changelog.mjs && next build",
     "clean": "rm -rf .next .turbo .source",
-    "dev": "next dev --port 3001",
+    "dev": "node scripts/gen-changelog.mjs && next dev --port 3001",
+    "gen:changelog": "node scripts/gen-changelog.mjs",
+    "gen:config-reference": "node scripts/gen-config-reference.mjs",
     "lint": "biome check .",
     "start": "next start --port 3001",
     "typecheck": "tsc --noEmit"

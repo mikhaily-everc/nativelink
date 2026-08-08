@@ -311,7 +311,7 @@ async fn try_subscribe_retries_once_on_miss_then_returns_existing() -> Result<()
         .try_subscribe(
             &OperationId::from("client-1"),
             &qualifier,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0,
         )
         .await?;
@@ -343,7 +343,7 @@ async fn try_subscribe_returns_none_after_two_consecutive_misses() -> Result<(),
         .try_subscribe(
             &OperationId::from("client-2"),
             &qualifier,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0,
         )
         .await?;
@@ -378,7 +378,7 @@ async fn try_subscribe_skips_lookup_for_uncacheable_qualifier() -> Result<(), Er
         .try_subscribe(
             &OperationId::from("client-3"),
             &uncacheable,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0,
         )
         .await?;

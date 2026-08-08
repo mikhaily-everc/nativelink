@@ -23,15 +23,17 @@ use futures::{Future, StreamExt, future};
 use nativelink_config::schedulers::SimpleSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::{MetricsComponent, RootMetricsComponent};
-use nativelink_proto::com::github::trace_machina::nativelink::events::OriginEvent;
+use nativelink_proto::com::github::trace_machina::nativelink::events::{
+    Event, OriginEvent, RequestEvent, event, request_event,
+};
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::StartExecute;
 use nativelink_util::action_messages::{ActionInfo, ActionState, OperationId, WorkerId};
 use nativelink_util::instant_wrapper::InstantWrapper;
-use nativelink_util::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, MatchingEngineStateManager,
     OperationFilter, OperationStageFlags, OrderDirection, UpdateOperationType,
 };
-use nativelink_util::origin_event::OriginMetadata;
+use nativelink_util::origin_event::{OriginMetadata, get_node_id};
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::spawn;
 use nativelink_util::task::JoinHandleDropGuard;
@@ -42,9 +44,11 @@ use opentelemetry_semantic_conventions::attribute::ENDUSER_ID;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Duration;
 use tracing::{debug, error, info, info_span, warn};
+use uuid::Uuid;
 
 use crate::api_worker_scheduler::ApiWorkerScheduler;
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION};
+use crate::known_platform_property_provider::KnownPlatformPropertyProvider;
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::simple_scheduler_state_manager::SimpleSchedulerStateManager;
 use crate::worker::{ActionInfoWithProps, Worker, WorkerTimestamp};
@@ -206,6 +210,61 @@ impl core::fmt::Debug for SimpleScheduler {
 }
 
 impl SimpleScheduler {
+    fn origin_event_id(event: &Event) -> String {
+        Uuid::now_v6(&get_node_id(Some(event)))
+            .hyphenated()
+            .to_string()
+    }
+
+    fn scheduler_start_execute_event(
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+        action_info: &ActionInfoWithProps,
+    ) -> Event {
+        let start_execute = StartExecute {
+            execute_request: Some(action_info.inner.as_ref().into()),
+            operation_id: operation_id.to_string(),
+            queued_timestamp: Some(action_info.inner.insert_timestamp.into()),
+            platform: Some((&action_info.platform_properties).into()),
+            worker_id: worker_id.to_string(),
+        };
+        Event {
+            event: Some(event::Event::Request(RequestEvent {
+                event: Some(request_event::Event::SchedulerStartExecute(start_execute)),
+            })),
+        }
+    }
+
+    async fn publish_scheduler_start_execute(
+        maybe_origin_event_tx: Option<&mpsc::Sender<OriginEvent>>,
+        origin_metadata: &OriginMetadata,
+        event_id: String,
+        event: Event,
+    ) {
+        let Some(origin_event_tx) = maybe_origin_event_tx else {
+            return;
+        };
+
+        let origin_event = OriginEvent {
+            version: 0,
+            event_id,
+            parent_event_id: String::new(),
+            bazel_request_metadata: origin_metadata.bazel_metadata.clone(),
+            identity: origin_metadata.identity.clone(),
+            event: Some(event),
+        };
+
+        // Awaited send (not try_send): backpressure rather than drop, so the
+        // start-execute event that later resource-usage events reference as
+        // their parent isn't silently lost when the queue is full.
+        if let Err(err) = origin_event_tx.send(origin_event).await {
+            warn!(
+                ?err,
+                "Failed to publish scheduler start execute origin event"
+            );
+        }
+    }
+
     /// Attempts to find a worker to execute an action and begins executing it.
     /// If an action is already running that is cacheable it may merge this
     /// action with the results and state changes of the already running
@@ -349,6 +408,7 @@ impl SimpleScheduler {
                 Arc::clone(&self.matching_engine_state_manager),
                 Arc::clone(&self.platform_property_manager),
                 Arc::clone(&phase_ms),
+                self.maybe_origin_event_tx.clone(),
                 full_worker_logging,
             ));
         }
@@ -371,6 +431,7 @@ impl SimpleScheduler {
                     Arc::clone(&self.matching_engine_state_manager),
                     Arc::clone(&self.platform_property_manager),
                     Arc::clone(&phase_ms),
+                    self.maybe_origin_event_tx.clone(),
                     full_worker_logging,
                 ));
             }
@@ -421,6 +482,7 @@ async fn match_one(
     state_manager: Arc<dyn MatchingEngineStateManager>,
     ppm: Arc<PlatformPropertyManager>,
     phase_ms: Arc<CyclePhaseMs>,
+    maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
     full_worker_logging: bool,
 ) -> Result<bool, Error> {
     let (action_info, maybe_origin_metadata) = action_state_result
@@ -434,9 +496,13 @@ async fn match_one(
         .make_platform_properties(action_info.platform_properties.clone())
         .err_tip(|| "Failed to make platform properties in SimpleScheduler::do_try_match")?;
 
+    let origin_metadata = maybe_origin_metadata.unwrap_or_default();
+
     let action_info = ActionInfoWithProps {
         inner: action_info,
         platform_properties,
+        origin_metadata: origin_metadata.clone(),
+        scheduler_start_execute_event_id: None,
     };
 
     let reserve_start = Instant::now();
@@ -456,10 +522,9 @@ async fn match_one(
         .expect("reservation just issued is armed")
         .clone();
 
-    let origin_metadata = maybe_origin_metadata.unwrap_or_default();
     let ctx = Context::current_with_baggage(vec![KeyValue::new(
         ENDUSER_ID,
-        origin_metadata.identity,
+        origin_metadata.identity.clone(),
     )]);
 
     let attach_fut = async move {
@@ -481,6 +546,22 @@ async fn match_one(
 
         match assign_result {
             Ok(()) => {
+                // Stamp the start-execute event id onto the action before it
+                // is handed to the worker, so later resource-usage events can
+                // reference it as their parent. Only published once the commit
+                // actually succeeds.
+                let mut action_info = action_info;
+                let scheduler_start_execute_event = maybe_origin_event_tx.as_ref().map(|_| {
+                    let event = SimpleScheduler::scheduler_start_execute_event(
+                        &worker_id,
+                        &operation_id,
+                        &action_info,
+                    );
+                    let event_id = SimpleScheduler::origin_event_id(&event);
+                    action_info.scheduler_start_execute_event_id = Some(event_id.clone());
+                    (event_id, event)
+                });
+
                 debug!(%worker_id, %operation_id, ?action_info, "Notifying worker of operation");
                 let commit_start = Instant::now();
                 let commit_result = workers
@@ -491,7 +572,18 @@ async fn match_one(
                     Ordering::Relaxed,
                 );
                 match commit_result {
-                    Ok(()) => Ok(true),
+                    Ok(()) => {
+                        if let Some((event_id, event)) = scheduler_start_execute_event {
+                            SimpleScheduler::publish_scheduler_start_execute(
+                                maybe_origin_event_tx.as_ref(),
+                                &origin_metadata,
+                                event_id,
+                                event,
+                            )
+                            .await;
+                        }
+                        Ok(true)
+                    }
                     Err((Some(res), commit_err)) => {
                         // Commit failed BEFORE finalize_run mutated any
                         // worker state (generation fence or worker-gone).
@@ -661,9 +753,26 @@ impl SimpleScheduler {
             worker_change_notify.clone(),
             worker_timeout_s,
             worker_registry,
+            maybe_origin_event_tx.clone(),
         );
 
         let worker_scheduler_clone = worker_scheduler.clone();
+
+        // Upstream's `fallback_match_interval_s` and this fork's
+        // `matcher_safety_net_interval_s` do the same job: force a matching
+        // pass when neither notify fires. Arming both would double the
+        // FT.AGGREGATE matching-pass load that the safety-net timer was
+        // introduced to bound, so the fork's timer (resolved above into
+        // `safety_net_interval`) is the live implementation and upstream's
+        // knob is deliberately inert.
+        if spec.fallback_match_interval_s > 0 {
+            info!(
+                fallback_match_interval_s = spec.fallback_match_interval_s,
+                safety_net_interval_s,
+                "fallback_match_interval_s is ignored; matcher_safety_net_interval_s drives \
+                 periodic matching passes"
+            );
+        }
 
         let action_scheduler = Arc::new_cyclic(move |weak_self| -> Self {
             let weak_inner = weak_self.clone();
@@ -697,6 +806,10 @@ impl SimpleScheduler {
                         // safety net is what woke us, not a notify.
                         let mut interval_driven = false;
                         if last_match_successful {
+                            // The safety-net interval is the only periodic wake
+                            // source; upstream's `fallback_match_interval_s`
+                            // would arm a second one and double the matching
+                            // passes, so it is not wired in here.
                             tokio::select! {
                                 _ = state_changed => {}
                                 _ = safety_net_interval_timer.tick() => {
@@ -892,10 +1005,6 @@ impl ClientStateManager for SimpleScheduler {
         filter: OperationFilter,
     ) -> Result<ActionStateResultStream<'a>, Error> {
         self.inner_filter_operations(filter).await
-    }
-
-    fn as_known_platform_property_provider(&self) -> Option<&dyn KnownPlatformPropertyProvider> {
-        Some(self)
     }
 }
 

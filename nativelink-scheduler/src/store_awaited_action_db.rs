@@ -988,7 +988,7 @@ where
                 continue;
             }
 
-            // Add the client_operation_id to operation_id mapping
+            // Bound the cid_* mapping's lifetime.
             self.store
                 .update_data(
                     UpdateClientIdToOperationId {

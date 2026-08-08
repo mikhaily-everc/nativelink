@@ -24,4 +24,5 @@ pub mod health_server;
 pub mod push_server;
 pub mod remote_asset_proto;
 pub mod scheduler_event_bridge;
+pub mod wire_compression;
 pub mod worker_api_server;

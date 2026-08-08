@@ -35,9 +35,7 @@ use std::time::SystemTime;
 use bytes::{Bytes, BytesMut};
 use filetime::{FileTime, set_file_mtime};
 use formatx::Template;
-use futures::future::{
-    BoxFuture, Future, FutureExt, TryFutureExt, try_join, try_join_all, try_join3,
-};
+use futures::future::{BoxFuture, Future, FutureExt, TryFutureExt, try_join, try_join_all};
 use futures::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 use nativelink_config::cas_server::{
     EnvironmentSource, UploadActionResultConfig, UploadCacheResultsStrategy,
@@ -50,7 +48,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
     Tree as ProtoTree, UpdateActionResultRequest,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    HistoricalExecuteResponse, StartExecute,
+    ActionResourceUsage, HistoricalExecuteResponse, StartExecute,
 };
 use nativelink_store::ac_utils::{
     ESTIMATED_DIGEST_SIZE, compute_buf_digest, get_and_decode_digest, serialize_and_upload_message,
@@ -98,6 +96,125 @@ const REQUIRES_WORKER_PROTOCOL_PROPERTY: &str = "requires-worker-protocol";
 /// should reflect it.
 const DEFAULT_HISTORICAL_RESULTS_STRATEGY: UploadCacheResultsStrategy =
     UploadCacheResultsStrategy::FailuresOnly;
+
+#[cfg(target_os = "linux")]
+const RESOURCE_USAGE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+
+#[cfg(target_os = "linux")]
+struct ActionResourceUsageSampler {
+    stop_tx: watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn start_action_resource_usage_sampler(pgid: u32) -> ActionResourceUsageSampler {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let handle = background_spawn!(
+        "action_resource_usage_sampler",
+        sample_action_peak_memory_kb(pgid, stop_rx)
+    );
+    ActionResourceUsageSampler { stop_tx, handle }
+}
+
+#[cfg(target_os = "linux")]
+async fn finish_action_resource_usage_sampler(sampler: ActionResourceUsageSampler) -> Option<u64> {
+    let _ = sampler.stop_tx.send(true);
+    sampler.handle.await.ok()
+}
+
+#[cfg(target_os = "linux")]
+async fn sample_action_peak_memory_kb(pgid: u32, mut stop_rx: watch::Receiver<bool>) -> u64 {
+    let mut peak_memory_kb = 0;
+    loop {
+        if let Some(memory_kb) = sample_process_group_memory_kb(pgid) {
+            peak_memory_kb = peak_memory_kb.max(memory_kb);
+        } else if !Path::new(&format!("/proc/{pgid}")).exists() {
+            // The group leader has been reaped and no member process remains,
+            // so the action is finished.
+            break;
+        }
+
+        if *stop_rx.borrow() {
+            break;
+        }
+
+        tokio::select! {
+            changed = stop_rx.changed() => {
+                if changed.is_ok() && *stop_rx.borrow() {
+                    if let Some(memory_kb) = sample_process_group_memory_kb(pgid) {
+                        peak_memory_kb = peak_memory_kb.max(memory_kb);
+                    }
+                    break;
+                }
+            }
+            () = tokio::time::sleep(RESOURCE_USAGE_SAMPLE_INTERVAL) => {}
+        }
+    }
+    peak_memory_kb
+}
+
+/// Sums the resident memory of every process in the action's process group.
+///
+/// The action is spawned as its own process-group leader (see
+/// `command_builder.process_group(0)` in `inner_execute`), so `pgid` equals
+/// the spawned child's pid and every descendant inherits it. Sampling by
+/// process group — rather than walking the parent/child tree from the spawned
+/// pid — is required because an intermediate shell frequently exits and
+/// reparents the real workload to the worker (PID 1); the tree walk then sees
+/// only a childless zombie and reports zero. Process-group membership is
+/// inherited and survives reparenting, and excludes the worker's own group.
+/// Returns `None` when no member process can be read (the group is empty).
+#[cfg(target_os = "linux")]
+fn sample_process_group_memory_kb(pgid: u32) -> Option<u64> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return None;
+    };
+
+    let mut total_kb = 0;
+    let mut found_any_process = false;
+    for entry in entries.flatten() {
+        let Ok(member_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if read_process_pgid(member_pid) != Some(pgid) {
+            continue;
+        }
+        if let Some(memory_kb) = read_process_rss_kb(member_pid) {
+            total_kb += memory_kb;
+            found_any_process = true;
+        }
+    }
+
+    found_any_process.then_some(total_kb)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_rss_kb(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("VmRSS:")?;
+        rest.split_whitespace().next()?.parse().ok()
+    })
+}
+
+/// Reads a process's group id (`pgrp`) from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn read_process_pgid(pid: u32) -> Option<u32> {
+    parse_pgid_from_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Parses the process group id (`pgrp`, field 5) from the contents of a
+/// `/proc/<pid>/stat` line.
+///
+/// `comm` (field 2) can contain spaces and parentheses, so fields are parsed
+/// relative to the final `)` to avoid miscounting. Returns `None` when the
+/// line is malformed.
+#[cfg(target_os = "linux")]
+pub fn parse_pgid_from_stat(stat: &str) -> Option<u32> {
+    let after_comm = stat.rsplit_once(')')?.1;
+    // Fields after the final ')': state(0) ppid(1) pgrp(2) ...
+    after_comm.split_whitespace().nth(2)?.parse().ok()
+}
 
 /// Valid string reasons for a failure.
 /// Note: If these change, the documentation should be updated.
@@ -236,12 +353,12 @@ pub fn download_to_directory<'a>(
                             let src_path = file_entry
                                 .get_file_path_locked(|src| async move { Ok(src) })
                                 .await?;
-                            let dst = dest.clone();
+                            let spawned_dest = dest.clone();
                             spawn_blocking!("download_to_directory_private_copy", move || {
-                                std::fs::copy(&src_path, &dst).map(|_| ()).map_err(|e| {
+                                std::fs::copy(&src_path, &spawned_dest).map(|_| ()).map_err(|e| {
                                     make_err!(
                                         Code::Internal,
-                                        "Failed to copy CAS blob into a private inode at {dst}: {e:?}"
+                                        "Failed to copy CAS blob into a private inode at {spawned_dest}: {e:?}"
                                     )
                                 })
                             })
@@ -275,10 +392,15 @@ pub fn download_to_directory<'a>(
                             fs::hard_link(&src_path, &dest)
                                 .await
                                 .map_err(|e| {
+                                    let src_metadata = std::fs::metadata(&src_path);
+                                    let dest_metadata = std::fs::metadata(&dest);
+                                    let dest_parent_metadata = Path::new(&dest).parent().map(Path::metadata);
+                                    let snapshot = filesystem_store.get_eviction_snapshot();
+                                    warn!(?e, fs_eviction_snapshot = %snapshot, ?src_path, ?src_metadata, %dest, ?dest_metadata, ?dest_parent_metadata, "Could not make hardlink");
                                     if e.code == Code::NotFound {
                                         e.append(
                                             format!(
-                                            "Could not make hardlink to {dest}, file was likely evicted from cache.\n\
+                                            "Could not make hardlink from {} to {dest}, file was likely evicted from cache.\n\
                                             This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
                                             To fix this issue:\n\
                                             1. Increase the 'max_bytes' value in your filesystem store configuration\n\
@@ -288,10 +410,10 @@ pub fn download_to_directory<'a>(
                                             4. Restart NativeLink after making the change\n\n\
                                             If this error persists after increasing max_bytes several times, please report at:\n\
                                             https://github.com/TraceMachina/nativelink/issues\n\
-                                            Include your config file and both server and client logs to help us assist you."
+                                            Include your config file and both server and client logs to help us assist you.", src_path.display()
                                         ))
                                     } else {
-                                        e.append(format!("Could not make hardlink to {dest}"))
+                                        e.append(format!("Could not make hardlink from {} to {dest}", src_path.display()))
                                     }
                                 })?;
                             // Hardlinked inodes are already correct (the 0o444
@@ -321,14 +443,14 @@ pub fn download_to_directory<'a>(
                             }
                         }
                         if let Some(mtime) = mtime {
-                            let dst = dest.clone();
+                            let spawned_dest = dest.clone();
                             spawn_blocking!("download_to_directory_set_mtime", move || {
                                 set_file_mtime(
-                                    &dst,
+                                    &spawned_dest,
                                     FileTime::from_unix_time(mtime.seconds, mtime.nanos as u32),
                                 )
                                 .err_tip(|| {
-                                    format!("Failed to set mtime in download_to_directory {dst}")
+                                    format!("Failed to set mtime in download_to_directory {spawned_dest}")
                                 })
                             })
                             .await
@@ -767,12 +889,18 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
             dir_count,
             symlink_count,
             scan_elapsed_ms = upload_dir_start.elapsed().as_millis(),
-            "upload_directory: starting try_join3"
+            "upload_directory: starting child uploads"
         );
         let join_start = std::time::Instant::now();
-        let (mut file_nodes, dir_entries, mut symlinks) = try_join3(
+        // Drive the subdirectory futures to completion BEFORE joining the file and
+        // symlink futures. Each recursion level holds a `read_dir` permit while its
+        // children run, so interleaving all three in one join can exhaust the open-file
+        // semaphore and deadlock on deep trees.
+        let dir_entries = dir_futures
+            .try_collect::<Vec<(DirectoryNode, VecDeque<Directory>)>>()
+            .await?;
+        let (mut file_nodes, mut symlinks) = try_join(
             file_futures.try_collect::<Vec<FileNode>>(),
-            dir_futures.try_collect::<Vec<(DirectoryNode, VecDeque<Directory>)>>(),
             symlink_futures.try_collect::<Vec<SymlinkNode>>(),
         )
         .await?;
@@ -780,7 +908,7 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
             full_dir_path = ?full_dir_path,
             join_elapsed_ms = join_start.elapsed().as_millis(),
             total_elapsed_ms = upload_dir_start.elapsed().as_millis(),
-            "upload_directory: try_join3 completed"
+            "upload_directory: child uploads completed"
         );
 
         let mut directory_nodes = Vec::with_capacity(dir_entries.len());
@@ -907,6 +1035,9 @@ pub trait RunningAction: Sync + Send + Sized + Unpin + 'static {
         self: Arc<Self>,
     ) -> impl Future<Output = Result<ActionResult, Error>> + Send;
 
+    /// Returns worker-observed resource usage captured while this action ran.
+    fn resource_usage(&self) -> Option<ActionResourceUsage>;
+
     /// Returns the work directory of the action.
     fn get_work_directory(&self) -> &String;
 }
@@ -916,6 +1047,7 @@ struct RunningActionImplExecutionResult {
     stdout: Bytes,
     stderr: Bytes,
     exit_code: i32,
+    resource_usage: Option<ActionResourceUsage>,
 }
 
 #[derive(Debug)]
@@ -927,6 +1059,7 @@ struct RunningActionImplState {
     kill_channel_rx: Option<oneshot::Receiver<()>>,
     execution_result: Option<RunningActionImplExecutionResult>,
     action_result: Option<ActionResult>,
+    resource_usage: Option<ActionResourceUsage>,
     execution_metadata: ExecutionMetadata,
     // If there was an internal error, this will be set.
     // This should NOT be set if everything was fine, but the process had a
@@ -973,6 +1106,7 @@ impl RunningActionImpl {
                 kill_channel_tx: Some(kill_channel_tx),
                 execution_result: None,
                 action_result: None,
+                resource_usage: None,
                 execution_metadata,
                 error: None,
             }),
@@ -1227,6 +1361,7 @@ impl RunningActionImpl {
                                                 stdout: Bytes::new(),
                                                 stderr: Bytes::new(),
                                                 exit_code: EXIT_CODE_FOR_SIGNAL,
+                                                resource_usage: None,
                                             });
                                         state.execution_metadata.execution_completed_timestamp =
                                             (self.running_actions_manager.callbacks.now_fn)();
@@ -1249,6 +1384,7 @@ impl RunningActionImpl {
                                     stdout: Bytes::new(),
                                     stderr: Bytes::from(response.output),
                                     exit_code: response.exit_code,
+                                    resource_usage: None,
                                 });
                                 state.execution_metadata.execution_completed_timestamp =
                                     (self.running_actions_manager.callbacks.now_fn)();
@@ -1362,24 +1498,34 @@ impl RunningActionImpl {
         #[cfg(target_os = "linux")]
         {
             let use_namespaces = self.running_actions_manager.use_namespaces;
-            let root_action_directory =
-                std::ffi::CString::new(self.running_actions_manager.root_action_directory.clone())
-                    .err_tip(|| "In RunningActionImpl::inner_execute()")?;
-            let action_directory = std::ffi::CString::new(self.action_directory.clone())
-                .err_tip(|| "In RunningActionImpl::inner_execute()")?;
 
-            // SAFETY: This function is specifically designed to operate in a async-signal-safe
-            // environment.
-            unsafe {
-                command_builder.pre_exec(move || match use_namespaces {
-                    UseNamespaces::No => Ok(()),
-                    _ => crate::namespace_utils::configure_namespace(
-                        matches!(use_namespaces, UseNamespaces::YesAndMount),
-                        &root_action_directory,
-                        &action_directory,
-                    ),
-                });
+            if !matches!(use_namespaces, UseNamespaces::No) {
+                let root_action_directory = std::ffi::CString::new(
+                    self.running_actions_manager.root_action_directory.clone(),
+                )
+                .err_tip(|| "In RunningActionImpl::inner_execute()")?;
+                let action_directory = std::ffi::CString::new(self.action_directory.clone())
+                    .err_tip(|| "In RunningActionImpl::inner_execute()")?;
+
+                // SAFETY: This function is specifically designed to operate in a async-signal-safe
+                // environment.
+                unsafe {
+                    command_builder.pre_exec(move || {
+                        crate::namespace_utils::configure_namespace(
+                            matches!(use_namespaces, UseNamespaces::YesAndMount),
+                            &root_action_directory,
+                            &action_directory,
+                        )
+                    });
+                }
             }
+
+            // Run the action as its own process-group leader (pgid == child
+            // pid). The resource-usage sampler attributes memory by process
+            // group, so this keeps the whole action together — including
+            // processes reparented to the worker when an intermediate shell
+            // exits — and never conflates it with the worker's own group.
+            command_builder.process_group(0);
         }
 
         let mut child_process = command_builder
@@ -1404,6 +1550,10 @@ impl RunningActionImpl {
             ),
             child_process,
         );
+
+        #[cfg(target_os = "linux")]
+        let mut maybe_resource_usage_sampler =
+            child_process.id().map(start_action_resource_usage_sampler);
 
         let mut child_process_guard = guard(child_process, |mut child_process| {
             let result: Result<Option<std::process::ExitStatus>, std::io::Error> =
@@ -1528,6 +1678,23 @@ impl RunningActionImpl {
                         exit_code
                     });
 
+                    #[cfg(target_os = "linux")]
+                    let resource_usage = match maybe_resource_usage_sampler.take() {
+                        Some(sampler) => finish_action_resource_usage_sampler(sampler)
+                            .await
+                            .and_then(|peak_memory_kb| {
+                                (peak_memory_kb > 0).then_some(ActionResourceUsage {
+                                    peak_memory_kb,
+                                    sampled: true,
+                                    operation_id: String::new(),
+                                    worker_id: String::new(),
+                                })
+                            }),
+                        None => None,
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let resource_usage = None;
+
                     info!(?args, "Command complete");
 
                     let maybe_error_override = if let Some(side_channel_file) = maybe_side_channel_file {
@@ -1545,6 +1712,7 @@ impl RunningActionImpl {
                             stdout,
                             stderr,
                             exit_code,
+                            resource_usage,
                         });
                         state.execution_metadata.execution_completed_timestamp = (self.running_actions_manager.callbacks.now_fn)();
                     }
@@ -1951,6 +2119,7 @@ impl RunningActionImpl {
             success = upload_result.is_ok(),
             "upload_results: all uploads completed",
         );
+        let resource_usage = execution_result.resource_usage.clone();
         let ((stdout_digest, stdout_raw), (stderr_digest, stderr_raw)) = match upload_result {
             Ok((stdout, stderr, ())) => (stdout, stderr),
             Err(e) => return Err(e).err_tip(|| "Error while uploading results"),
@@ -1983,6 +2152,7 @@ impl RunningActionImpl {
                 error: state.error.clone(),
                 message: String::new(), // Will be filled in on cache_action_result if needed.
             });
+            state.resource_usage = resource_usage;
         }
         debug!(
             operation_id = ?self.operation_id,
@@ -2147,6 +2317,10 @@ impl RunningAction for RunningActionImpl {
             .get_finished_result
             .wrap(Self::inner_get_finished_result(self))
             .await
+    }
+
+    fn resource_usage(&self) -> Option<ActionResourceUsage> {
+        self.state.lock().resource_usage.clone()
     }
 
     fn get_work_directory(&self) -> &String {
@@ -2479,6 +2653,8 @@ pub struct RunningActionsManagerArgs<'a> {
     pub upload_action_result_config: &'a UploadActionResultConfig,
     pub max_action_timeout: Duration,
     pub max_upload_timeout: Duration,
+    pub max_cleanup_wait: Duration,
+    pub max_cleanup_backoff: Duration,
     pub timeout_handled_externally: bool,
     pub directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
     #[cfg(target_os = "linux")]
@@ -2526,6 +2702,8 @@ pub struct RunningActionsManagerImpl {
     /// attempt's directory is fully cleaned up before creating a new one.
     /// See: <https://github.com/TraceMachina/nativelink/issues/1859>
     cleaning_up_operations: Mutex<HashSet<OperationId>>,
+    max_cleanup_wait: Duration,
+    max_cleanup_backoff: Duration,
     /// Notify waiters when a cleanup operation completes. This is used in conjunction with
     /// `cleaning_up_operations` to coordinate directory cleanup and creation.
     cleanup_complete_notify: Arc<Notify>,
@@ -2536,11 +2714,6 @@ pub struct RunningActionsManagerImpl {
 }
 
 impl RunningActionsManagerImpl {
-    /// Maximum time to wait for a cleanup operation to complete before timing out.
-    /// TODO(marcussorealheis): Consider making cleanup wait timeout configurable in the future
-    const MAX_WAIT: Duration = Duration::from_secs(30);
-    /// Maximum backoff duration for exponential backoff when waiting for cleanup.
-    const MAX_BACKOFF: Duration = Duration::from_millis(500);
     pub fn new_with_callbacks(
         args: RunningActionsManagerArgs<'_>,
         callbacks: Callbacks,
@@ -2573,8 +2746,13 @@ impl RunningActionsManagerImpl {
             running_actions: Mutex::new(HashMap::new()),
             action_done_tx,
             callbacks,
-            metrics: Arc::new(Metrics::default()),
+            metrics: Arc::new(Metrics {
+                directory_cache: args.directory_cache.as_ref().map(Arc::downgrade),
+                ..Default::default()
+            }),
             cleaning_up_operations: Mutex::new(HashSet::new()),
+            max_cleanup_wait: args.max_cleanup_wait,
+            max_cleanup_backoff: args.max_cleanup_backoff,
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
             persistent_worker_pool: PersistentWorkerPool::default(),
@@ -2660,7 +2838,7 @@ impl RunningActionsManagerImpl {
                 return Ok(());
             }
 
-            if start.elapsed() > Self::MAX_WAIT {
+            if start.elapsed() > self.max_cleanup_wait {
                 self.metrics.cleanup_wait_timeouts.inc();
                 warn!(%operation_id, waited=?start.elapsed(), "Timeout waiting for previous operation cleanup");
                 return Err(make_err!(
@@ -2687,7 +2865,7 @@ impl RunningActionsManagerImpl {
                 () = self.cleanup_complete_notify.notified() => {},
                 () = tokio::time::sleep(backoff) => {
                     // Exponential backoff
-                    backoff = (backoff * 2).min(Self::MAX_BACKOFF);
+                    backoff = (backoff * 2).min(self.max_cleanup_backoff);
                 },
             }
         }
@@ -2889,10 +3067,7 @@ impl RunningActionsManager for RunningActionsManagerImpl {
             .wrap_no_capture_result(async move {
                 let kill_operations: Vec<Arc<RunningActionImpl>> = {
                     let running_actions = self.running_actions.lock();
-                    running_actions
-                        .iter()
-                        .filter_map(|(_operation_id, action)| action.upgrade())
-                        .collect()
+                    running_actions.values().filter_map(Weak::upgrade).collect()
                 };
                 let mut kill_futures: FuturesUnordered<_> = kill_operations
                     .into_iter()
@@ -2970,6 +3145,10 @@ pub struct Metrics {
         help = "Number of times the directory cache failed and fell back to download_to_directory."
     )]
     directory_cache_fallback: CounterWithTime,
+    #[metric(
+        help = "Stats about the input-directory cache (hits, misses, subtree reuse, evictions, size)."
+    )]
+    directory_cache: Option<Weak<crate::directory_cache::DirectoryCache>>,
 }
 
 impl Metrics {

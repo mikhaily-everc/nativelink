@@ -36,8 +36,8 @@ const channels = [
   },
   {
     title: "Clone the repo",
-    body: "MIT-licensed. File issues, send PRs, or just star us. Every contribution gets a review.",
-    href: "https://github.com/tracemachina/nativelink",
+    body: "Public source, with module-aware licensing. File issues, send PRs, or just star us. Every contribution gets a review.",
+    href: "https://github.com/TraceMachina/nativelink",
     label: "View on GitHub",
     accent: "default" as const,
     icon: (

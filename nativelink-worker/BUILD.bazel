@@ -72,6 +72,7 @@ rust_test_suite(
     name = "integration",
     timeout = "short",
     srcs = [
+        "tests/directory_cache_stress_test.rs",
         "tests/directory_cache_test.rs",
         "tests/local_worker_test.rs",
         "tests/namespace_utils_test.rs",
@@ -90,6 +91,7 @@ rust_test_suite(
         ":nativelink-worker",
         "//nativelink-config",
         "//nativelink-error",
+        "//nativelink-metric",
         "//nativelink-proto",
         "//nativelink-store",
         "//nativelink-util",
@@ -105,6 +107,7 @@ rust_test_suite(
         "@crates//:serial_test",
         "@crates//:tokio",
         "@crates//:tonic",
+        "@crates//:tonic-prost",
         "@crates//:tracing",
         "@crates//:tracing-test",
         "@crates//:uuid",

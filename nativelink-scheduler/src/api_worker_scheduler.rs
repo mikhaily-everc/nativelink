@@ -26,16 +26,22 @@ use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
     RootMetricsComponent, group,
 };
+use nativelink_proto::com::github::trace_machina::nativelink::events::{
+    Event, OriginEvent, ResponseEvent, event, response_event,
+};
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
 use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
+use nativelink_util::origin_event::get_node_id;
 use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::spawn;
 use nativelink_util::task::JoinHandleDropGuard;
-use tokio::sync::{Notify, mpsc};
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Notify, mpsc};
 use tonic::async_trait;
 use tracing::{error, info, trace, warn};
+use uuid::Uuid;
 
 /// Metrics for tracking scheduler performance.
 #[derive(Debug, Default)]
@@ -504,7 +510,10 @@ impl ApiWorkerSchedulerImpl {
     ) -> Result<(), Error> {
         if let Some(worker) = self.workers.get_mut(&worker_id) {
             let notify_worker_result = worker
-                .notify_update(WorkerUpdate::RunAction((operation_id, action_info.clone())))
+                .notify_update(WorkerUpdate::RunAction(Box::new((
+                    operation_id,
+                    action_info.clone(),
+                ))))
                 .await;
 
             if let Err(notify_worker_result) = notify_worker_result {
@@ -560,6 +569,18 @@ impl ApiWorkerSchedulerImpl {
     ) -> Result<(), Error> {
         let mut result = Ok(());
         if let Some(mut worker) = self.remove_worker(worker_id) {
+            // Log every eviction here rather than in each caller, so a worker
+            // can never leave the pool unexplained. Without this, a worker that
+            // vanished mid-build left nothing on the scheduler side to
+            // attribute it to, and the only visible symptom was the worker
+            // reconnecting with a fresh id.
+            info!(
+                ?worker_id,
+                is_disconnect,
+                running_actions = worker.running_action_infos.len(),
+                reason = %err.message_string(),
+                "Evicting worker from pool"
+            );
             // We don't care if we fail to send message to worker, this is only a best attempt.
             drop(worker.notify_update(WorkerUpdate::Disconnect).await);
             let update = if is_disconnect {
@@ -623,6 +644,10 @@ pub struct ApiWorkerScheduler {
     /// task is `.abort()`'d the moment this struct drops, before runtime
     /// shutdown gets a chance to wait on it.
     _releaser_handle: JoinHandleDropGuard<()>,
+
+    /// Channel for publishing origin events such as worker-observed action
+    /// resource usage. `None` when origin events are disabled.
+    maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
 }
 
 impl ApiWorkerScheduler {
@@ -633,6 +658,7 @@ impl ApiWorkerScheduler {
         worker_change_notify: Arc<Notify>,
         worker_timeout_s: u64,
         worker_registry: SharedWorkerRegistry,
+        maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
     ) -> Arc<Self> {
         let (release_tx, release_rx) =
             mpsc::channel::<WorkerReservationInner>(RELEASE_CHANNEL_CAPACITY);
@@ -671,6 +697,7 @@ impl ApiWorkerScheduler {
                     "api_worker_scheduler_releaser",
                     Self::run_releaser(weak_for_releaser, release_rx, metrics_for_releaser),
                 ),
+                maybe_origin_event_tx,
             }
         });
 
@@ -979,6 +1006,19 @@ impl ApiWorkerScheduler {
         result
     }
 
+    pub async fn running_action_info(
+        &self,
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+    ) -> Option<ActionInfoWithProps> {
+        let inner = self.inner.lock().await;
+        inner
+            .workers
+            .peek(worker_id)
+            .and_then(|worker| worker.running_action_infos.get(operation_id))
+            .map(|pending_action_info| pending_action_info.action_info.clone())
+    }
+
     /// Returns the scheduler metrics for observability.
     #[must_use]
     pub const fn get_metrics(&self) -> &Arc<SchedulerMetrics> {
@@ -1079,6 +1119,59 @@ impl ApiWorkerScheduler {
 impl WorkerScheduler for ApiWorkerScheduler {
     fn get_platform_property_manager(&self) -> &PlatformPropertyManager {
         self.platform_property_manager.as_ref()
+    }
+
+    async fn record_action_resource_usage(
+        &self,
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+        mut resource_usage: ActionResourceUsage,
+    ) -> Result<(), Error> {
+        // The worker API talks to this `ApiWorkerScheduler` (it is the
+        // `WorkerScheduler` returned by `SimpleScheduler::new`), so the
+        // resource-usage origin event must be published here. Previously the
+        // only override lived on `SimpleScheduler`, which this path never
+        // reaches, so the event was silently dropped by the trait's no-op
+        // default and `observed_worker_peak_memory_mib` was never recorded.
+        let Some(origin_event_tx) = self.maybe_origin_event_tx.as_ref() else {
+            return Ok(());
+        };
+        let Some(action_info) = self.running_action_info(worker_id, operation_id).await else {
+            return Ok(());
+        };
+
+        if resource_usage.operation_id.is_empty() {
+            resource_usage.operation_id = operation_id.to_string();
+        }
+        if resource_usage.worker_id.is_empty() {
+            resource_usage.worker_id = worker_id.to_string();
+        }
+
+        let event = Event {
+            event: Some(event::Event::Response(ResponseEvent {
+                event: Some(response_event::Event::ActionResourceUsage(resource_usage)),
+            })),
+        };
+        let origin_event = OriginEvent {
+            version: 0,
+            event_id: Uuid::now_v6(&get_node_id(Some(&event)))
+                .hyphenated()
+                .to_string(),
+            parent_event_id: action_info
+                .scheduler_start_execute_event_id
+                .clone()
+                .unwrap_or_default(),
+            bazel_request_metadata: action_info.origin_metadata.bazel_metadata.clone(),
+            identity: action_info.origin_metadata.identity,
+            event: Some(event),
+        };
+        // Awaited send (not try_send): apply backpressure when the publisher
+        // queue is full instead of silently dropping the resource-usage event,
+        // which is what drives action-level resource sizing in the UI.
+        if let Err(err) = origin_event_tx.send(origin_event).await {
+            warn!(?err, "Failed to publish action resource usage origin event");
+        }
+        Ok(())
     }
 
     async fn add_worker(&self, worker: Worker) -> Result<(), Error> {

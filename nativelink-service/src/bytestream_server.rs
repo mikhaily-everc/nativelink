@@ -17,10 +17,10 @@ use core::fmt::{Debug, Formatter};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
 use futures::future::pending;
@@ -31,6 +31,7 @@ use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, group, publish,
 };
+use nativelink_proto::build::bazel::remote::execution::v2::compressor;
 use nativelink_proto::google::bytestream::byte_stream_server::{
     ByteStream, ByteStreamServer as Server,
 };
@@ -57,6 +58,8 @@ use parking_lot::Mutex;
 use tokio::time::sleep;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{Instrument, Level, debug, error, error_span, info, instrument, trace, warn};
+
+use crate::wire_compression::RemoteCacheCompressionInstances;
 
 /// If this value changes update the documentation in the config definition.
 const DEFAULT_PERSIST_STREAM_ON_DISCONNECT_TIMEOUT: Duration = Duration::from_mins(1);
@@ -254,6 +257,8 @@ pub struct InstanceInfo {
     metrics: Arc<ByteStreamMetrics>,
     /// Handle to the global sweeper task. Kept alive for the lifetime of the instance.
     _sweeper_handle: Arc<JoinHandleDropGuard<()>>,
+    /// Whether this instance supports Bazel remote cache compression.
+    remote_cache_compression_enabled: bool,
 }
 
 impl Debug for InstanceInfo {
@@ -264,7 +269,125 @@ impl Debug for InstanceInfo {
             .field("active_uploads", &self.active_uploads)
             .field("idle_stream_timeout", &self.idle_stream_timeout)
             .field("metrics", &self.metrics)
+            .field(
+                "remote_cache_compression_enabled",
+                &self.remote_cache_compression_enabled,
+            )
             .finish()
+    }
+}
+
+struct CompressedUploadGuard {
+    uuid_key: u128,
+    active_uploads: Arc<Mutex<HashMap<UuidKey, BytesWrittenAndIdleStream>>>,
+    metrics: Arc<ByteStreamMetrics>,
+}
+
+impl Drop for CompressedUploadGuard {
+    fn drop(&mut self) {
+        self.active_uploads.lock().remove(&self.uuid_key);
+        self.metrics.active_uploads.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl InstanceInfo {
+    fn track_compressed_upload(
+        &self,
+        uuid_key: UuidKey,
+    ) -> (Arc<AtomicU64>, CompressedUploadGuard) {
+        let bytes_received = Arc::new(AtomicU64::new(0));
+        let uuid_key = {
+            let mut active_uploads = self.active_uploads.lock();
+            match active_uploads.entry(uuid_key) {
+                Entry::Occupied(entry) => {
+                    // Another upload already owns this UUID; rekey instead of
+                    // clobbering its entry (which would break its QueryWriteStatus
+                    // visibility and double-decrement the metric on guard drop).
+                    // Mirrors create_or_join_upload_stream's collision handling.
+                    let original_key = *entry.key();
+                    let unique_key = ByteStreamServer::generate_unique_uuid_key(original_key);
+                    warn!(
+                        msg = "UUID collision detected on compressed upload, generating unique UUID to prevent conflict",
+                        original_uuid = format!("{original_key:032x}"),
+                        unique_uuid = format!("{unique_key:032x}")
+                    );
+                    self.metrics.uuid_collisions.fetch_add(1, Ordering::Relaxed);
+                    // Release the Occupied entry's borrow so we can insert on the same guard.
+                    let _ = entry;
+                    active_uploads.insert(unique_key, (bytes_received.clone(), None));
+                    unique_key
+                }
+                Entry::Vacant(entry) => {
+                    let key = *entry.key();
+                    entry.insert((bytes_received.clone(), None));
+                    key
+                }
+            }
+        };
+        self.metrics.active_uploads.fetch_add(1, Ordering::Relaxed);
+
+        (
+            bytes_received,
+            CompressedUploadGuard {
+                uuid_key,
+                active_uploads: self.active_uploads.clone(),
+                metrics: self.metrics.clone(),
+            },
+        )
+    }
+}
+
+/// Pump compressed `ByteStream` upload chunks into the decoder.
+///
+/// Compressed uploads intentionally do not support the identity upload resume
+/// protocol; offsets are validated against compressed wire bytes.
+async fn process_compressed_client_stream(
+    mut stream: WriteRequestStreamWrapper<impl Stream<Item = Result<WriteRequest, Status>> + Unpin>,
+    mut tx: DropCloserWriteHalf,
+    bytes_received: &Arc<AtomicU64>,
+) -> Result<(), Error> {
+    loop {
+        match stream.next().await {
+            Some(Ok(write_request)) => {
+                if write_request.write_offset < 0 {
+                    return Err(make_input_err!(
+                        "Invalid negative compressed write offset in write request: {}",
+                        write_request.write_offset
+                    ));
+                }
+                let write_offset = u64::try_from(write_request.write_offset)
+                    .err_tip(|| "Compressed write offset was not convertible to u64")?;
+                let compressed_offset = tx.get_bytes_written();
+                if write_offset != compressed_offset {
+                    return Err(make_input_err!(
+                        "Received out of order compressed data. Got {}, expected {}",
+                        write_offset,
+                        compressed_offset
+                    ));
+                }
+
+                if !write_request.data.is_empty() {
+                    tx.send(write_request.data)
+                        .await
+                        .err_tip(|| "Failed to forward compressed upload data")?;
+                    bytes_received.store(tx.get_bytes_written(), Ordering::Release);
+                }
+                if write_request.finish_write {
+                    tx.send_eof()
+                        .err_tip(|| "Failed to send compressed upload EOF")?;
+                    return Ok(());
+                }
+            }
+            Some(Err(e)) => {
+                return Err(e);
+            }
+            None => {
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "Compressed write stream ended without finish_write"
+                ));
+            }
+        }
     }
 }
 
@@ -275,6 +398,7 @@ struct StreamState {
     uuid: UuidKey,
     tx: DropCloserWriteHalf,
     store_update_fut: StoreUpdateFuture,
+    digest_function: DigestHasherFunc,
 }
 
 impl Debug for StreamState {
@@ -358,32 +482,64 @@ impl IdleStream {
 #[derive(Debug)]
 pub struct ByteStreamServer {
     instance_infos: HashMap<InstanceName, InstanceInfo>,
+    reported_digest_function_mismatches: Mutex<HashSet<(DigestHasherFunc, DigestHasherFunc)>>,
 }
 
 impl ByteStreamServer {
+    /// Generate a unique UUID key by `XOR`ing the base key with a nanosecond timestamp.
+    /// This ensures virtually zero collision probability while being O(1).
+    ///
+    /// Only used by the COMPRESSED upload path (`track_compressed_upload`), where
+    /// the map entry is pure bookkeeping for `QueryWriteStatus` and is dropped with
+    /// the guard — there is no resumable `store_update_fut` keyed by it. The
+    /// uncompressed path deliberately does NOT rekey: minting a fresh key there
+    /// would start a new `store.update` at offset 0 while the client resumes at
+    /// `committed_size`, silently dropping the head bytes. See
+    /// `create_or_join_upload_stream` Case 3, which rejects with `Code::Aborted`.
+    fn generate_unique_uuid_key(base_key: UuidKey) -> UuidKey {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        // XOR with timestamp to create unique key
+        base_key ^ timestamp
+    }
+
     pub fn new(
         configs: &[WithInstanceName<ByteStreamConfig>],
         store_manager: &StoreManager,
+        remote_cache_compression_instances: &RemoteCacheCompressionInstances,
     ) -> Result<Self, Error> {
         let mut instance_infos: HashMap<String, InstanceInfo> = HashMap::new();
         for config in configs {
-            let idle_stream_timeout = if config.persist_stream_on_disconnect_timeout == 0 {
+            let idle_stream_timeout = if config.persist_stream_on_disconnect_timeout_s == 0 {
                 DEFAULT_PERSIST_STREAM_ON_DISCONNECT_TIMEOUT
             } else {
-                Duration::from_secs(config.persist_stream_on_disconnect_timeout as u64)
+                Duration::from_secs(config.persist_stream_on_disconnect_timeout_s as u64)
             };
+            let remote_cache_compression_enabled =
+                remote_cache_compression_instances.enabled_for(&config.instance_name);
             let _old_value = instance_infos.insert(
                 config.instance_name.clone(),
-                Self::new_with_timeout(config, store_manager, idle_stream_timeout)?,
+                Self::new_with_timeout(
+                    config,
+                    store_manager,
+                    idle_stream_timeout,
+                    remote_cache_compression_enabled,
+                )?,
             );
         }
-        Ok(Self { instance_infos })
+        Ok(Self {
+            instance_infos,
+            reported_digest_function_mismatches: Mutex::new(HashSet::new()),
+        })
     }
 
     pub fn new_with_timeout(
         config: &WithInstanceName<ByteStreamConfig>,
         store_manager: &StoreManager,
         idle_stream_timeout: Duration,
+        remote_cache_compression_enabled: bool,
     ) -> Result<InstanceInfo, Error> {
         let store = store_manager
             .get_store(&config.cas_store)
@@ -456,6 +612,7 @@ impl ByteStreamServer {
             idle_stream_timeout,
             metrics,
             _sweeper_handle: Arc::new(sweeper_handle),
+            remote_cache_compression_enabled,
         })
     }
 
@@ -486,7 +643,13 @@ impl ByteStreamServer {
         uuid_str: &str,
         instance: &InstanceInfo,
         digest: DigestInfo,
+        digest_function: DigestHasherFunc,
     ) -> Result<ActiveStreamGuard, Error> {
+        // Bind the digest function to the retained store future itself. The
+        // future can outlive this RPC while an upload is idle, so it must not
+        // depend on the context of whichever request polls it next.
+        let store_update_context = make_ctx_for_hash_func(digest_function)?;
+
         // Parse UUID string to u128 key for efficient HashMap operations
         let uuid_key = parse_uuid_to_key(uuid_str);
 
@@ -523,6 +686,19 @@ impl ByteStreamServer {
                 // Case 2: Stream exists but is idle, we can resume it. Continue the
                 // existing `store_update_fut` from its current `committed_size`.
                 let val = entry.get_mut();
+                // A resumed stream keeps its original `store_update_fut`, which is
+                // already bound to the digest function the upload started with.
+                // Resuming under a different one would hash the tail with the wrong
+                // function, so refuse rather than silently corrupt the blob.
+                if let Some(idle_stream) = val.1.as_ref()
+                    && idle_stream.stream_state.digest_function != digest_function
+                {
+                    return Err(make_input_err!(
+                        "Cannot resume upload with digest function {} because it started with {}",
+                        digest_function,
+                        idle_stream.stream_state.digest_function,
+                    ));
+                }
                 let idle_stream = val.1.take().unwrap();
                 let bytes_received = val.0.clone();
                 info!(
@@ -560,19 +736,24 @@ impl ByteStreamServer {
 
         let (tx, rx) = make_buf_channel_pair();
         let store = instance.store.clone();
-        let store_update_fut = Box::pin(async move {
-            // We need to wrap `Store::update()` in a another future because we need to capture
-            // `store` to ensure its lifetime follows the future and not the caller.
-            store
-                // Bytestream always uses digest size as the actual byte size.
-                .update(digest, rx, UploadSizeInfo::ExactSize(digest.size_bytes()))
-                .await
-        });
+        let store_update_fut = Box::pin(
+            async move {
+                // We need to wrap `Store::update()` in a another future because we need to capture
+                // `store` to ensure its lifetime follows the future and not the caller.
+                store
+                    // Bytestream always uses digest size as the actual byte size.
+                    .update(digest, rx, UploadSizeInfo::ExactSize(digest.size_bytes()))
+                    .await
+                    .map(|_| ())
+            }
+            .with_context(store_update_context),
+        );
         Ok(ActiveStreamGuard {
             stream_state: Some(StreamState {
                 uuid,
                 tx,
                 store_update_fut,
+                digest_function,
             }),
             bytes_received,
             active_uploads: instance.active_uploads.clone(),
@@ -709,6 +890,7 @@ impl ByteStreamServer {
         &self,
         instance_info: &InstanceInfo,
         digest: DigestInfo,
+        digest_function: DigestHasherFunc,
         stream: WriteRequestStreamWrapper<impl Stream<Item = Result<WriteRequest, Status>> + Unpin>,
     ) -> Result<Response<WriteResponse>, Error> {
         async fn process_client_stream(
@@ -810,7 +992,7 @@ impl ByteStreamServer {
             .as_ref()
             .ok_or_else(|| make_input_err!("UUID must be set if writing data"))?;
         let mut active_stream_guard =
-            self.create_or_join_upload_stream(uuid, instance_info, digest)?;
+            self.create_or_join_upload_stream(uuid, instance_info, digest, digest_function)?;
         let expected_size = stream.resource_info.expected_size as u64;
 
         let active_stream = active_stream_guard.stream_state.as_mut().unwrap();
@@ -829,7 +1011,7 @@ impl ByteStreamServer {
         active_stream_guard.graceful_finish();
 
         Ok(Response::new(WriteResponse {
-            committed_size: expected_size as i64,
+            committed_size: expected_size.try_into().unwrap_or(i64::MAX),
         }))
     }
 
@@ -839,6 +1021,7 @@ impl ByteStreamServer {
         &self,
         instance_info: &InstanceInfo,
         digest: DigestInfo,
+        digest_function: DigestHasherFunc,
         mut stream: WriteRequestStreamWrapper<
             impl Stream<Item = Result<WriteRequest, Status>> + Unpin,
         >,
@@ -913,16 +1096,255 @@ impl ByteStreamServer {
 
         // Direct update without channel overhead
         let store = instance_info.store.clone();
+        let store_update_context = make_ctx_for_hash_func(digest_function)?;
         store
             .update_oneshot(digest, buffer.freeze())
+            .with_context(store_update_context)
             .await
             .err_tip(|| "Error in update_oneshot")?;
 
         // Note: bytes_written_total is updated in the caller (bytestream_write) based on result
 
         Ok(Response::new(WriteResponse {
-            committed_size: expected_size as i64,
+            committed_size: expected_size.try_into().unwrap_or(i64::MAX),
         }))
+    }
+
+    /// Handle a compressed upload: stream compressed wire bytes through the
+    /// decoder into the store update stream, validate the decoded size, and
+    /// verify the decoded digest.
+    async fn inner_write_compressed(
+        &self,
+        instance: &InstanceInfo,
+        digest: DigestInfo,
+        digest_function: DigestHasherFunc,
+        wire_compressor: compressor::Value,
+        stream: WriteRequestStreamWrapper<impl Stream<Item = Result<WriteRequest, Status>> + Unpin>,
+    ) -> Result<Response<WriteResponse>, Error> {
+        // Register the upload in active_uploads so QueryWriteStatus can report
+        // compressed wire-byte progress while decoding. This mirrors what
+        // create_or_join_upload_stream does for uncompressed uploads.
+        let uuid_str = stream
+            .resource_info
+            .uuid
+            .as_deref()
+            .ok_or_else(|| make_input_err!("UUID must be set if writing compressed data"))?;
+        let uuid_key = parse_uuid_to_key(uuid_str);
+        let (bytes_received, _guard) = instance.track_compressed_upload(uuid_key);
+
+        let (compressed_tx, compressed_rx) = make_buf_channel_pair();
+        let (decompressed_tx, decompressed_rx) = make_buf_channel_pair();
+        let store = instance.store.clone();
+        let store_update_context = make_ctx_for_hash_func(digest_function)?;
+        let store_update_fut = async move {
+            store
+                .update(
+                    digest,
+                    decompressed_rx,
+                    UploadSizeInfo::ExactSize(digest.size_bytes()),
+                )
+                .await
+                .map(|_| ())
+                .err_tip(|| "Failed to store decompressed data")
+        }
+        .with_context(store_update_context);
+        // Plain async future: decode progresses at the pace of the client
+        // upload and the store write without occupying a blocking-pool thread
+        // for the stream's lifetime.
+        let decode_fut = crate::wire_compression::stream_decode_compressed_upload(
+            compressed_rx,
+            wire_compressor,
+            digest,
+            digest_function,
+            decompressed_tx,
+        );
+        let client_stream_fut =
+            process_compressed_client_stream(stream, compressed_tx, &bytes_received);
+        let (client_stream_result, decode_result, store_update_result) =
+            tokio::join!(client_stream_fut, decode_fut, store_update_fut);
+
+        if let Err(err) = &client_stream_result
+            && err.code == Code::InvalidArgument
+        {
+            return Err(err.clone());
+        }
+        if let Err(err) = &decode_result
+            && err.code == Code::InvalidArgument
+        {
+            return Err(err.clone());
+        }
+        let mut upload_error = store_update_result.err();
+        if let Err(err) = decode_result {
+            upload_error = Some(match upload_error {
+                Some(existing) => existing.merge(err),
+                None => err,
+            });
+        }
+        if let Err(err) = client_stream_result {
+            upload_error = Some(match upload_error {
+                Some(existing) => existing.merge(err),
+                None => err,
+            });
+        }
+        if let Some(err) = upload_error {
+            return Err(err);
+        }
+
+        let committed_size = i64::try_from(bytes_received.load(Ordering::Acquire))
+            .err_tip(|| "Compressed upload size was not convertible to i64")?;
+        Ok(Response::new(WriteResponse { committed_size }))
+    }
+
+    /// Read a blob from the store, compress it with the given wire compressor,
+    /// and return it as a stream of chunked `ReadResponse`s.
+    async fn inner_read_compressed(
+        &self,
+        instance: &InstanceInfo,
+        digest: DigestInfo,
+        wire_compressor: compressor::Value,
+        read_request: ReadRequest,
+    ) -> Result<ReadStream, Error> {
+        struct ReaderState {
+            max_bytes_per_stream: usize,
+            rx: DropCloserReadHalf,
+            maybe_get_part_result: Option<Result<(), Error>>,
+            maybe_encode_result: Option<Result<(), Error>>,
+            get_part_fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>,
+            encode_fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>,
+        }
+
+        impl ReaderState {
+            async fn finish(mut self, mut error: Option<Error>) -> Option<Error> {
+                let encode_result = if let Some(result) = self.maybe_encode_result.take() {
+                    result
+                } else {
+                    self.encode_fut.await
+                };
+                if let Err(err) = encode_result {
+                    error = Some(match error {
+                        Some(existing) => err.merge(existing),
+                        None => err,
+                    });
+                }
+
+                let get_part_result = if let Some(result) = self.maybe_get_part_result.take() {
+                    result
+                } else {
+                    self.get_part_fut.await
+                };
+                if let Err(err) = get_part_result {
+                    error = Some(match error {
+                        Some(existing) => err.merge(existing),
+                        None => err,
+                    });
+                }
+
+                error
+            }
+        }
+
+        if read_request.read_limit != 0 {
+            return Err(make_input_err!(
+                "read_limit must be 0 when reading compressed blobs"
+            ));
+        }
+        if read_request.read_offset < 0 {
+            return Err(make_input_err!(
+                "read_offset must be non-negative when reading compressed blobs"
+            ));
+        }
+        let read_offset = u64::try_from(read_request.read_offset)
+            .err_tip(|| "Could not convert read_offset to u64")?;
+
+        let (raw_tx, raw_rx) = make_buf_channel_pair();
+        let (compressed_tx, compressed_rx) = make_buf_channel_pair();
+
+        let store = instance.store.clone();
+        let get_part_fut = Box::pin(async move {
+            store
+                .get_part(digest, raw_tx, read_offset, None)
+                .await
+                .err_tip(|| "Failed to read blob for wire compression")
+        });
+        // The encode runs as a plain async future: it must not occupy a
+        // blocking-pool thread for the stream's lifetime, because it only
+        // progresses at the client's drain rate. Dropping the returned
+        // stream drops this future, which tears the encode down exactly
+        // like the previous task-abort-on-drop did.
+        let encode_fut = Box::pin(crate::wire_compression::stream_encode_compressed_download(
+            raw_rx,
+            wire_compressor,
+            crate::wire_compression::ZSTD_COMPRESSION_LEVEL,
+            compressed_tx,
+        ));
+
+        let state = Some(ReaderState {
+            max_bytes_per_stream: instance.max_bytes_per_stream,
+            rx: compressed_rx,
+            maybe_get_part_result: None,
+            maybe_encode_result: None,
+            get_part_fut,
+            encode_fut,
+        });
+
+        Ok(Box::pin(unfold(state, move |state| async {
+            enum ReadStep {
+                Response(ReadResponse),
+                Finish(Option<Error>),
+            }
+
+            let mut state = state?;
+            let step = {
+                let mut response = ReadResponse::default();
+                let consume_fut = state.rx.consume(Some(state.max_bytes_per_stream));
+                tokio::pin!(consume_fut);
+                loop {
+                    tokio::select! {
+                        read_result = &mut consume_fut => {
+                            match read_result {
+                                Ok(bytes) => {
+                                    if bytes.is_empty() {
+                                        break ReadStep::Finish(None);
+                                    }
+                                    if bytes.len() > state.max_bytes_per_stream {
+                                        let err = make_err!(Code::Internal, "Returned compressed size was larger than read size");
+                                        break ReadStep::Finish(Some(err));
+                                    }
+                                    response.data = bytes;
+                                    trace!(
+                                        response.data = format!("<redacted len({})>", response.data.len())
+                                    );
+                                    break ReadStep::Response(response);
+                                }
+                                Err(e) => {
+                                    break ReadStep::Finish(Some(e));
+                                }
+                            }
+                        }
+                        get_part_result = &mut state.get_part_fut, if state.maybe_get_part_result.is_none() => {
+                            state.maybe_get_part_result = Some(get_part_result);
+                        }
+                        encode_result = &mut state.encode_fut, if state.maybe_encode_result.is_none() => {
+                            state.maybe_encode_result = Some(encode_result);
+                        }
+                    }
+                }
+            };
+
+            match step {
+                ReadStep::Response(response) => Some((Ok(response), Some(state))),
+                ReadStep::Finish(error) => {
+                    state.finish(error).await.map(|mut err| {
+                        if err.code == Code::NotFound {
+                            // Trim common NotFound details to match the identity read path.
+                            err.messages.truncate(1);
+                        }
+                        error!(response = ?err);
+                        (Err(err.into()), None)
+                    })
+                }
+            }
+        })))
     }
 
     async fn inner_query_write_status(
@@ -961,7 +1383,10 @@ impl ByteStreamServer {
             let active_uploads = instance.active_uploads.lock();
             if let Some((received_bytes, _maybe_idle_stream)) = active_uploads.get(&uuid_key) {
                 return Ok(Response::new(QueryWriteStatusResponse {
-                    committed_size: received_bytes.load(Ordering::Acquire) as i64,
+                    committed_size: received_bytes
+                        .load(Ordering::Acquire)
+                        .try_into()
+                        .unwrap_or(i64::MAX),
                     // If we are in the active_uploads map, but the value is None,
                     // it means the stream is not complete.
                     complete: false,
@@ -981,7 +1406,7 @@ impl ByteStreamServer {
             }));
         };
         Ok(Response::new(QueryWriteStatusResponse {
-            committed_size: item_size as i64,
+            committed_size: item_size.try_into().unwrap_or(i64::MAX),
             complete: true,
         }))
     }
@@ -1004,13 +1429,19 @@ impl ByteStream for ByteStreamServer {
         let start_time = Instant::now();
 
         let read_request = grpc_request.into_inner();
-        let resource_info = ResourceInfo::new(&read_request.resource_name, false)?;
+        let resource_name = read_request.resource_name.clone();
+        let resource_info = ResourceInfo::new(&resource_name, false)?;
         let instance_name = resource_info.instance_name.as_ref();
         let expected_size = resource_info.expected_size as u64;
         let instance = self
             .instance_infos
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+
+        trace!(
+            resource_name,
+            instance_name, expected_size, "Starting bytestream request"
+        );
 
         // Track read request
         instance
@@ -1033,23 +1464,49 @@ impl ByteStream for ByteStreamServer {
             DigestHasherFunc::try_from,
         )?;
 
-        let resp = self
-            .inner_read(instance, digest, read_request)
-            .instrument(error_span!("bytestream_read"))
-            .with_context(
-                make_ctx_for_hash_func(digest_function).err_tip(|| "In BytestreamServer::read")?,
-            )
-            .await
-            .err_tip(|| "In ByteStreamServer::read")
-            .map(|stream| -> Response<Self::ReadStream> { Response::new(Box::pin(stream)) });
+        // Determine if the client requested wire-compressed data via compressed-blobs URI.
+        let wire_compressor = crate::wire_compression::resolve_wire_compressor(
+            resource_info.compressor.as_deref(),
+            instance.remote_cache_compression_enabled,
+        )?;
+
+        let resp = if wire_compressor == compressor::Value::Identity {
+            // Uncompressed path — use the existing streaming read.
+            self.inner_read(instance, digest, read_request)
+                .instrument(error_span!("bytestream_read"))
+                .with_context(
+                    make_ctx_for_hash_func(digest_function)
+                        .err_tip(|| "In BytestreamServer::read")?,
+                )
+                .await
+                .err_tip(|| "In ByteStreamServer::read")
+                .map(|stream| -> Response<Self::ReadStream> { Response::new(Box::pin(stream)) })
+        } else {
+            // Compressed path — stream the requested raw range through zstd.
+            self.inner_read_compressed(instance, digest, wire_compressor, read_request)
+                .instrument(error_span!("bytestream_read_compressed"))
+                .with_context(
+                    make_ctx_for_hash_func(digest_function)
+                        .err_tip(|| "In BytestreamServer::read_compressed")?,
+                )
+                .await
+                .err_tip(|| "In ByteStreamServer::read_compressed")
+                .map(|stream| -> Response<Self::ReadStream> { Response::new(Box::pin(stream)) })
+        };
 
         // Track metrics based on result
+        let elapsed = start_time.elapsed();
         #[allow(clippy::cast_possible_truncation)]
-        let elapsed_ns = start_time.elapsed().as_nanos() as u64;
+        let elapsed_ns = elapsed.as_nanos() as u64;
         instance
             .metrics
             .read_duration_ns
             .fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        trace!(
+            ?elapsed,
+            resource_name, instance_name, expected_size, "Completed bytestream request"
+        );
 
         match &resp {
             Ok(_) => {
@@ -1119,14 +1576,71 @@ impl ByteStream for ByteStreamServer {
             return resp;
         }
 
-        let digest_function = stream
-            .resource_info
-            .digest_function
-            .as_deref()
-            .map_or_else(
-                || Ok(default_digest_hasher_func()),
-                DigestHasherFunc::try_from,
-            )?;
+        let default_digest_function = default_digest_hasher_func();
+        let digest_function = match stream.resource_info.digest_function.as_deref() {
+            Some(value) => {
+                let digest_function = DigestHasherFunc::try_from(value)?;
+                if digest_function != default_digest_function
+                    && self
+                        .reported_digest_function_mismatches
+                        .lock()
+                        .insert((digest_function, default_digest_function))
+                {
+                    warn!(
+                        client_digest_function = %digest_function,
+                        server_default_digest_function = %default_digest_function,
+                        "ByteStream client declared a digest function that differs from the server default; the client-declared function will be used for this upload, but clients using different digest functions generate different cache keys and will not share cache hits; configure global.default_digest_hash_function and all clients to use the same digest function"
+                    );
+                }
+                digest_function
+            }
+            None => default_digest_function,
+        };
+
+        // Determine if the client is sending wire-compressed data via compressed-blobs URI.
+        let wire_compressor = crate::wire_compression::resolve_wire_compressor(
+            stream.resource_info.compressor.as_deref(),
+            instance.remote_cache_compression_enabled,
+        )?;
+
+        // For compressed uploads, stream compressed wire bytes through the
+        // decoder and store the resulting raw bytes.
+        if wire_compressor != compressor::Value::Identity {
+            let result = self
+                .inner_write_compressed(instance, digest, digest_function, wire_compressor, stream)
+                .instrument(error_span!("bytestream_write_compressed"))
+                .await
+                .err_tip(|| "In ByteStreamServer::write_compressed");
+
+            // Track metrics based on result
+            #[allow(clippy::cast_possible_truncation)]
+            let elapsed_ns = start_time.elapsed().as_nanos() as u64;
+            instance
+                .metrics
+                .write_duration_ns
+                .fetch_add(elapsed_ns, Ordering::Relaxed);
+
+            match &result {
+                Ok(_) => {
+                    instance
+                        .metrics
+                        .write_requests_success
+                        .fetch_add(1, Ordering::Relaxed);
+                    instance
+                        .metrics
+                        .bytes_written_total
+                        .fetch_add(expected_size, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    instance
+                        .metrics
+                        .write_requests_failure
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            return result.map_err(Into::into);
+        }
 
         // Check if store supports direct oneshot updates (bypasses channel overhead).
         // Use fast-path only when:
@@ -1158,21 +1672,13 @@ impl ByteStream for ByteStreamServer {
         };
 
         let result = if use_oneshot {
-            self.inner_write_oneshot(instance, digest, stream)
+            self.inner_write_oneshot(instance, digest, digest_function, stream)
                 .instrument(error_span!("bytestream_write_oneshot"))
-                .with_context(
-                    make_ctx_for_hash_func(digest_function)
-                        .err_tip(|| "In BytestreamServer::write")?,
-                )
                 .await
                 .err_tip(|| "In ByteStreamServer::write (oneshot)")
         } else {
-            self.inner_write(instance, digest, stream)
+            self.inner_write(instance, digest, digest_function, stream)
                 .instrument(error_span!("bytestream_write"))
-                .with_context(
-                    make_ctx_for_hash_func(digest_function)
-                        .err_tip(|| "In BytestreamServer::write")?,
-                )
                 .await
                 .err_tip(|| "In ByteStreamServer::write")
         };

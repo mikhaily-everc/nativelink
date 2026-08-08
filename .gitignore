@@ -1,5 +1,7 @@
 bazel-*
+!tools/bazel-retry.sh
 target/
+nativelink-test/fuzz/target/
 .vscode/
 .idea/
 .zed
@@ -28,3 +30,4 @@ nativelink_config.schema.json
 nativelink-worker-init.tar
 nativelink-image.tar
 .gstack/
+.worktrees/

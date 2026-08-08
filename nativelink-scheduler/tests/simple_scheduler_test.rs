@@ -30,10 +30,13 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    ExecuteRequest, Platform, digest_function,
+    ExecuteRequest, Platform, RequestMetadata, digest_function, platform,
+};
+use nativelink_proto::com::github::trace_machina::nativelink::events::{
+    event, request_event, response_event,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ConnectionResult, StartExecute, UpdateForWorker, update_for_worker,
+    ActionResourceUsage, ConnectionResult, StartExecute, UpdateForWorker, update_for_worker,
 };
 use nativelink_scheduler::awaited_action_db::{
     AwaitedAction, AwaitedActionDb, AwaitedActionSubscriber, SortedAwaitedAction,
@@ -53,7 +56,14 @@ use nativelink_util::operation_state_manager::{
     ActionStateResult, ClientStateManager, OperationFilter, OperationStageFlags,
     UpdateOperationType,
 };
+use nativelink_util::origin_event::{
+    BAZEL_METADATA_KEY, OriginMetadata, request_metadata_to_baggage,
+};
 use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
+use opentelemetry::KeyValue;
+use opentelemetry::baggage::BaggageExt;
+use opentelemetry::context::{Context, FutureExt as OtelFutureExt};
+use opentelemetry_semantic_conventions::attribute::ENDUSER_ID;
 use pretty_assertions::assert_eq;
 use tokio::sync::{Notify, mpsc};
 use utils::scheduler_utils::{INSTANCE_NAME, make_base_action_info, update_eq};
@@ -177,6 +187,161 @@ async fn basic_add_action_with_one_worker_test() -> Result<(), Error> {
         };
         assert_eq!(action_state.as_ref(), &expected_action_state);
     }
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn scheduler_start_execute_origin_event_includes_resource_hints() -> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+    let task_change_notify = Arc::new(Notify::new());
+    let (origin_event_tx, mut origin_event_rx) = mpsc::channel(8);
+    let (scheduler, worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            supported_platform_properties: Some(HashMap::from([
+                ("cpu_count".to_string(), PropertyType::Minimum),
+                ("memory_kb".to_string(), PropertyType::Minimum),
+            ])),
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        Some(origin_event_tx),
+    );
+    let mut rx_from_worker = setup_new_worker(
+        &scheduler,
+        worker_id.clone(),
+        PlatformProperties::new(HashMap::from([
+            ("cpu_count".to_string(), PlatformPropertyValue::Minimum(8)),
+            (
+                "memory_kb".to_string(),
+                PlatformPropertyValue::Minimum(16_000_000),
+            ),
+        ])),
+    )
+    .await?;
+
+    let action_digest = DigestInfo::new([42u8; 32], 512);
+    let insert_timestamp = make_system_time(2);
+    let mut action_info = make_base_action_info(insert_timestamp, action_digest);
+    Arc::make_mut(&mut action_info).platform_properties = HashMap::from([
+        ("cpu_count".to_string(), "2".to_string()),
+        ("memory_kb".to_string(), "12_000_000".replace('_', "")),
+    ]);
+    let request_metadata = RequestMetadata {
+        tool_invocation_id: "00000000-0000-0000-0000-000000000001".to_string(),
+        target_id: "//pkg:high_mem_test".to_string(),
+        action_mnemonic: "TestRunner".to_string(),
+        ..Default::default()
+    };
+    let context = Context::current_with_baggage(vec![
+        KeyValue::new(ENDUSER_ID, "dev@example.com"),
+        KeyValue::new(
+            BAZEL_METADATA_KEY,
+            request_metadata_to_baggage(&request_metadata),
+        ),
+    ]);
+
+    let mut action_listener = scheduler
+        .add_action(OperationId::from("client-op"), action_info)
+        .with_context(context)
+        .await?;
+    tokio::task::yield_now().await;
+    scheduler.do_try_match_for_test().await?;
+
+    let start_action = match rx_from_worker.recv().await.unwrap().update.unwrap() {
+        update_for_worker::Update::StartAction(start_action) => start_action,
+        update_for_worker::Update::ConnectionResult(connection_result) => {
+            panic!("Unexpected connection result: {connection_result:?}");
+        }
+        update_for_worker::Update::Disconnect(()) => {
+            panic!("Unexpected disconnect");
+        }
+        event => {
+            panic!("Unexpected worker update: {event:?}");
+        }
+    };
+    assert_eq!(start_action.worker_id, "worker_id");
+    let start_action_platform = start_action.platform.unwrap();
+    assert_eq!(
+        start_action_platform.properties,
+        vec![
+            platform::Property {
+                name: "cpu_count".to_string(),
+                value: "2".to_string(),
+            },
+            platform::Property {
+                name: "memory_kb".to_string(),
+                value: "12000000".to_string(),
+            },
+        ]
+    );
+
+    let (action_state, _maybe_origin_metadata) = action_listener.changed().await.unwrap();
+    assert_eq!(action_state.stage, ActionStage::Executing);
+
+    let scheduler_start_execute_event = origin_event_rx.recv().await.unwrap();
+    let scheduler_start_execute_event_id = scheduler_start_execute_event.event_id.clone();
+    assert_eq!(scheduler_start_execute_event.identity, "dev@example.com");
+    assert_eq!(
+        scheduler_start_execute_event
+            .bazel_request_metadata
+            .unwrap(),
+        request_metadata
+    );
+    let origin_event = scheduler_start_execute_event.event.unwrap().event.unwrap();
+    let request_event = match origin_event {
+        event::Event::Request(request_event) => request_event,
+        event => panic!("Unexpected origin event: {event:?}"),
+    };
+    let scheduler_start_execute = match request_event.event.unwrap() {
+        request_event::Event::SchedulerStartExecute(scheduler_start_execute) => {
+            scheduler_start_execute
+        }
+        event => panic!("Unexpected request event: {event:?}"),
+    };
+    assert_eq!(scheduler_start_execute.worker_id, "worker_id");
+    assert_eq!(
+        scheduler_start_execute.platform.unwrap().properties,
+        start_action_platform.properties
+    );
+
+    worker_scheduler
+        .record_action_resource_usage(
+            &worker_id,
+            &OperationId::from(start_action.operation_id.as_str()),
+            ActionResourceUsage {
+                peak_memory_kb: 12_345,
+                sampled: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let resource_usage_event = origin_event_rx.recv().await.unwrap();
+    assert_eq!(
+        resource_usage_event.parent_event_id,
+        scheduler_start_execute_event_id
+    );
+    let origin_event = resource_usage_event.event.unwrap().event.unwrap();
+    let response_event = match origin_event {
+        event::Event::Response(response_event) => response_event,
+        event => panic!("Unexpected origin event: {event:?}"),
+    };
+    let resource_usage = match response_event.event.unwrap() {
+        response_event::Event::ActionResourceUsage(resource_usage) => resource_usage,
+        event => panic!("Unexpected response event: {event:?}"),
+    };
+    assert_eq!(resource_usage.operation_id, start_action.operation_id);
+    assert_eq!(resource_usage.worker_id, "worker_id");
+    assert_eq!(resource_usage.peak_memory_kb, 12_345);
+    assert!(resource_usage.sampled);
 
     Ok(())
 }
@@ -2308,8 +2473,8 @@ async fn action_timeout_is_enforced_backend_side_test() -> Result<(), Error> {
     let task_change_notify = Arc::new(Notify::new());
     let state_mgr = SimpleSchedulerStateManager::new(
         /* max_job_retries */ 1,
-        /* no_event_action_timeout */ Duration::from_secs(60),
-        /* client_action_timeout */ Duration::from_secs(60),
+        /* no_event_action_timeout */ Duration::from_mins(1),
+        /* client_action_timeout */ Duration::from_mins(1),
         /* max_executing_timeout */ Duration::ZERO,
         memory_awaited_action_db_factory(
             0,
@@ -2756,6 +2921,81 @@ async fn concurrent_matching_respects_worker_capacity() -> Result<(), Error> {
     Ok(())
 }
 
+/// Regression test: a finished operation whose client entry is dropped late
+/// (e.g. evicted after the retain window) must not remove the
+/// action-key entry claimed by a newer operation for the same action,
+/// otherwise later requests stop deduplicating onto the live operation.
+#[nativelink_test]
+async fn late_client_drop_does_not_orphan_replacement_operation() -> Result<(), Error> {
+    const NO_EVENT_ACTION_TIMEOUT: Duration = Duration::from_mins(1);
+
+    let task_change_notify = Arc::new(Notify::new());
+    let awaited_action_db = memory_awaited_action_db_factory(
+        0, // Use the default retain_completed_for_s (60s).
+        &task_change_notify,
+        MockInstantWrapped::default,
+    );
+    let action_info = make_base_action_info(make_system_time(0), DigestInfo::new([99u8; 32], 512));
+
+    // Client 1 creates operation A for the action key.
+    let client1_id = OperationId::default();
+    let subscriber1 = awaited_action_db
+        .add_action(
+            client1_id.clone(),
+            action_info.clone(),
+            NO_EVENT_ACTION_TIMEOUT,
+        )
+        .await?;
+    let mut awaited_action_a = subscriber1.borrow().await?;
+    let operation_id_a = awaited_action_a.operation_id().clone();
+
+    // Operation A finishes, releasing its action-key entry.
+    let mut completed_state = awaited_action_a.state().as_ref().clone();
+    completed_state.stage = ActionStage::Completed(ActionResult::default());
+    awaited_action_a.worker_set_state(Arc::new(completed_state), make_system_time(1));
+    awaited_action_db
+        .update_awaited_action(awaited_action_a)
+        .await?;
+
+    // Let the client 1 entry go stale past the retain window without dropping
+    // the subscriber, mimicking a client that vanished without cleanup.
+    MockClock::advance(Duration::from_mins(2));
+
+    // Client 2 requests the same action; the key is free, so a new operation B
+    // claims it. Inserting client 2 also evicts the stale client 1 entry,
+    // queueing the ClientDroppedOperation cleanup for operation A.
+    let client2_id = OperationId::default();
+    let subscriber2 = awaited_action_db
+        .add_action(
+            client2_id.clone(),
+            action_info.clone(),
+            NO_EVENT_ACTION_TIMEOUT,
+        )
+        .await?;
+    let operation_id_b = subscriber2.borrow().await?.operation_id().clone();
+    assert_ne!(operation_id_a, operation_id_b);
+
+    // Let the background event task process client 1's drop. The cleanup of
+    // finished operation A must leave operation B's action-key entry alone.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    // Client 3 requesting the same action must join operation B instead of
+    // creating a third operation.
+    let client3_id = OperationId::default();
+    let subscriber3 = awaited_action_db
+        .add_action(client3_id.clone(), action_info, NO_EVENT_ACTION_TIMEOUT)
+        .await?;
+    let operation_id_c = subscriber3.borrow().await?.operation_id().clone();
+    assert_eq!(operation_id_b, operation_id_c);
+
+    assert!(!logs_contain("out of sync"));
+    assert!(!logs_contain("should have had the unique_key"));
+
+    Ok(())
+}
+
 /// Tests #2 + #8 combined: generation fencing on worker replacement.
 ///
 /// Reserve a worker, then simulate a disconnect+reconnect (remove + add)
@@ -2831,6 +3071,8 @@ async fn reservation_generation_fence_blocks_stale_commit() -> Result<(), Error>
     let action_info = ActionInfoWithProps {
         inner: make_base_action_info(make_system_time(1), DigestInfo::new([1u8; 32], 64)),
         platform_properties: reserve_props.clone(),
+        origin_metadata: OriginMetadata::default(),
+        scheduler_start_execute_event_id: None,
     };
     let fake_op_id = OperationId::default();
     let commit_err = api
@@ -3376,6 +3618,8 @@ async fn five_point_rollback_contract_via_resource_exhausted() -> Result<(), Err
     let action_info_with_props = ActionInfoWithProps {
         inner: action_info.clone(),
         platform_properties: reserve_props.clone(),
+        origin_metadata: OriginMetadata::default(),
+        scheduler_start_execute_event_id: None,
     };
     let commit_err = api
         .commit_reservation(reservation, op_id.clone(), action_info_with_props)
@@ -3706,6 +3950,197 @@ async fn worker_reservation_drop_restores_budget_when_release_channel_full()
     Ok(())
 }
 
+/// Wraps a real `AwaitedActionDb`, but hides queued actions from
+/// `get_range_of_actions` while `suppress_queued_searches` is set. This
+/// simulates an eventually consistent backend (e.g. Redis), where a
+/// (re-)queued operation may not yet be visible to the search that its own
+/// change notification triggered.
+#[derive(MetricsComponent)]
+struct QueuedSearchSuppressingDb<A: AwaitedActionDb> {
+    inner: A,
+    suppress_queued_searches: Arc<AtomicBool>,
+}
+
+impl<A: AwaitedActionDb> AwaitedActionDb for QueuedSearchSuppressingDb<A> {
+    type Subscriber = A::Subscriber;
+
+    async fn get_awaited_action_by_id(
+        &self,
+        client_operation_id: &OperationId,
+    ) -> Result<Option<Self::Subscriber>, Error> {
+        self.inner
+            .get_awaited_action_by_id(client_operation_id)
+            .await
+    }
+
+    async fn get_all_awaited_actions(
+        &self,
+    ) -> Result<impl Stream<Item = Result<Self::Subscriber, Error>> + Send, Error> {
+        self.inner.get_all_awaited_actions().await
+    }
+
+    async fn get_by_operation_id(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<Self::Subscriber>, Error> {
+        self.inner.get_by_operation_id(operation_id).await
+    }
+
+    async fn get_range_of_actions(
+        &self,
+        state: SortedAwaitedActionState,
+        start: Bound<SortedAwaitedAction>,
+        end: Bound<SortedAwaitedAction>,
+        desc: bool,
+    ) -> Result<impl Stream<Item = Result<Self::Subscriber, Error>> + Send, Error> {
+        let items = if matches!(state, SortedAwaitedActionState::Queued)
+            && self.suppress_queued_searches.load(Ordering::Acquire)
+        {
+            Vec::new()
+        } else {
+            self.inner
+                .get_range_of_actions(state, start, end, desc)
+                .await?
+                .collect::<Vec<_>>()
+                .await
+        };
+        Ok(futures::stream::iter(items))
+    }
+
+    async fn update_awaited_action(&self, new_awaited_action: AwaitedAction) -> Result<(), Error> {
+        self.inner.update_awaited_action(new_awaited_action).await
+    }
+
+    async fn add_action(
+        &self,
+        client_operation_id: OperationId,
+        action_info: Arc<ActionInfo>,
+        no_event_action_timeout: Duration,
+    ) -> Result<Self::Subscriber, Error> {
+        self.inner
+            .add_action(client_operation_id, action_info, no_event_action_timeout)
+            .await
+    }
+}
+
+/// Common setup for the fallback match interval tests: a scheduler over a
+/// `QueuedSearchSuppressingDb` with a channel that receives a message after
+/// every completed matching pass.
+type FallbackTestSetup = (
+    Arc<SimpleScheduler>,
+    Arc<Notify>,
+    Arc<AtomicBool>,
+    mpsc::UnboundedReceiver<()>,
+);
+
+fn make_fallback_test_scheduler(fallback_match_interval_s: i64) -> FallbackTestSetup {
+    let task_change_notify = Arc::new(Notify::new());
+    let suppress_queued_searches = Arc::new(AtomicBool::new(false));
+    let (match_tx, match_rx) = mpsc::unbounded_channel();
+    // `fallback_match_interval_s` is inert in this fork — the periodic
+    // matching pass is driven by `matcher_safety_net_interval_s` instead (see
+    // `SimpleScheduler::new_with_callback`), so mirror the requested cadence
+    // onto the knob that is actually armed. A disabled fallback maps to a
+    // safety net parked far beyond any test's wait window rather than to
+    // `Some(0)`, which would silently fall back to the 10s default and rescue
+    // the action the "disabled" test asserts is never rescued.
+    let matcher_safety_net_interval_s = if fallback_match_interval_s > 0 {
+        fallback_match_interval_s.unsigned_abs()
+    } else {
+        3600
+    };
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            fallback_match_interval_s,
+            matcher_safety_net_interval_s: Some(matcher_safety_net_interval_s),
+            ..Default::default()
+        },
+        QueuedSearchSuppressingDb {
+            inner: memory_awaited_action_db_factory(
+                0,
+                &task_change_notify.clone(),
+                MockInstantWrapped::default,
+            ),
+            suppress_queued_searches: suppress_queued_searches.clone(),
+        },
+        move || {
+            let match_tx = match_tx.clone();
+            async move {
+                let _ = match_tx.send(());
+            }
+        },
+        task_change_notify.clone(),
+        MockInstantWrapped::default,
+        None,
+    );
+    (
+        scheduler,
+        task_change_notify,
+        suppress_queued_searches,
+        match_rx,
+    )
+}
+
+/// Waits until no matching pass has completed for a short while, which
+/// guarantees no notification permits are pending and no pass is in flight.
+async fn wait_for_matching_passes_to_settle(match_rx: &mut mpsc::UnboundedReceiver<()>) {
+    while tokio::time::timeout(Duration::from_millis(200), match_rx.recv())
+        .await
+        .is_ok()
+    {}
+}
+
+// Regression test for a queued operation not being visible to the matching
+// engine search that its own change notification triggered (e.g. an OOM-killed
+// worker's operation being re-queued while the Redis search index is stale).
+// The fallback match interval must rescue such an operation.
+#[nativelink_test(start_paused = true)]
+async fn fallback_match_interval_rescues_action_hidden_from_search() -> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+    let (scheduler, _task_change_notify, suppress_queued_searches, mut match_rx) =
+        make_fallback_test_scheduler(1 /* fallback_match_interval_s */);
+    let action_digest = DigestInfo::new([99u8; 32], 512);
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+
+    // Hide the action from the matching engine's queued searches, then add it.
+    suppress_queued_searches.store(true, Ordering::Release);
+    let insert_timestamp = make_system_time(1);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    wait_for_matching_passes_to_settle(&mut match_rx).await;
+
+    // All notification-triggered passes ran while the action was hidden, so
+    // nothing was assigned to the worker.
+    assert_eq!(poll!(Box::pin(rx_from_worker.recv())), Poll::Pending);
+
+    // Make the action visible again. No notification fires for this, so only
+    // the fallback match interval can rescue the action now.
+    suppress_queued_searches.store(false, Ordering::Release);
+
+    let msg_for_worker = tokio::time::timeout(Duration::from_secs(30), rx_from_worker.recv())
+        .await
+        .expect("Fallback matching pass should have assigned the action")
+        .unwrap();
+    match msg_for_worker.update {
+        Some(update_for_worker::Update::StartAction(start_execute)) => {
+            assert_eq!(
+                start_execute.execute_request.unwrap().action_digest,
+                Some(action_digest.into())
+            );
+        }
+        other => panic!("Expected StartAction, got: {other:?}"),
+    }
+
+    // Client should see the action executing.
+    let (action_state, _maybe_origin_metadata) = action_listener.changed().await.unwrap();
+    assert_eq!(action_state.stage, ActionStage::Executing);
+
+    Ok(())
+}
+
 /// Verifies the matcher safety-net interval. Without the fix, a leaked
 /// `pending_action_count` makes `can_accept_work` permanently false,
 /// `match_one` returns `Ok(false)` for every action, `do_try_match` aggregates
@@ -3820,3 +4255,163 @@ async fn matcher_safety_net_kicks_when_pending_count_leaked() -> Result<(), Erro
     Ok(())
 }
 
+// With the fallback match interval disabled, the same scenario leaves the
+// action stuck in the queued state until an unrelated event triggers another
+// matching pass. This documents the behavior the fallback interval fixes.
+#[nativelink_test(start_paused = true)]
+async fn fallback_match_interval_disabled_leaves_hidden_action_queued() -> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+    let (scheduler, task_change_notify, suppress_queued_searches, mut match_rx) =
+        make_fallback_test_scheduler(-1 /* fallback_match_interval_s */);
+    let action_digest = DigestInfo::new([99u8; 32], 512);
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+
+    // Hide the action from the matching engine's queued searches, then add it.
+    suppress_queued_searches.store(true, Ordering::Release);
+    let insert_timestamp = make_system_time(1);
+    let _action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    wait_for_matching_passes_to_settle(&mut match_rx).await;
+    suppress_queued_searches.store(false, Ordering::Release);
+
+    // Without the fallback interval nothing ever rescues the action.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), rx_from_worker.recv())
+            .await
+            .is_err(),
+        "Action should stay queued with the fallback match interval disabled"
+    );
+
+    // Only an unrelated task change event triggers another matching pass.
+    task_change_notify.notify_one();
+    let msg_for_worker = tokio::time::timeout(Duration::from_secs(5), rx_from_worker.recv())
+        .await
+        .expect("Task change notification should have assigned the action")
+        .unwrap();
+    assert!(matches!(
+        msg_for_worker.update,
+        Some(update_for_worker::Update::StartAction(_))
+    ));
+
+    Ok(())
+}
+
+/// Regression test: when the worker reports an action finished but the
+/// state-manager update fails because the operation was already completed
+/// (e.g. the client-timeout sweep marked it `DeadlineExceeded` while the
+/// worker was still executing it), the worker's platform properties must
+/// still be restored. They used to leak, permanently shrinking the worker's
+/// capacity until no action could match it.
+#[nativelink_test]
+async fn failed_final_update_does_not_leak_worker_capacity() -> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            supported_platform_properties: Some(HashMap::from([(
+                "cpu_count".to_string(),
+                PropertyType::Minimum,
+            )])),
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            // Large retain window so the stale client entry is not evicted:
+            // the operation must still exist (as finished) when the worker
+            // reports, since a missing operation is tolerated by the state
+            // manager and would not reproduce the leak.
+            100_000,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    // The worker has a single cpu slot, so one leaked slot is enough to make
+    // it unmatchable.
+    let mut rx_from_worker = setup_new_worker(
+        &scheduler,
+        worker_id.clone(),
+        PlatformProperties::new(HashMap::from([(
+            "cpu_count".to_string(),
+            PlatformPropertyValue::Minimum(1),
+        )])),
+    )
+    .await?;
+
+    let platform_properties = HashMap::from([("cpu_count".to_string(), "1".to_string())]);
+
+    // Action 1 is assigned to the worker, consuming the only slot.
+    let _action1_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([1u8; 32], 512),
+        platform_properties.clone(),
+        make_system_time(1),
+    )
+    .await?;
+    let operation_id = match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(start_execute)) => start_execute.operation_id,
+        v => panic!("Expected StartAction, got : {v:?}"),
+    };
+
+    // The client stops sending keepalives past client_action_timeout_s, then
+    // a sweep over all operations times the executing operation out, marking
+    // it Completed(DeadlineExceeded) while the worker still runs it.
+    MockClock::advance(Duration::from_mins(2));
+    drop(
+        scheduler
+            .filter_operations(OperationFilter::default())
+            .await?
+            .collect::<Vec<_>>()
+            .await,
+    );
+    assert!(logs_contain(
+        "Operation timed out having no more clients listening"
+    ));
+
+    // Action 2 queues: the worker's only slot is still held by action 1.
+    let _action2_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([2u8; 32], 512),
+        platform_properties,
+        make_system_time(2),
+    )
+    .await?;
+
+    // The worker now reports action 1 finished. The state-manager update
+    // fails ("already completed"), but the worker's slot must still be freed.
+    let update_result = scheduler
+        .update_action(
+            &worker_id,
+            &OperationId::from(operation_id),
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                ActionResult::default(),
+            )),
+        )
+        .await;
+    assert_eq!(
+        update_result
+            .expect_err("state-manager update should fail")
+            .code,
+        Code::Internal
+    );
+
+    // With the slot restored, action 2 must get matched to the worker.
+    scheduler.do_try_match_for_test().await?;
+    match rx_from_worker
+        .try_recv()
+        .expect("worker should have been sent action 2")
+        .update
+    {
+        Some(update_for_worker::Update::StartAction(_)) => {}
+        v => panic!("Expected StartAction for the second action, got : {v:?}"),
+    }
+
+    Ok(())
+}

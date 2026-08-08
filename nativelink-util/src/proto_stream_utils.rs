@@ -90,6 +90,13 @@ where
     pub fn is_first_msg_complete(&self) -> bool {
         self.first_msg.as_ref().is_some_and(|msg| msg.finish_write)
     }
+
+    fn enforce_wire_size_matches_digest_size(&self) -> bool {
+        matches!(
+            self.resource_info.compressor.as_deref(),
+            None | Some("identity")
+        )
+    }
 }
 
 impl<T, E> Stream for WriteRequestStreamWrapper<T>
@@ -103,12 +110,14 @@ where
         // If the stream said that the previous message was the last one, then
         // return a stream EOF (i.e. None).
         if self.write_finished {
-            error_if!(
-                self.bytes_received != self.resource_info.expected_size,
-                "Did not send enough data. Expected {}, but so far received {}",
-                self.resource_info.expected_size,
-                self.bytes_received
-            );
+            if self.enforce_wire_size_matches_digest_size() {
+                error_if!(
+                    self.bytes_received != self.resource_info.expected_size,
+                    "Did not send enough data. Expected {}, but so far received {}",
+                    self.resource_info.expected_size,
+                    self.bytes_received
+                );
+            }
             return Poll::Ready(None);
         }
 
@@ -134,7 +143,9 @@ where
             self.bytes_received += message.data.len();
 
             // Check that we haven't read past the expected end.
-            if self.bytes_received > self.resource_info.expected_size {
+            if self.enforce_wire_size_matches_digest_size()
+                && self.bytes_received > self.resource_info.expected_size
+            {
                 Err(make_input_err!(
                     "Sent too much data. Expected {}, but so far received {}",
                     self.resource_info.expected_size,
@@ -217,6 +228,12 @@ where
     resume_queue: [Option<WriteRequest>; 2],
     // An optimisation to avoid having to manage resume_queue when it's empty.
     is_resumed: bool,
+    // When false, a partially-consumed stream never reports `can_resume()`:
+    // uploads whose server-side protocol cannot accept a replay from a
+    // nonzero offset (REAPI compressed-blobs writes) must fail fast instead
+    // of burning retries on guaranteed-rejected resumes. A stream that has
+    // not yet been consumed can always be retried from the start.
+    resumable: bool,
 }
 
 impl<T, E> WriteState<T, E>
@@ -232,7 +249,21 @@ where
             cached_messages: [None, None],
             resume_queue: [None, None],
             is_resumed: false,
+            resumable: true,
         }
+    }
+
+    /// Marks this write as non-resumable: once the stream has been partially
+    /// consumed, `can_resume()` reports false so the caller fails fast with
+    /// the original error instead of replaying messages the server-side
+    /// protocol is guaranteed to reject. Retrying an unconsumed stream from
+    /// the start remains allowed.
+    pub const fn set_non_resumable(&mut self) {
+        self.resumable = false;
+    }
+
+    pub(crate) const fn is_resumable(&self) -> bool {
+        self.resumable
     }
 
     fn push_message(&mut self, message: WriteRequest) {
@@ -257,7 +288,8 @@ where
 
     pub const fn can_resume(&self) -> bool {
         self.read_stream_error.is_none()
-            && (self.cached_messages[0].is_some() || self.read_stream.is_first_msg())
+            && ((self.resumable && self.cached_messages[0].is_some())
+                || self.read_stream.is_first_msg())
     }
 
     pub fn resume(&mut self) {
@@ -361,8 +393,11 @@ where
                     "WriteStateWrapper::poll_next yielding",
                 );
                 // Cache the last request in case there is an error to allow
-                // the upload to be resumed.
-                local_state.push_message(message.clone());
+                // the upload to be resumed. Non-resumable writes skip the
+                // clone: cached messages would never be replayed.
+                if local_state.is_resumable() {
+                    local_state.push_message(message.clone());
+                }
                 Some(message)
             }
             Some(Err(err)) => {

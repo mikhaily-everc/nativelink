@@ -29,7 +29,7 @@ use nativelink_util::evicting_map::{EvictingMap, LenEntry};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::store_trait::{
-    RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    RemoveCallback, RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use parking_lot::Mutex;
 use tracing::{debug, info, trace};
@@ -210,6 +210,11 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
 
 #[async_trait]
 impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        self.inner_store.clone().into_inner().post_init().await?;
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -231,7 +236,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let digest = key.into_digest();
         let mut exists = [None];
         self.inner_has_with_results(&[digest], &mut exists)
@@ -240,11 +245,11 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         if exists[0].is_some() {
             // We need to drain the reader to avoid the writer complaining that we dropped
             // the connection prematurely.
-            reader
+            let size = reader
                 .drain()
                 .await
                 .err_tip(|| "In ExistenceCacheStore::update")?;
-            return Ok(());
+            return Ok(size);
         }
         {
             let mut locked_callbacks = self.pause_remove_callbacks.lock();
@@ -254,14 +259,12 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         }
         trace!(?digest, "Inserting into inner cache");
         let result = self.inner_store.update(digest, reader, size_info).await;
-        if result.is_ok() {
+        if let Ok(size) = &result {
             trace!(?digest, "Inserting into existence cache");
-            if let UploadSizeInfo::ExactSize(size) = size_info {
-                let _ = self
-                    .existence_cache
-                    .insert(digest, ExistenceItem(size))
-                    .await;
-            }
+            let _ = self
+                .existence_cache
+                .insert(digest, ExistenceItem(*size))
+                .await;
         }
         {
             let maybe_keys = self.pause_remove_callbacks.lock().take();
@@ -309,10 +312,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         self
     }
 
-    fn register_remove_callback(
-        self: Arc<Self>,
-        callback: Arc<dyn RemoveItemCallback>,
-    ) -> Result<(), Error> {
+    fn register_remove_callback(self: Arc<Self>, callback: RemoveCallback) -> Result<(), Error> {
         self.inner_store.register_remove_callback(callback)
     }
 }

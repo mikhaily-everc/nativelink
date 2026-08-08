@@ -23,7 +23,7 @@ use nativelink_metric::{
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    RemoveItemCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+    RemoveCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -47,6 +47,10 @@ impl NoopStore {
 
 #[async_trait]
 impl StoreDriver for NoopStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         _keys: &[StoreKey<'_>],
@@ -63,11 +67,11 @@ impl StoreDriver for NoopStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // We need to drain the reader to avoid the writer complaining that we dropped
         // the connection prematurely.
-        reader.drain().await.err_tip(|| "In NoopStore::update")?;
-        Ok(())
+        let size = reader.drain().await.err_tip(|| "In NoopStore::update")?;
+        Ok(size)
     }
 
     fn optimized_for(&self, optimization: StoreOptimizations) -> bool {
@@ -97,10 +101,7 @@ impl StoreDriver for NoopStore {
         self
     }
 
-    fn register_remove_callback(
-        self: Arc<Self>,
-        _callback: Arc<dyn RemoveItemCallback>,
-    ) -> Result<(), Error> {
+    fn register_remove_callback(self: Arc<Self>, _callback: RemoveCallback) -> Result<(), Error> {
         // does nothing, so drop
         Ok(())
     }
