@@ -402,7 +402,12 @@ async fn test_multiple_clients_subscribe_to_same_action() -> Result<(), Error> {
     // The worker goes away without completing the task, so the action goes back
     // to queued.
     drop(rx_from_worker);
-    scheduler.remove_worker(&worker_id, make_err!(Code::Unavailable, "test: worker removed")).await?;
+    scheduler
+        .remove_worker(
+            &worker_id,
+            make_err!(Code::Unavailable, "test: worker removed"),
+        )
+        .await?;
 
     let (state, _metadata) = subscription1
         .changed()
@@ -417,7 +422,12 @@ async fn test_multiple_clients_subscribe_to_same_action() -> Result<(), Error> {
             setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
         scheduler.do_try_match_for_test().await?;
         drop(rx_from_worker);
-        scheduler.remove_worker(&worker_id, make_err!(Code::Unavailable, "test: worker removed")).await?;
+        scheduler
+            .remove_worker(
+                &worker_id,
+                make_err!(Code::Unavailable, "test: worker removed"),
+            )
+            .await?;
     }
 
     // Update the operation ID for the new subscription.

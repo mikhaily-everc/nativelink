@@ -26,7 +26,7 @@ use nativelink_config::stores::{
 use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_redis_tester::{
-    ReadOnlyRedis, SubscriptionManagerNotify, add_lua_script, add_to_response,
+    ReadOnlyRedis, SubscriptionManagerNotify, add_lua_script, add_to_response, add_to_response_raw,
     fake_redis_sentinel_master_stream, fake_redis_sentinel_stream, fake_redis_stream,
     make_fake_redis_with_responses,
 };
@@ -2338,19 +2338,43 @@ async fn callback_for_eviction_core<F>(
 where
     F: Fn(&str) -> bool,
 {
+    callback_for_eviction_core_impl(logs_contain, Some(notify_keyspace_events)).await
+}
+
+/// `notify_keyspace_events == None` makes the fake server reject `CONFIG` the
+/// way managed Redis/Valkey does (AWS ElastiCache, MemoryDB), rather than
+/// answering it.
+async fn callback_for_eviction_core_impl<F>(
+    logs_contain: F,
+    notify_keyspace_events: Option<&[u8]>,
+) -> Result<(), Error>
+where
+    F: Fn(&str) -> bool,
+{
     let redis_span = info_span!("redis");
 
     let mut responses = add_lua_version_script(fake_redis_stream());
-    add_to_response(
-        &mut responses,
-        redis::cmd("CONFIG")
-            .arg("GET")
-            .arg("notify-keyspace-events"),
-        vec![Value::Map(vec![(
-            Value::BulkString(b"notify-keyspace-events".into()),
-            Value::BulkString(notify_keyspace_events.into()),
-        )])],
-    );
+    match notify_keyspace_events {
+        Some(events) => add_to_response(
+            &mut responses,
+            redis::cmd("CONFIG")
+                .arg("GET")
+                .arg("notify-keyspace-events"),
+            vec![Value::Map(vec![(
+                Value::BulkString(b"notify-keyspace-events".into()),
+                Value::BulkString(events.into()),
+            )])],
+        ),
+        None => add_to_response_raw(
+            &mut responses,
+            redis::cmd("CONFIG")
+                .arg("GET")
+                .arg("notify-keyspace-events"),
+            "-ERR unknown command 'config', with args beginning with: 'GET' \
+             'notify-keyspace-events' \r\n"
+                .to_string(),
+        ),
+    }
     add_to_response(
         &mut responses,
         redis::cmd("PSUBSCRIBE").arg("__key*__:*"),
@@ -2405,8 +2429,34 @@ async fn callback_for_eviction_no_keyspace() -> Result<(), Error> {
 async fn callback_for_eviction_no_all() -> Result<(), Error> {
     callback_for_eviction_core(logs_contain, b"K").await?;
     assert!(logs_contain(
-        "notify-keyspace-events does not contain 'A' so we won't get eviction events notify_keyspace_events=\"K\""
+        "notify-keyspace-events contains neither 'A' nor 'e' so we won't get eviction events notify_keyspace_events=\"K\""
     ));
+    Ok(())
+}
+
+/// `Ke` is the minimal correct setting - `e` is the eviction class, and it is
+/// the only class this subscriber reads - so it must not be reported as broken.
+/// This is what the RBE ElastiCache parameter group is set to; before 'e' was
+/// accepted alongside 'A' it logged a permanent ERROR against a config that
+/// works.
+#[nativelink_test]
+async fn callback_for_eviction_evict_class_only() -> Result<(), Error> {
+    callback_for_eviction_core(logs_contain, b"Ke").await?;
+    assert!(!logs_contain("ERROR"));
+    Ok(())
+}
+
+/// Managed Redis/Valkey disables `CONFIG` outright, so the probe fails. It is
+/// advisory - every branch above only logs - so failing it must NOT skip the
+/// psubscribe, or eviction callbacks are silently dead on exactly the
+/// deployments that need them and `ExistenceCacheStore` keeps advertising
+/// digests the backing store has already evicted.
+#[nativelink_test]
+async fn callback_for_eviction_subscribes_when_config_is_unavailable() -> Result<(), Error> {
+    // The core helper only returns once the psubscribe has completed, so
+    // reaching this point is the assertion that matters.
+    callback_for_eviction_core_impl(logs_contain, None).await?;
+    assert!(logs_contain("Could not read notify-keyspace-events"));
     Ok(())
 }
 

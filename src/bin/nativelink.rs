@@ -40,7 +40,6 @@ use nativelink_scheduler::default_scheduler_factory::scheduler_factory;
 use nativelink_service::ac_server::AcServer;
 use nativelink_service::bep_server::BepServer;
 use nativelink_service::bep_subscription_server::BepSubscriptionService;
-use tower_http::cors::{AllowHeaders, AllowMethods, CorsLayer};
 use nativelink_service::bytestream_server::ByteStreamServer;
 use nativelink_service::capabilities_server::CapabilitiesServer;
 use nativelink_service::cas_server::CasServer;
@@ -82,6 +81,7 @@ use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig as TlsServerConfig};
 use tonic::codec::CompressionEncoding;
 use tonic::service::Routes;
+use tower_http::cors::{AllowHeaders, AllowMethods, CorsLayer};
 use tracing::{error, error_span, info, trace_span, warn};
 
 #[global_allocator]
@@ -400,14 +400,14 @@ async fn inner_main(
                     .transpose()
                     .err_tip(|| "Could not create BEP service")?;
                 if let Some(ref bep) = bep_server {
-                    let sub = BepSubscriptionService::new(
-                        bep.sender(),
-                        bep.index(),
-                        bep.store(),
-                    );
+                    let sub = BepSubscriptionService::new(bep.sender(), bep.index(), bep.store());
                     let sub_svc = service_setup!(sub.into_service(), http_config);
                     let grpc_web_layer = tonic_web::GrpcWebLayer::new();
-                    bep_subscription_svc = Some(tower::ServiceBuilder::new().layer(grpc_web_layer).service(sub_svc));
+                    bep_subscription_svc = Some(
+                        tower::ServiceBuilder::new()
+                            .layer(grpc_web_layer)
+                            .service(sub_svc),
+                    );
 
                     // Bridge scheduler operation state into this BEP pipeline so
                     // WatchBuild can overlay remote-execution data per build.
@@ -418,9 +418,7 @@ async fn inner_main(
                     scheduler_event_bridges.push(SchedulerEventBridge::new(
                         action_schedulers
                             .values()
-                            .map(|scheduler| {
-                                Arc::clone(scheduler) as Arc<dyn ClientStateManager>
-                            })
+                            .map(|scheduler| Arc::clone(scheduler) as Arc<dyn ClientStateManager>)
                             .collect(),
                         bep.store(),
                         bep.index(),
@@ -442,13 +440,11 @@ async fn inner_main(
                 "grpc-status".parse().unwrap(),
                 "grpc-message".parse().unwrap(),
             ]);
-        let mut svc =
-            tonic_services
-                .into_axum_router()
-                .layer(cors)
-                .layer(nativelink_util::telemetry::OtlpLayer::new(
-                    server_cfg.experimental_identity_header.required,
-                ));
+        let mut svc = tonic_services.into_axum_router().layer(cors).layer(
+            nativelink_util::telemetry::OtlpLayer::new(
+                server_cfg.experimental_identity_header.required,
+            ),
+        );
 
         if let Some(health_cfg) = services.health {
             let path = if health_cfg.path.is_empty() {

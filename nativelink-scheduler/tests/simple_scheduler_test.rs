@@ -690,7 +690,14 @@ async fn remove_worker_reschedules_multiple_running_job_test() -> Result<(), Err
     }
 
     // Now remove worker.
-    drop(scheduler.remove_worker(&worker_id1, make_err!(Code::Unavailable, "test: worker removed")).await);
+    drop(
+        scheduler
+            .remove_worker(
+                &worker_id1,
+                make_err!(Code::Unavailable, "test: worker removed"),
+            )
+            .await,
+    );
     tokio::task::yield_now().await; // Allow task<->worker matcher to run.
 
     {
@@ -3083,7 +3090,12 @@ async fn reservation_generation_fence_blocks_stale_commit() -> Result<(), Error>
     // Simulate a reconnect: remove the worker, then add a fresh one under
     // the same WorkerId. `LruCache::put` replaces, so the pool's
     // generation for this WorkerId is bumped.
-    scheduler.remove_worker(&worker_id, make_err!(Code::Unavailable, "test: worker removed")).await?;
+    scheduler
+        .remove_worker(
+            &worker_id,
+            make_err!(Code::Unavailable, "test: worker removed"),
+        )
+        .await?;
     let _rx_second = setup_new_worker(&scheduler, worker_id.clone(), worker_props).await?;
 
     let metrics = api.get_metrics().clone();
@@ -3467,7 +3479,10 @@ async fn concurrent_matcher_throughput_smoke() -> Result<(), Error> {
             ref other => panic!("unexpected stage {other:?}"),
         }
     }
-    assert_eq!(executing, 64, "all 64 actions must dispatch to the capacity-64 worker");
+    assert_eq!(
+        executing, 64,
+        "all 64 actions must dispatch to the capacity-64 worker"
+    );
     assert_eq!(queued, 0);
 
     // Accounting identity: every reservation created must be accounted for
@@ -3596,7 +3611,11 @@ async fn five_point_rollback_contract_via_resource_exhausted() -> Result<(), Err
     // running_action_infos, restores the worker's budget, and returns the
     // op to Queued without bumping attempts.
     scheduler
-        .update_action(&worker_id, &op_id, UpdateOperationType::UpdateWithDisconnect)
+        .update_action(
+            &worker_id,
+            &op_id,
+            UpdateOperationType::UpdateWithDisconnect,
+        )
         .await?;
     // Drain the Queued transition from the listener.
     loop {
@@ -3639,7 +3658,12 @@ async fn five_point_rollback_contract_via_resource_exhausted() -> Result<(), Err
 
     // Step 3: simulate generation mismatch by removing + re-adding the
     // worker under the same WorkerId.
-    scheduler.remove_worker(&worker_id, make_err!(Code::Unavailable, "test: worker removed")).await?;
+    scheduler
+        .remove_worker(
+            &worker_id,
+            make_err!(Code::Unavailable, "test: worker removed"),
+        )
+        .await?;
     let _rx2 = setup_new_worker(&scheduler, worker_id.clone(), worker_props).await?;
 
     // Step 4: attempt commit. Must fail with Aborted on generation fence.
@@ -3887,8 +3911,7 @@ async fn max_concurrent_matches_default_when_unset_or_zero() -> Result<(), Error
 /// channel-full fallback path. After yielding, both the releaser and the
 /// fallback tasks restore their respective budgets.
 #[nativelink_test]
-async fn worker_reservation_drop_restores_budget_when_release_channel_full()
--> Result<(), Error> {
+async fn worker_reservation_drop_restores_budget_when_release_channel_full() -> Result<(), Error> {
     const NUM_RESERVATIONS: usize = 260; // > RELEASE_CHANNEL_CAPACITY (256).
 
     let worker_id = WorkerId("worker-leak-fix".to_string());
@@ -3905,12 +3928,8 @@ async fn worker_reservation_drop_restores_budget_when_release_channel_full()
         MockInstantWrapped::default,
         None,
     );
-    let _rx = setup_new_worker(
-        &scheduler,
-        worker_id.clone(),
-        PlatformProperties::default(),
-    )
-    .await?;
+    let _rx =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
 
     let workers = scheduler.worker_scheduler().clone();
     assert_eq!(
@@ -4201,12 +4220,8 @@ async fn matcher_safety_net_kicks_when_pending_count_leaked() -> Result<(), Erro
         MockInstantWrapped::default,
         None,
     );
-    let mut rx = setup_new_worker(
-        &scheduler,
-        worker_id.clone(),
-        PlatformProperties::default(),
-    )
-    .await?;
+    let mut rx =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
 
     let workers = scheduler.worker_scheduler().clone();
 

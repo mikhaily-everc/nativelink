@@ -68,9 +68,9 @@ mod tests {
     use nativelink_util::common::{DigestInfo, fs, make_temp_path};
     use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
     use nativelink_util::store_trait::{Store, StoreLike};
+    use nativelink_worker::directory_cache::{DirectoryCache, DirectoryCacheConfig};
     #[cfg(target_os = "linux")]
     use nativelink_worker::namespace_utils;
-    use nativelink_worker::directory_cache::{DirectoryCache, DirectoryCacheConfig};
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
         RunningActionsManagerArgs, RunningActionsManagerImpl, download_to_directory,

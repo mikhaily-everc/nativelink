@@ -313,8 +313,7 @@ async fn single_shot_upload_honors_configured_deadline() -> Result<(), Error> {
 
     // capture_request never completes the PUT (the body is never fully sent),
     // so the upload future stays pending until the deadline fires.
-    let (mock_client, _request_receiver) =
-        aws_smithy_http_client::test_util::capture_request(None);
+    let (mock_client, _request_receiver) = aws_smithy_http_client::test_util::capture_request(None);
     let test_config = Builder::new()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(REGION))

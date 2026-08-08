@@ -473,7 +473,9 @@ where
     /// indexes created by this store. See
     /// [`RedisSpec::experimental_index_ttl_s`]. Ignored when
     /// [`Self::search_backend`] is `ValkeySearch`, which has no `TEMPORARY`.
-    #[metric(help = "TTL (seconds) applied to scheduler RediSearch indexes via FT.CREATE TEMPORARY")]
+    #[metric(
+        help = "TTL (seconds) applied to scheduler RediSearch indexes via FT.CREATE TEMPORARY"
+    )]
     index_ttl_s: u64,
 
     /// Which `FT.*` dialect to emit. See [`RedisSearchBackend`].
@@ -637,19 +639,16 @@ where
         const REDIS_PERMIT_DEADLINE: Duration = Duration::from_secs(10);
         let local_client_permits = self.client_permits.clone();
         let remaining = local_client_permits.available_permits();
-        let semaphore_permit = timeout(
-            REDIS_PERMIT_DEADLINE,
-            local_client_permits.acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            make_err!(
-                Code::DeadlineExceeded,
-                "redis client_permits acquire exceeded {}s ({} permits available at entry)",
-                REDIS_PERMIT_DEADLINE.as_secs(),
-                remaining,
-            )
-        })??;
+        let semaphore_permit = timeout(REDIS_PERMIT_DEADLINE, local_client_permits.acquire_owned())
+            .await
+            .map_err(|_| {
+                make_err!(
+                    Code::DeadlineExceeded,
+                    "redis client_permits acquire exceeded {}s ({} permits available at entry)",
+                    REDIS_PERMIT_DEADLINE.as_secs(),
+                    remaining,
+                )
+            })??;
         trace!(remaining, "Got a client permit");
         let (connection_manager, uuid) = self.connection_manager.get_connection().await?;
         Ok(ClientWithPermit {
@@ -946,9 +945,7 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
             subscriber_channel,
             StandardRedisManager::new(
                 Box::new(move || Box::pin(Self::connect(spec.clone(), tx.clone()))),
-                Box::new(move || {
-                    Box::pin(Self::connect(search_spec.clone(), search_tx.clone()))
-                }),
+                Box::new(move || Box::pin(Self::connect(search_spec.clone(), search_tx.clone()))),
             )
             .await?,
         )
@@ -1483,24 +1480,48 @@ where
             self.remove_callbacks.lock().await.push(callback);
             if let Err(err) = local_self.clone().has_remove_callback_subscribe
                 .get_or_try_init(|| async move {
-                    let mut client = local_self.get_client().await?;
-                    let cfg = redis::cmd("CONFIG").arg("GET").arg("notify-keyspace-events").to_owned().query_async::<Vec<(String,String)>>(&mut client.connection_manager).await.map_err(|e| Error::from(e).append("Parsing notify-keyspace-events"))?;
-                    if cfg.len() != 1 {
-                        warn!(?cfg, "Got multiple items for CONFIG GET, expected one");
-                        return Err(make_input_err!("Got multiple items for CONFIG GET, expected one"));
-                    }
-                    let events_cfg = &cfg.first().ok_or_else(|| make_err!(Code::InvalidArgument, "Only one item"))?.1;
-                    if events_cfg.is_empty() {
-                        error!("notify-keyspace-events not enabled for Redis, will fail to get remove callbacks");
-                    } else if !events_cfg.contains('K') {
-                        error!(notify_keyspace_events=events_cfg, "notify-keyspace-events does not contain 'K' so won't get keyspace events we need for eviction events");
-                    } else if !events_cfg.contains('A') {
-                        error!(notify_keyspace_events=events_cfg, "notify-keyspace-events does not contain 'A' so we won't get eviction events");
+                    // `CONFIG GET` is purely advisory here: every branch below only
+                    // logs, and per the FIXME further down we psubscribe regardless of
+                    // what it reports. So its failure must not be fatal — managed
+                    // Redis/Valkey (AWS ElastiCache, MemoryDB) disables `CONFIG`
+                    // outright (`ERR unknown command 'config'`), and propagating that
+                    // skipped the psubscribe below on exactly the deployments that
+                    // need eviction callbacks most: without them `ExistenceCacheStore`
+                    // keeps advertising digests the backing store has already evicted,
+                    // and clients get "not found in either fast or slow store" for a
+                    // blob the CAS just told them it had.
+                    //
+                    // Where `CONFIG` is unavailable, configure the events server-side
+                    // instead — on ElastiCache that is the `notify-keyspace-events`
+                    // parameter-group entry, which needs `K` plus the `e` class.
+                    let probe = async {
+                        let mut client = local_self.get_client().await?;
+                        let cfg = redis::cmd("CONFIG").arg("GET").arg("notify-keyspace-events").to_owned().query_async::<Vec<(String,String)>>(&mut client.connection_manager).await.map_err(|e| Error::from(e).append("Parsing notify-keyspace-events"))?;
+                        if cfg.len() != 1 {
+                            return Err(make_input_err!("Got {} items for CONFIG GET, expected one", cfg.len()));
+                        }
+                        Ok::<String, Error>(cfg.into_iter().next().ok_or_else(|| make_err!(Code::InvalidArgument, "Only one item"))?.1)
+                    };
+                    let events_cfg = match probe.await {
+                        Ok(cfg) => Some(cfg),
+                        Err(err) => {
+                            warn!(?err, "Could not read notify-keyspace-events (managed Redis/Valkey restricts CONFIG); subscribing to eviction events anyway");
+                            None
+                        }
+                    };
+                    match events_cfg.as_deref() {
+                        Some("") => error!("notify-keyspace-events not enabled for Redis, will fail to get remove callbacks"),
+                        Some(cfg) if !cfg.contains('K') => error!(notify_keyspace_events=cfg, "notify-keyspace-events does not contain 'K' so won't get keyspace events we need for eviction events"),
+                        // 'A' is redis' alias for the whole class set; 'e' is the
+                        // eviction class on its own and is all this subscriber needs,
+                        // so accept either rather than demanding the firehose.
+                        Some(cfg) if !cfg.contains('A') && !cfg.contains('e') => error!(notify_keyspace_events=cfg, "notify-keyspace-events contains neither 'A' nor 'e' so we won't get eviction events"),
+                        Some(_) | None => {}
                     }
                     // FIXME: Redis events spec appears unreliable, so we subscribe anyways
                     // It should just need Ke as per https://redis.io/docs/latest/develop/pubsub/keyspace-notifications/
                     // but I'm yet to get reliable eviction events out of that
-                    info!(notify_keyspace_events=events_cfg, "Attempting to subscribe to eviction events");
+                    info!(?events_cfg, "Attempting to subscribe to eviction events");
                     self.connection_manager.psubscribe("__key*__:*").await?;
                     Ok::<(), Error>(())
                  })
@@ -2317,10 +2338,9 @@ where
                 },
                 FtAggregateOptions {
                     load: match self.search_backend {
-                        RedisSearchBackend::Redisearch => FtLoad::Named(vec![
-                            DATA_FIELD_NAME.into(),
-                            VERSION_FIELD_NAME.into(),
-                        ]),
+                        RedisSearchBackend::Redisearch => {
+                            FtLoad::Named(vec![DATA_FIELD_NAME.into(), VERSION_FIELD_NAME.into()])
+                        }
                         // See `FtLoad::All` — naming a non-indexed field is an
                         // error on valkey-search, and the payload is not indexed.
                         RedisSearchBackend::ValkeySearch => FtLoad::All,

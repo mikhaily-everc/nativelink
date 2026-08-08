@@ -1964,8 +1964,8 @@ async fn write_too_many_bytes_fails() -> Result<(), Box<dyn core::error::Error>>
 /// the wrong store offset, leaving the head missing and only failing later at
 /// hash verification after the whole upload was wasted.
 #[nativelink_test]
-pub async fn write_offset_gap_after_partial_is_rejected()
--> Result<(), Box<dyn core::error::Error>> {
+pub async fn write_offset_gap_after_partial_is_rejected() -> Result<(), Box<dyn core::error::Error>>
+{
     const WRITE_DATA: &str = "12456789abcdefghijk";
 
     let store_manager = make_store_manager().await?;

@@ -692,7 +692,9 @@ async fn rebuild_index_from_store_test() -> Result<(), Box<dyn core::error::Erro
         };
         store
             .update_oneshot(
-                StoreKey::Str(Cow::Owned(format!("BepIndex:meta:{build_id}:{invocation_id}"))),
+                StoreKey::Str(Cow::Owned(format!(
+                    "BepIndex:meta:{build_id}:{invocation_id}"
+                ))),
                 info.encode_to_vec().into(),
             )
             .await?;

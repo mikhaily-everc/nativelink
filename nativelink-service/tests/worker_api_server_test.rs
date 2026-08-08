@@ -387,7 +387,10 @@ pub async fn going_away_removes_worker_test() -> Result<(), Box<dyn core::error:
 
     test_context
         .scheduler
-        .remove_worker(&test_context.worker_id, make_err!(Code::Unavailable, "test: worker removed"))
+        .remove_worker(
+            &test_context.worker_id,
+            make_err!(Code::Unavailable, "test: worker removed"),
+        )
         .await
         .unwrap();
 
