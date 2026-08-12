@@ -202,11 +202,9 @@ jobs:
       actions: read # read the workflow run to build provenance
       id-token: write # keyless signing of the provenance
       contents: write # attach provenance to the release
-    # The SLSA generator MUST be referenced by an immutable semver tag, not a
-    # commit SHA: slsa-verifier validates the reusable-workflow ref to confirm a
-    # trusted builder produced the provenance, so a SHA pin would fail
-    # verification. This is the one intentional exception to SHA-pinning here.
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    # Hash-pinned per org supply-chain policy; keep the trailing semver comment
+    # so Renovate and humans can still see the upstream SLSA generator version.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
     with:
       base64-subjects: ${{ needs.combine-hashes.outputs.subjects }}
       upload-assets: true

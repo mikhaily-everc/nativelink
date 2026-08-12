@@ -1,0 +1,155 @@
+# zizmor configuration — GitHub Actions supply-chain pinning policy.
+# See https://docs.zizmor.sh/configuration/
+#
+# CANONICAL COPY. This file is the org-wide template: it is copied verbatim to
+# `.github/zizmor.yml` in every repo covered by the pinning policy (all mlrc and
+# merchantview repos, plus every repo we admin). Edit it HERE and re-propagate;
+# do not fork per-repo variants.
+#
+# WHY THIS EXISTS, AND WHY IT IS NOT actionlint
+# ---------------------------------------------
+# actionlint (//tools/lint:actionlint) checks workflow *syntax and typing*. It has no
+# SHA-pinning rule and no custom-rule mechanism — its entire config surface is
+# `self-hosted-runner`, `config-variables` and `paths.<glob>.ignore` regexes, and its
+# "Action format in `uses:`" check validates the *shape* of a `uses:` clause, not what it
+# resolves to. So supply-chain pinning cannot be expressed there, and zizmor runs
+# alongside it rather than replacing it. The two are complementary: actionlint = "is this
+# workflow correct", zizmor = "is this workflow safe to run".
+#
+# SCOPING: this repo runs zizmor ONLY for `unpinned-uses`
+# ------------------------------------------------------
+# zizmor ships 40 audits. Run unscoped against our workflows they produce a large backlog
+# of unrelated findings (template-injection, excessive-permissions, github-app, ...) that
+# would make the check unlandable and train everyone to ignore it. zizmor has no
+# audit-selection CLI flag, so the only way to scope it is `rules.<id>.disable`, spelled
+# out audit-by-audit below.
+#
+# Those other audits are NOT judgements that the findings are wrong — several are real and
+# worth fixing. They are out of scope for the pinning rollout and should be enabled
+# deliberately, one at a time, each with its own backlog. Deleting a `disable: true` line
+# is how you opt this repo into another audit.
+
+rules:
+  # ---------------------------------------------------------------------------------
+  # THE RULE THIS CONFIG EXISTS FOR.
+  #
+  # A `uses:` clause pinned to a tag or branch is mutable: upstream can force-push over
+  # the tag and change what runs, with our runner's token and secrets. See the
+  # tj-actions/changed-files compromise (March 2025) — an action we use.
+  #
+  # `hash-pin` requires a full-length (40 hex) commit SHA. `ref-pin` accepts a tag or
+  # branch. Most specific pattern wins, regardless of ordering. Anything unmatched gets an
+  # implicit `hash-pin`; the explicit `"*"` below states that rather than leaving it to a
+  # default that could change between zizmor versions.
+  #
+  # Keep the trailing `# vX.Y.Z` comment when pinning — Renovate reads it to bump the
+  # digest, and humans read it to know what the SHA actually is.
+  # ---------------------------------------------------------------------------------
+  unpinned-uses:
+    config:
+      policies:
+        # GitHub-owned. Trusted: tag refs acceptable.
+        actions/*: ref-pin
+        github/*: ref-pin
+
+        # Major-vendor-owned. Trusted by policy decision — same risk class as GitHub's
+        # own, and these publish stable major-version tags we want to keep floating.
+        aws-actions/*: ref-pin
+        docker/*: ref-pin
+        gradle/*: ref-pin
+        azure/*: ref-pin
+
+        # First-party. DELIBERATELY NOT hash-pinned. The mlrc-infra reusable-workflow
+        # templates (java-pr-pipeline-template.yml, lint-workflows.yml, ...) are consumed
+        # at @develop by ~30 repos precisely so a template fix propagates without 30 PRs.
+        # Hash-pinning these would trade a supply-chain risk we already control (we own
+        # the org) for a change-management cost we cannot absorb.
+        evercompliant/*: ref-pin
+
+        # Everything else is untrusted third party.
+        "*": hash-pin
+
+  # ---------------------------------------------------------------------------------
+  # Out of scope for the pinning rollout — see "SCOPING" above. Each of these is a real
+  # audit that we may enable later; none is disabled because it is wrong.
+  # ---------------------------------------------------------------------------------
+  adhoc-packages:
+    disable: true
+  anonymous-definition:
+    disable: true
+  archived-uses:
+    disable: true
+  artipacked:
+    disable: true
+  bot-conditions:
+    disable: true
+  cache-poisoning:
+    disable: true
+  concurrency-limits:
+    disable: true
+  dangerous-triggers:
+    disable: true
+  dependabot-cooldown:
+    disable: true
+  dependabot-execution:
+    disable: true
+  excessive-permissions:
+    disable: true
+  forbidden-uses:
+    disable: true
+  github-app:
+    disable: true
+  github-env:
+    disable: true
+  hardcoded-container-credentials:
+    disable: true
+  impostor-commit:
+    disable: true
+  insecure-commands:
+    disable: true
+  insecure-url-scheme:
+    disable: true
+  known-vulnerable-actions:
+    disable: true
+  misfeature:
+    disable: true
+  obfuscation:
+    disable: true
+  overprovisioned-secrets:
+    disable: true
+  ref-confusion:
+    disable: true
+  ref-version-mismatch:
+    disable: true
+  secrets-inherit:
+    disable: true
+  secrets-outside-env:
+    disable: true
+  self-hosted-runner:
+    disable: true
+  self-repository:
+    disable: true
+  stale-action-refs:
+    disable: true
+  superfluous-actions:
+    disable: true
+  template-injection:
+    disable: true
+  typosquat-uses:
+    disable: true
+  undocumented-permissions:
+    disable: true
+  unpinned-images:
+    disable: true
+  unpinned-tools:
+    disable: true
+  unredacted-secrets:
+    disable: true
+  unsound-condition:
+    disable: true
+  unsound-contains:
+    disable: true
+  unsound-ternary:
+    disable: true
+  use-trusted-publishing:
+    disable: true
