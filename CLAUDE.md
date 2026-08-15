@@ -34,16 +34,9 @@ All three images are built via Bazel for `linux/amd64`. The nativelink binary is
 
 ### Build, Push & Deploy
 
-One-shot deploy — `//tools/rbe/k8s:nativelink.apply` (rules_gitops) depends on
-the three OCI push targets, so building, pushing to ECR, injecting fresh
-digests, and `kubectl apply` all happen in a single invocation:
-
-```bash
-aspect rbe
-```
-
-Do NOT run `aspect run //tools/rbe/oci:push_all` or `aspect build` on the
-images first — that's redundant work the apply target already performs.
+Merge image changes to `main`. `publish-tooling-images.yml` is the sole release
+entry point: it publishes immutable tags, then Kargo and Argo CD promote and
+reconcile NativeLink. There is no laptop-driven deploy command.
 
 The underlying targets (for reference / debugging only):
 
