@@ -4,6 +4,19 @@ Fork of [TraceMachina/nativelink](https://github.com/TraceMachina/nativelink) wi
 
 ## Current Patches
 
+- **Dead upload sessions are never resumed** (`nativelink-service/src/bytestream_server.rs`,
+  `nativelink-util/src/buf_channel.rs`): an upload whose write half is closed is no longer
+  parked in `active_uploads` as a resumable `IdleStream`, and `QueryWriteStatus` never
+  answers `committed_size == expected_size` with `complete: false`. Upstream (v1.6.5) does
+  both, and together they broke every large-blob upload the client had to retry: the resumed
+  session answers `INTERNAL: Tried to send while stream is closed`, and the unactionable
+  status pair drives Bazel 9.2.0's `ByteStreamUploader` into `Chunker.seek(size)` on an
+  already-drained `Chunker` — an NPE inside the gRPC `onReady` callback, reported as
+  `CANCELLED: Failed to call onReady`. When the RPC is merely cancelled after EOF, the
+  retained `store.update` is now finished by a detached task so the bytes still land and the
+  client's retry short-circuits through `ALREADY_EXISTS`. Regressions:
+  `retry_after_a_store_failure_past_eof_starts_a_clean_session` and
+  `query_write_status_never_claims_a_full_but_incomplete_write`.
 - **ByteStream Write resume fix**: Accept data from offset 0 on UUID collision
 - **Directory cache fix**: Skip work dir pre-creation when directory cache is enabled to prevent hardlink failures
 - **REAPI SplitBlob/SpliceBlob**: Implements the `ContentAddressableStorage.SplitBlob`/`SpliceBlob`

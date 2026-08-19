@@ -50,7 +50,7 @@ use nativelink_util::digest_hasher::{
 };
 use nativelink_util::proto_stream_utils::WriteRequestStreamWrapper;
 use nativelink_util::resource_info::ResourceInfo;
-use nativelink_util::spawn;
+use nativelink_util::{background_spawn, spawn};
 use nativelink_util::store_trait::{Store, StoreLike, StoreOptimizations, UploadSizeInfo};
 use nativelink_util::task::JoinHandleDropGuard;
 use opentelemetry::context::FutureExt;
@@ -101,6 +101,14 @@ pub struct ByteStreamMetrics {
     pub resumed_uploads: AtomicU64,
     /// Number of idle streams that timed out
     pub idle_stream_timeouts: AtomicU64,
+    /// Number of sessions whose client stream finished (EOF sent) but whose RPC did not,
+    /// so the retained store update was detached and driven to completion in the
+    /// background instead of being parked for a resume that can never arrive.
+    pub detached_store_updates: AtomicU64,
+    /// Number of sessions discarded outright because the RPC failed after the write half
+    /// had already closed. These are NOT resumable, and parking them was the bug behind
+    /// `Tried to send while stream is closed`.
+    pub discarded_finished_sessions: AtomicU64,
 }
 
 impl MetricsComponent for ByteStreamMetrics {
@@ -200,6 +208,18 @@ impl MetricsComponent for ByteStreamMetrics {
             &self.idle_stream_timeouts,
             MetricKind::Counter,
             "Number of idle streams that timed out"
+        );
+        publish!(
+            "detached_store_updates",
+            &self.detached_store_updates,
+            MetricKind::Counter,
+            "Store updates finished in the background after the client's RPC ended"
+        );
+        publish!(
+            "discarded_finished_sessions",
+            &self.discarded_finished_sessions,
+            MetricKind::Counter,
+            "Upload sessions discarded because their write half was already closed"
         );
 
         Ok(MetricPublishKnownKindData::Component)
@@ -428,6 +448,46 @@ impl ActiveStreamGuard {
         // Decrement active uploads counter on successful completion
         self.metrics.active_uploads.fetch_sub(1, Ordering::Relaxed);
     }
+
+    /// Whether this session's write half is closed, i.e. whether the client can still
+    /// push another byte into it.
+    ///
+    /// A session in that state IS NOT RESUMABLE and must never be parked as an
+    /// `IdleStream`: `create_or_join_upload_stream`'s Case 2 hands the resumed
+    /// `DropCloserWriteHalf` straight to `process_client_stream`, whose first `tx.send`
+    /// then fails with `Internal: Tried to send while stream is closed`.
+    ///
+    /// THE HARM IS NOT THAT THE CLIENT CANNOT RETRY — it is that retrying cannot help.
+    /// Bazel classifies INTERNAL as a transient failure
+    /// (`RemoteRetrier.EXPERIMENTAL_GRPC_RESULT_CLASSIFIER`), so a one-off store hiccup
+    /// should be absorbed. It is not, because the retry reuses the SAME upload UUID
+    /// (`ByteStreamUploader` mints one per blob in `startAsyncUpload`, not per attempt),
+    /// the dead session is retained for `persist_stream_on_disconnect_timeout`, and the
+    /// retry is immediate — so it lands on the same corpse and fails identically. Under
+    /// `--remote_retries=1` the budget is then spent. A transient store failure becomes a
+    /// deterministic build failure. Observed against Bazel 9.2.0 on 2026-08-13
+    /// (evercompliant/ai-utils GHA run 31711356666).
+    fn write_half_closed(&self) -> bool {
+        self.stream_state
+            .as_ref()
+            .is_some_and(|state| state.tx.is_pipe_broken())
+    }
+
+    /// Consumes the guard and forgets the session entirely, without parking it for a
+    /// resume and without touching the retained store future.
+    ///
+    /// For the failure path where the store update has ALREADY resolved (so re-polling it
+    /// would panic) but the write half is closed, so there is nothing to resume either.
+    fn discard(mut self) {
+        let Some(stream_state) = self.stream_state.take() else {
+            return;
+        };
+        self.active_uploads.lock().remove(&stream_state.uuid);
+        self.metrics.active_uploads.fetch_sub(1, Ordering::Relaxed);
+        self.metrics
+            .discarded_finished_sessions
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl Drop for ActiveStreamGuard {
@@ -435,6 +495,55 @@ impl Drop for ActiveStreamGuard {
         let Some(stream_state) = self.stream_state.take() else {
             return; // If None it means we don't want it put back into an IdleStream.
         };
+
+        // THE CLIENT ALREADY SENT EVERYTHING; ONLY THE STORE IS OUTSTANDING. Reaching
+        // `Drop` with the state still present means the RPC ended without
+        // `graceful_finish`/`discard` — i.e. it was CANCELLED (client deadline, gateway
+        // reset, disconnect) mid-`try_join!`.
+        //
+        // WHY THE STORE FUTURE IS NECESSARILY STILL PENDING HERE, so awaiting it below
+        // cannot poll a completed future: `process_client_stream` returns Ok in the very
+        // same poll in which it calls `send_eof` (there is no await after it), and
+        // `store.update` cannot resolve before it observes that EOF. So if the store
+        // future had resolved, both halves of the `try_join!` would have been Ready in one
+        // poll and the RPC would have returned through `graceful_finish` instead of here.
+        //
+        // FINISHING IT DETACHED IS THE WHOLE POINT, not just tidiness. This is exactly the
+        // large-blob case: a ~329 MiB source layer whose bytes are all in the channel while
+        // `store.update` is still draining them through verify -> filesystem -> Redis/S3.
+        // Dropping the future would throw those bytes away and the client's retry would hit
+        // the same wall, so a blob whose store leg outlasts one `--remote_timeout` could
+        // never land. Draining it here means the retry's `QueryWriteStatus` finds the blob
+        // present, answers `complete: true`, and the client treats it as ALREADY_EXISTS —
+        // no re-upload.
+        //
+        // `background_spawn!`, NOT `spawn!`: the latter wraps the handle in a
+        // `JoinHandleDropGuard` that ABORTS the task when dropped, and there is nowhere in
+        // a `Drop` impl to keep such a guard alive.
+        if stream_state.tx.is_eof_sent() {
+            let uuid = stream_state.uuid;
+            self.active_uploads.lock().remove(&uuid);
+            self.metrics.active_uploads.fetch_sub(1, Ordering::Relaxed);
+            self.metrics
+                .detached_store_updates
+                .fetch_add(1, Ordering::Relaxed);
+            let store_update_fut = stream_state.store_update_fut;
+            background_spawn!("bytestream_detached_store_update", async move {
+                match store_update_fut.await {
+                    Ok(()) => info!(
+                        msg = "Finished a store update whose client RPC had already ended",
+                        uuid = format!("{uuid:032x}"),
+                    ),
+                    Err(err) => warn!(
+                        msg = "Store update failed after its client RPC had already ended",
+                        uuid = format!("{uuid:032x}"),
+                        ?err,
+                    ),
+                }
+            });
+            return;
+        }
+
         let mut active_uploads = self.active_uploads.lock();
         let uuid = stream_state.uuid; // u128 is Copy, no clone needed
         let Some(active_uploads_slot) = active_uploads.get_mut(&uuid) else {
@@ -622,7 +731,11 @@ impl ByteStreamServer {
 
     /// Creates or joins an upload stream for the given UUID.
     ///
-    /// This function handles three scenarios:
+    /// This function handles four scenarios:
+    /// 0. UUID exists, is idle, and its WRITE HALF IS ALREADY CLOSED - not resumable at
+    ///    all. Dropped, and rejected with a retriable `Aborted` so the client's next
+    ///    `QueryWriteStatus` falls through to the store and it restarts from 0. See the
+    ///    comment at the check itself for why this must not silently become case 1.
     /// 1. UUID doesn't exist - creates a new upload stream.
     /// 2. UUID exists but is idle - resumes the existing stream, continuing the
     ///    SAME in-progress `store.update` at its current `committed_size`. This is
@@ -681,6 +794,48 @@ impl ByteStreamServer {
                     return Err(make_err!(
                         Code::Aborted,
                         "An upload for this resource is already in progress; retry to resume",
+                    ));
+                }
+                // A CLOSED WRITE HALF IS NOT RESUMABLE. Joining one hands the retry's very
+                // first `tx.send` an `Internal: Tried to send while stream is closed` — the
+                // 2026-08-13 signature (GHA run 31711356666). `ActiveStreamGuard` no longer
+                // parks a session in this state, so this is a backstop rather than the
+                // primary guard; keep both, because the consequence of the state existing
+                // again is silent and severe.
+                //
+                // DROP THE SLOT AND ANSWER `Aborted` RATHER THAN QUIETLY RESTARTING AT 0.
+                // Restarting at 0 is the only *safe* offset — the previous session's
+                // `store.update` is gone with its channel, so any non-zero offset would
+                // leave `[0..offset)` missing — but this RPC cannot impose it: the client
+                // already took its resume offset from `QueryWriteStatus` before opening the
+                // stream, so a fresh session at 0 makes its next frame arrive as "Received
+                // out of order data", a non-retriable InvalidArgument. Removing the entry
+                // instead means the retry's `QueryWriteStatus` falls through to the store,
+                // reports `committed_size: 0`, and the client restarts from the beginning of
+                // its own accord. `Aborted` is retriable, so that costs one round trip.
+                if entry
+                    .get()
+                    .1
+                    .as_ref()
+                    .is_some_and(|idle| idle.stream_state.tx.is_pipe_broken())
+                {
+                    warn!(
+                        msg = "Discarding an idle stream whose write half was already closed",
+                        uuid = format!("{:032x}", original_key),
+                        digest = %digest,
+                    );
+                    drop(entry.remove());
+                    instance
+                        .metrics
+                        .active_uploads
+                        .fetch_sub(1, Ordering::Relaxed);
+                    instance
+                        .metrics
+                        .discarded_finished_sessions
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(make_err!(
+                        Code::Aborted,
+                        "The previous upload session for this resource is finished; retry to restart",
                     ));
                 }
                 // Case 2: Stream exists but is idle, we can resume it. Continue the
@@ -995,17 +1150,31 @@ impl ByteStreamServer {
             self.create_or_join_upload_stream(uuid, instance_info, digest, digest_function)?;
         let expected_size = stream.resource_info.expected_size as u64;
 
-        let active_stream = active_stream_guard.stream_state.as_mut().unwrap();
-        try_join!(
-            process_client_stream(
-                stream,
-                &mut active_stream.tx,
-                &active_stream_guard.bytes_received,
-                expected_size
-            ),
-            (&mut active_stream.store_update_fut)
-                .map_err(|err| { err.append("Error updating inner store") })
-        )?;
+        // THE RESULT IS INSPECTED RATHER THAN `?`-PROPAGATED, so the failure path can
+        // dispose of the session explicitly instead of leaving it to `Drop`. On error with
+        // the write half already closed there is nothing left to resume, and `Drop`'s
+        // detach path must not run either: the store future may have resolved already —
+        // it is the half that errored — and re-polling a resolved future panics.
+        let bytes_received = active_stream_guard.bytes_received.clone();
+        let result = {
+            let active_stream = active_stream_guard.stream_state.as_mut().unwrap();
+            try_join!(
+                process_client_stream(
+                    stream,
+                    &mut active_stream.tx,
+                    &bytes_received,
+                    expected_size
+                ),
+                (&mut active_stream.store_update_fut)
+                    .map_err(|err| { err.append("Error updating inner store") })
+            )
+        };
+        if let Err(err) = result {
+            if active_stream_guard.write_half_closed() {
+                active_stream_guard.discard();
+            }
+            return Err(err);
+        }
 
         // Close our guard and consider the stream no longer active.
         active_stream_guard.graceful_finish();
@@ -1379,20 +1548,46 @@ impl ByteStreamServer {
             .ok_or_else(|| make_input_err!("UUID must be set if querying write status"))?;
         let uuid_key = parse_uuid_to_key(&uuid_str);
 
-        {
+        let session_bytes_received = {
             let active_uploads = instance.active_uploads.lock();
-            if let Some((received_bytes, _maybe_idle_stream)) = active_uploads.get(&uuid_key) {
-                return Ok(Response::new(QueryWriteStatusResponse {
-                    committed_size: received_bytes
-                        .load(Ordering::Acquire)
-                        .try_into()
-                        .unwrap_or(i64::MAX),
-                    // If we are in the active_uploads map, but the value is None,
-                    // it means the stream is not complete.
-                    complete: false,
-                }));
-            }
+            active_uploads
+                .get(&uuid_key)
+                .map(|(received_bytes, _maybe_idle_stream)| received_bytes.load(Ordering::Acquire))
+        };
+
+        // NEVER ANSWER `committed_size == expected_size` WITH `complete: false`. That pair
+        // is unactionable for any client: it says "you owe me nothing more" and "this is
+        // not committed" in the same breath, so no resume offset can make progress.
+        //
+        // IT IS ALSO WHAT BROKE BAZEL, and the mechanism is exact. `ByteStreamUploader`'s
+        // retry calls `QueryWriteStatus`, then `upload(committedSize)`, whose onReady
+        // handler runs `Chunker.seek(committedSize)`. A `Chunker` drained by the previous
+        // attempt has `initialized == true`, `offset == size` and `data == null` (its own
+        // `next()` calls `closeInput()` at EOF), so `seek(size)` takes the fast path,
+        // skips zero bytes, and dereferences `data` — NPE at Chunker.java:161, thrown
+        // INSIDE the gRPC onReady callback, which grpc-java converts into
+        // `CANCELLED: Failed to call onReady`. That is the 2026-08-13 build failure
+        // (GHA run 31711356666), and it is still unfixed on bazelbuild/bazel master, so
+        // no client upgrade covers it — the server must not produce the input.
+        //
+        // Any smaller `committed_size` stays on the old path: the client resumes from it,
+        // and `seek(n < size)` re-opens the stream instead of tripping the fast path.
+        let expected_size = u64::try_from(resource_info.expected_size).unwrap_or(u64::MAX);
+        if let Some(received_bytes) = session_bytes_received
+            && received_bytes < expected_size
+        {
+            return Ok(Response::new(QueryWriteStatusResponse {
+                committed_size: received_bytes.try_into().unwrap_or(i64::MAX),
+                // If we are in the active_uploads map, but the value is None,
+                // it means the stream is not complete.
+                complete: false,
+            }));
         }
+        // Either there is no session, or the session holds every byte and only the store
+        // leg is outstanding. Both are answered truthfully by the store below: present
+        // means `complete: true` (the client short-circuits to ALREADY_EXISTS, including
+        // when a detached store update from a cancelled RPC has since landed the blob),
+        // absent means `committed_size: 0` and a clean restart from the beginning.
 
         let has_fut = store_clone.has(digest);
         let Some(item_size) = has_fut.await.err_tip(|| "Failed to call .has() on store")? else {

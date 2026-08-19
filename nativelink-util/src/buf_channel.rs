@@ -207,6 +207,20 @@ impl DropCloserWriteHalf {
     pub const fn is_pipe_broken(&self) -> bool {
         self.tx.is_none()
     }
+
+    /// Returns whether [`Self::send_eof`] has run, i.e. whether the writer declared the
+    /// payload complete.
+    ///
+    /// NARROWER THAN [`Self::is_pipe_broken`] AND THE DIFFERENCE IS THE POINT: both are
+    /// true once `send_eof` has run, but `is_pipe_broken` is ALSO true when a `send`
+    /// failed because the reader went away. Only this one means "every byte the writer
+    /// owed the reader is already in the channel", which is what a caller holding a
+    /// half-finished session needs in order to decide whether the reader can still be
+    /// driven to completion.
+    #[must_use]
+    pub fn is_eof_sent(&self) -> bool {
+        self.eof_sent.load(Ordering::Acquire)
+    }
 }
 
 /// Reader half of the pair.

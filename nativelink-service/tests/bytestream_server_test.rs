@@ -2171,3 +2171,157 @@ async fn uuid_collision_does_not_deadlock() -> Result<(), Box<dyn core::error::E
     drop(tx1);
     Ok(())
 }
+
+/// REGRESSION (2026-08-13, evercompliant/ai-utils GHA run 31711356666): a `Write` that
+/// fails AFTER the client has already sent `finish_write` must not wedge the upload UUID.
+///
+/// `process_client_stream` calls `send_eof()` on `finish_write`, which sets the write
+/// half's `tx` to `None`. If the store update then errors, `try_join!` returns Err,
+/// `graceful_finish` never runs, and `ActiveStreamGuard::drop` used to park that ALREADY
+/// CLOSED write half in `active_uploads` as a resumable `IdleStream`. A client retry reuses
+/// the same upload UUID — that is how REAPI addresses resumption, so it is the normal case,
+/// not an edge one — landed on Case 2 of `create_or_join_upload_stream`, and its very first
+/// `tx.send` came back `Internal: Tried to send while stream is closed`.
+///
+/// Bazel DOES treat that INTERNAL as retriable; the harm is that retrying cannot help. The
+/// dead session is retained for `persist_stream_on_disconnect_timeout` and the retry is
+/// immediate under the same UUID, so it lands on the same corpse — a transient store failure
+/// becomes a deterministic one, and `--remote_retries=1` then runs out.
+///
+/// THE FAILURE IS INDUCED THROUGH THE STORE, not through the transport, because that is the
+/// half that is reachable deterministically: a verifying store plus content that does not
+/// match the declared hash. The length is identical, so `expected_size` is reached and EOF
+/// really is sent; only the trailing hash check rejects it. The retry then sends the CORRECT
+/// bytes under the same digest and UUID and must succeed.
+#[nativelink_test]
+async fn retry_after_a_store_failure_past_eof_starts_a_clean_session()
+-> Result<(), Box<dyn core::error::Error>> {
+    const GOOD_DATA: &[u8] = b"content that the declared sha256 actually names";
+    const UPLOAD_UUID: &str = "3f6d0c11-6f0e-4d2b-9a4b-8f5f3f2f7f10";
+
+    let mut bad_data = GOOD_DATA.to_vec();
+    bad_data[0] ^= 0xff;
+
+    let hash = sha256_hex(GOOD_DATA);
+    let digest = DigestInfo::try_new(&hash, GOOD_DATA.len())?;
+    let store_manager = make_verify_store_manager().await?;
+    let bs_server = Arc::new(make_bytestream_server(&store_manager, None)?);
+    let store = store_manager.get_store("main_cas").unwrap();
+    let resource_name = format!(
+        "{INSTANCE_NAME}/uploads/{UPLOAD_UUID}/blobs/{hash}/{}",
+        GOOD_DATA.len()
+    );
+
+    // Attempt 1: every byte arrives and `finish_write` is set, so the server sends EOF.
+    // The verifying store then rejects the payload, failing the RPC past the point of no
+    // return.
+    let (tx, join_handle) = make_stream_and_writer_spawn(bs_server.clone(), None);
+    tx.send(Frame::data(encode_stream_proto(&WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: 0,
+        finish_write: true,
+        data: bad_data.into(),
+    })?))
+    .await?;
+    drop(tx);
+    let status = join_handle
+        .await
+        .expect("task panicked")
+        .expect_err("A hash mismatch must fail the write");
+    assert!(
+        !status.message().contains("Tried to send while stream is closed"),
+        "First attempt must fail on the store, not on a closed channel: {status:?}"
+    );
+
+    // Attempt 2: SAME UUID, correct bytes. Before the fix this returned
+    // `Internal: Tried to send while stream is closed` without touching the store.
+    let (tx, join_handle) = make_stream_and_writer_spawn(bs_server.clone(), None);
+    tx.send(Frame::data(encode_stream_proto(&WriteRequest {
+        resource_name,
+        write_offset: 0,
+        finish_write: true,
+        data: GOOD_DATA.to_vec().into(),
+    })?))
+    .await?;
+    drop(tx);
+    join_handle
+        .await
+        .expect("task panicked")
+        .expect("Retry under the same UUID must get a clean session and succeed");
+
+    assert_eq!(
+        store.get_part_unchunked(digest, 0, None).await?,
+        GOOD_DATA,
+        "The retry's bytes must be what the store ends up holding",
+    );
+    Ok(())
+}
+
+/// REGRESSION, and the other half of the same 2026-08-13 incident: `QueryWriteStatus` must
+/// never answer `committed_size == expected_size` together with `complete: false`.
+///
+/// THAT PAIR IS UNACTIONABLE FOR ANY CLIENT — it says "you owe me nothing more" and "this is
+/// not committed" at once, so no resume offset can make progress. What it did to Bazel 9.2.0
+/// is exact: `ByteStreamUploader.call()` queries the status on a retry and then runs
+/// `upload(committedSize)`, whose gRPC onReady handler calls `Chunker.seek(committedSize)`.
+/// A `Chunker` drained by the previous attempt has `initialized == true`, `offset == size`
+/// and `data == null` (its own `next()` calls `closeInput()` at EOF), so `seek(size)` takes
+/// the fast path, skips zero bytes and dereferences `data` — NullPointerException at
+/// Chunker.java:161, thrown INSIDE the callback, which grpc-java reports as
+/// `CANCELLED: Failed to call onReady`. That is still unfixed on bazelbuild/bazel master, so
+/// no client upgrade covers it; the server must not produce the input.
+///
+/// Same induced failure as `retry_after_a_store_failure_past_eof_starts_a_clean_session`:
+/// all bytes accepted, EOF sent, store rejects.
+#[nativelink_test]
+async fn query_write_status_never_claims_a_full_but_incomplete_write()
+-> Result<(), Box<dyn core::error::Error>> {
+    const GOOD_DATA: &[u8] = b"another payload whose sha256 is declared honestly";
+    const UPLOAD_UUID: &str = "5a1c9d44-0b7e-42a3-8c61-7d2e4a9b0c33";
+
+    let mut bad_data = GOOD_DATA.to_vec();
+    bad_data[0] ^= 0xff;
+
+    let hash = sha256_hex(GOOD_DATA);
+    let store_manager = make_verify_store_manager().await?;
+    let bs_server = Arc::new(make_bytestream_server(&store_manager, None)?);
+    let resource_name = format!(
+        "{INSTANCE_NAME}/uploads/{UPLOAD_UUID}/blobs/{hash}/{}",
+        GOOD_DATA.len()
+    );
+
+    let (tx, join_handle) = make_stream_and_writer_spawn(bs_server.clone(), None);
+    tx.send(Frame::data(encode_stream_proto(&WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: 0,
+        finish_write: true,
+        data: bad_data.into(),
+    })?))
+    .await?;
+    drop(tx);
+    join_handle
+        .await
+        .expect("task panicked")
+        .expect_err("A hash mismatch must fail the write");
+
+    let response = bs_server
+        .query_write_status(Request::new(QueryWriteStatusRequest { resource_name }))
+        .await?
+        .into_inner();
+
+    let expected_size = i64::try_from(GOOD_DATA.len())?;
+    assert!(
+        !(response.committed_size == expected_size && !response.complete),
+        "`committed_size == expected_size` with `complete: false` leaves the client nothing \
+         to resume from and NPEs Bazel's uploader: {response:?}",
+    );
+    assert_eq!(
+        response,
+        QueryWriteStatusResponse {
+            committed_size: 0,
+            complete: false,
+        },
+        "A write the store rejected must restart from the beginning",
+    );
+    Ok(())
+}
