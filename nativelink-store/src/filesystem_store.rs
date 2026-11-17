@@ -73,6 +73,14 @@ const DEFAULT_BLOCK_SIZE: u64 = 4 * 1024;
 // budget. Healthy fsync on the dev PVC is <100ms; 8s leaves ~80× headroom.
 const FS_WRITE_DEADLINE: Duration = Duration::from_secs(8);
 
+// fsync time grows with the blob: a 3.8 GB layer needs ~30s on a default gp3 volume.
+const FSYNC_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024 * 1024;
+
+/// The flush_durably ceiling for a `size`-byte blob: the fixed deadline plus 1s per 64 MiB.
+fn flush_deadline(size: u64) -> Duration {
+    FS_WRITE_DEADLINE + Duration::from_secs(size / FSYNC_FLOOR_BYTES_PER_SEC)
+}
+
 pub const STR_FOLDER: &str = "s";
 pub const DIGEST_FOLDER: &str = "d";
 
@@ -1558,13 +1566,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // `flush_durably` is the fsync (it replaced the bare `sync_all`), so
         // the FS_WRITE_DEADLINE ceiling belongs here — we still hold the
         // write_semaphore permit across it.
-        timeout(FS_WRITE_DEADLINE, self.flush_durably(&temp_file))
+        let deadline = flush_deadline(data_size);
+        timeout(deadline, self.flush_durably(&temp_file))
             .await
             .map_err(|_| {
                 make_err!(
                     Code::DeadlineExceeded,
                     "filesystem flush_durably exceeded {}s ({:?})",
-                    FS_WRITE_DEADLINE.as_secs(),
+                    deadline.as_secs(),
                     final_key,
                 )
             })?
@@ -1910,13 +1919,14 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             .flush()
             .await
             .err_tip(|| "Failed to flush in filesystem store update_oneshot")?;
-        timeout(FS_WRITE_DEADLINE, self.flush_durably(&temp_file))
+        let deadline = flush_deadline(u64::try_from(data.len()).unwrap_or(u64::MAX));
+        timeout(deadline, self.flush_durably(&temp_file))
             .await
             .map_err(|_| {
                 make_err!(
                     Code::DeadlineExceeded,
                     "filesystem update_oneshot flush_durably exceeded {}s ({:?})",
-                    FS_WRITE_DEADLINE.as_secs(),
+                    deadline.as_secs(),
                     key,
                 )
             })?
